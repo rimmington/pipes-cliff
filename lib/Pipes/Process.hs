@@ -62,7 +62,7 @@ import Control.Concurrent.Async (wait, Async, withAsync)
 --
 -- The type variables have the same meaning as in 'Proxy'.
 data RunProxy a' a b' b m r
-  = RunProxy (Proxy a' a b' b m r) (m r -> IO ())
+  = RunProxy (Proxy a' a b' b m r) (m () -> IO ())
   -- ^ @RunProxy p f@, where
   --
   -- @p@ is a 'Proxy', and
@@ -236,27 +236,6 @@ consumeToHandle h = do
   liftIO $ BS.hPut h bs
   consumeToHandle h
 
--- There is no (easy) way to make the type of the RunConsumer values
--- polymorphic in the return tpe.  That is, you can't
---
--- RunConsumer' ByteString xm () xc
---
--- into
---
--- RunConsumer' ByteString xm xr xc
---
--- This is because 'produceFromHandle' needs to have some type it
--- returns when it is done yielding.  Most obviously this should be
--- ().
---
--- The type of RunProducer' does not have this problem; therefore it
--- is polymorphic in the return type.  Theoretically runProcess' could
--- return the final return type. As a practical matter though I
--- currently see no reason for it to do this; it seems that typical
--- Pipes usage is to use other monads in the stack to do things like
--- return values accumulated in a stateful way.  So for now, although
--- the stdin producer is polymorphic in its return type, this doesn't
--- give you anything useful.
 
 -- | Launches and runs a subprocess to completion.  Is exception-safe;
 -- if an exception is thrown, the subprocess will be terminated using
