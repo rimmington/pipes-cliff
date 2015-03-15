@@ -44,8 +44,9 @@ module Pipes.Process
 import Control.Monad.IO.Class ()
 import System.Exit (ExitCode)
 import Pipes
-  ( MonadIO, Producer', liftIO, yield, Consumer',
-    await, runEffect, (>->), Proxy, X, MonadTrans)
+  ( MonadIO, liftIO, yield,
+    await, runEffect, (>->), Proxy, X, MonadTrans,
+    Producer, Consumer )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified System.Process as Process
@@ -60,9 +61,12 @@ import Control.Concurrent.Async (wait, Async, withAsync)
 -- | 'RunProxy' bundles a 'Proxy' with a function that runs 'Effects'
 -- that the 'Proxy' will ultimately produce.
 --
--- The type variables have the same meaning as in 'Proxy'.
-data RunProxy a' a b' b m r
-  = RunProxy (Proxy a' a b' b m r) (m () -> IO ())
+-- The type variables have the same meaning as in 'Proxy'.  There is
+-- no type variable for @b'@ because this type will always be ().
+-- Similarly, there is no type variable for the
+-- return type; it is always ().
+data RunProxy a' a b m
+  = RunProxy (Proxy a' a () b m ()) (m () -> IO ())
   -- ^ @RunProxy p f@, where
   --
   -- @p@ is a 'Proxy', and
@@ -74,15 +78,15 @@ data RunProxy a' a b' b m r
   -- function.
 
 -- | A 'RunProxy' that produces 'ByteString'.
-type RunProducer m = RunProxy X () () ByteString m ()
+type RunProducer m = RunProxy X  ()         ByteString m
 
 -- | A 'RunProxy' that consumes 'ByteString'.
-type RunConsumer m = RunProxy () ByteString () X m ()
+type RunConsumer m = RunProxy () ByteString X          m
 
-data StdStream a' a b' b m r
+data StdStream a' a b m r
   = Inherit
   | UseHandle Handle
-  | UseProxy (RunProxy a' a b' b m r)
+  | UseProxy (RunProxy a' a b m)
 
 
 -- | Specifies how to launch a process.  The "System.Process" module
@@ -110,11 +114,11 @@ data ProcSpec = ProcSpec
 
 
 convertProcSpec
-  :: StdStream xa' xa xb' xb xm xr
+  :: StdStream xa' xa xb xm xr
   -- ^ Stdin
-  -> StdStream ya' ya yb' yb ym yr
+  -> StdStream ya' ya yb ym yr
   -- ^ Stdout
-  -> StdStream za' za zb' zb zm zr
+  -> StdStream za' za zb zm zr
   -- ^ Stderr
   -> ProcSpec
   -> Process.CreateProcess
@@ -131,7 +135,7 @@ convertProcSpec inp out err ps = Process.CreateProcess
   }
 
 convertStdStream
-  :: StdStream a' a b' b m r
+  :: StdStream a' a b m r
   -> Process.StdStream
 convertStdStream s = case s of
   Inherit -> Process.Inherit
@@ -218,7 +222,7 @@ bufSize = 1024
 produceFromHandle
   :: MonadIO m
   => Handle
-  -> Producer' ByteString m ()
+  -> Producer ByteString m ()
 produceFromHandle h = liftIO (BS.hGetSome h bufSize) >>= go
   where
     go bs | BS.null bs = return ()
@@ -230,7 +234,7 @@ produceFromHandle h = liftIO (BS.hGetSome h bufSize) >>= go
 consumeToHandle
   :: MonadIO m
   => Handle
-  -> Consumer' ByteString m r
+  -> Consumer ByteString m r
 consumeToHandle h = do
   bs <- await
   liftIO $ BS.hPut h bs
@@ -243,11 +247,11 @@ consumeToHandle h = do
 -- closed.
 runProcess
   :: (MonadIO xm, MonadIO ym, MonadIO zm)
-  => StdStream X  ()         () ByteString xm ()
-  -- ^ Produces bytes for the subprocess standard input.
-  -> StdStream () ByteString () X          ym ()
+  => StdStream X  ()         ByteString xm ()
+  -- ^ Produces bytes for thebprocess standard input.
+  -> StdStream () ByteString X          ym ()
   -- ^ Consumes bytes from the subprocess standard output.
-  -> StdStream () ByteString () X          zm ()
+  -> StdStream () ByteString X          zm ()
   -- ^ Consumes bytes from the subprocess standard error.
   -> ProcSpec
   -> IO ExitCode
