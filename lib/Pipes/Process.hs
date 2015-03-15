@@ -243,11 +243,11 @@ consumeToHandle h = do
 -- closed.
 runProcess
   :: (MonadIO xm, MonadIO ym, MonadIO zm)
-  => StdStream X () () ByteString xm ()
+  => StdStream X  ()         () ByteString xm ()
   -- ^ Produces bytes for the subprocess standard input.
-  -> StdStream () ByteString () X ym ()
+  -> StdStream () ByteString () X          ym ()
   -- ^ Consumes bytes from the subprocess standard output.
-  -> StdStream () ByteString () X zm ()
+  -> StdStream () ByteString () X          zm ()
   -- ^ Consumes bytes from the subprocess standard error.
   -> ProcSpec
   -> IO ExitCode
