@@ -30,9 +30,14 @@ props = blank
     , "flaws are mine and should be reported to"
     , ""
     , "<http://www.github.com/massysett/pipes-subprocess/issues>"
+    , ""
+    , "Though I hope pipes-subprocess works on Windows systems, I have only"
+    , "tested it on Unix-like systems.  Any reports on how this library works"
+    , "on Windows are appreciated."
     ]
   , category = "Pipes, Concurrency"
   , testedWith = [(ghc, eq [7,8,2])]
+  , extraSourceFiles = ["README.md"]
   }
 
 defaultOptions :: HasBuildInfo a => [a]
