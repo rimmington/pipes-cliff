@@ -37,13 +37,15 @@
 --
 -- * Only deals with standard input, standard output, and standard
 -- error; you cannot create additional streams to or from the process.
-module Pipes.Subprocess
+module Pipes.Subprocess where
+{-
   ( -- * Types
     RunProxy(..)
   , RunProducer
   , RunConsumer
   , RunProducer'
   , RunConsumer'
+  , Process.CmdSpec(..)
   , ProcSpec(..)
   , procSpec
 
@@ -62,7 +64,7 @@ module Pipes.Subprocess
   , produceFromHandle
   , consumeToHandle
   ) where
-
+-}
 import Control.Monad.IO.Class ()
 import System.Exit (ExitCode)
 import Pipes
@@ -84,26 +86,9 @@ import Control.Concurrent.Async (wait, Async, withAsync)
 -- | 'RunProxy' bundles a 'Proxy' with a function that runs 'Effects'
 -- that the 'Proxy' will ultimately produce.
 --
--- Type variables:
---
--- @a'@ - 'Proxy' upstream values out
---
--- @a@ - 'Proxy' upstream values in
---
--- @b'@ - 'Proxy' downstream values in
---
--- @b@ - 'Proxy' downtream values out
---
--- @m@ - 'Proxy' base monad
---
--- @r@ - 'Proxy' return type
---
--- @c@ - return type of the IO action that results from applying the
--- function you give below to the value in the base monad that results
--- from running this 'Proxy'.  Values of this type are known as the
--- /witness/.
-data RunProxy a' a b' b m r c
-  = RunProxy (Proxy a' a b' b m r) (m r -> IO c)
+-- The type variables have the same meaning as in 'Proxy'.
+data RunProxy a' a b' b m r
+  = RunProxy (Proxy a' a b' b m r) (m r -> IO ())
   -- ^ @RunProxy p f@, where
   --
   -- @p@ is a 'Proxy', and
@@ -114,34 +99,29 @@ data RunProxy a' a b' b m r c
   -- of 'MonadIO' and that you can pair it with an appropriate
   -- function.
 
--- | A 'RunProxy' that produces 'ByteString'.  The 'Proxy' return type
--- and the witness type are both ().
-type RunProducer m = RunProxy X () () ByteString m () ()
+-- | A 'RunProxy' that produces 'ByteString'.
+type RunProducer m = RunProxy X () () ByteString m ()
 
--- | A 'RunProxy' that consumes 'ByteString'.  The 'Proxy' return type
--- and the witness type are both ().
-type RunConsumer m = RunProxy () ByteString () X m () ()
+-- | A 'RunProxy' that consumes 'ByteString'.
+type RunConsumer m = RunProxy () ByteString () X m ()
 
--- | Like 'RunProducer' but is polymorphic in the 'Proxy' return type
--- and the witness type.
-type RunProducer' m r c = forall x' x. RunProxy x' x () ByteString m r c
+-- | Like 'RunProducer' but is polymorphic.
+type RunProducer' m r = forall x' x. RunProxy x' x () ByteString m r
 
--- | Like 'RunConsumer' but is polymorphic in the 'Proxy' return type
--- and the witness type.
-type RunConsumer' m r c = forall y' y. RunProxy () ByteString y' y m r c
+-- | Like 'RunConsumer' but is polymorphic.
+type RunConsumer' m r = forall y' y. RunProxy () ByteString y' y m r
+
+data StdStream a' a b' b m r
+  = Inherit
+  | UseHandle Handle
+  | UseProxy (RunProxy a' a b' b m r)
 
 
 -- | Specifies how to launch a process.  The "System.Process" module
--- is used to launch the process.  All processes are created using
--- 'System.Process.RawCommand'.  The standard input, standard output,
--- and standard error will be opened with pipes (that is, using
--- 'System.Process.CreatePipe') so that you can communicate using a
--- 'Proxy'.
+-- is used to launch the process.
 data ProcSpec = ProcSpec
-  { program :: String
-  -- ^ The name of the program.
-  , args :: [String]
-  -- ^ Any arguments to the program
+  { cmdspec :: Process.CmdSpec
+    -- ^ Executable and arguments, or shell command
   , cwd :: Maybe FilePath
   -- ^ A new current working directory for the subprocess; if
   -- 'Nothing', use the calling process's working directory.
@@ -160,20 +140,35 @@ data ProcSpec = ProcSpec
   -- module for details.
   }
 
+
 convertProcSpec
-  :: ProcSpec
+  :: (forall a' a b' b m r. StdStream a' a b' b m r)
+  -- ^ Stdin
+  -> (forall a' a b' b m r. StdStream a' a b' b m r)
+  -- ^ Stdout
+  -> (forall a' a b' b m r. StdStream a' a b' b m r)
+  -- ^ Stderr
+  -> ProcSpec
   -> Process.CreateProcess
-convertProcSpec ps = Process.CreateProcess
-  { Process.cmdspec = Process.RawCommand (program ps) (args ps)
+convertProcSpec inp out err ps = Process.CreateProcess
+  { Process.cmdspec = cmdspec ps
   , Process.cwd = cwd ps
   , Process.env = env ps
-  , Process.std_in = Process.CreatePipe
-  , Process.std_out = Process.CreatePipe
-  , Process.std_err = Process.CreatePipe
+  , Process.std_in = convertStdStream inp
+  , Process.std_out = convertStdStream out
+  , Process.std_err = convertStdStream err
   , Process.close_fds = close_fds ps
   , Process.create_group = create_group ps
   , Process.delegate_ctlc = delegate_ctlc ps
   }
+
+convertStdStream
+  :: StdStream a' a b' b m r
+  -> Process.StdStream
+convertStdStream s = case s of
+  Inherit -> Process.Inherit
+  UseHandle h -> Process.UseHandle h
+  UseProxy _ -> Process.CreatePipe
 
 -- | Creates a 'ProcSpec' with the given program name and arguments.
 -- In addition:
@@ -192,8 +187,7 @@ procSpec
   -> [String]
   -> ProcSpec
 procSpec p a = ProcSpec
-  { program = p
-  , args = a
+  { cmdspec = Process.RawCommand p a
   , cwd = Nothing
   , env = Nothing
   , close_fds = True
@@ -207,6 +201,7 @@ procSpec p a = ProcSpec
 -- small value and see how it works.
 bufSize :: Int
 bufSize = 1024
+
 
 -- | Create a 'Producer'' from a 'Handle'.  The 'Producer'' will get
 -- 'ByteString' from the 'Handle' and produce them.  Does nothing to
@@ -232,6 +227,7 @@ consumeToHandle h = do
   liftIO $ BS.hPut h bs
   consumeToHandle h
 
+{-
 -- | A 'RunProducer'' that will produce values from whatever file or
 -- device is hooked to the standard input of the current process.  The
 -- device will not be closed when input is done.
@@ -249,7 +245,9 @@ toStdout = RunProxy (consumeToHandle stdout) id
 -- device will not be closed when output is done.
 toStderr :: RunConsumer' IO () ()
 toStderr = RunProxy (consumeToHandle stderr) id
+-}
 
+{-
 -- | Creates a 'RunProducer' that will produce values from the file at
 -- the given path.  The file handle will be closed when input is
 -- complete, and it will also be closed if an exception is thrown.
@@ -286,7 +284,7 @@ consumeWriteToFile file = RunProxy pxy Safe.runSafeT
       (IO.openFile file IO.WriteMode)
       IO.hClose
       consumeToHandle
-
+-}
 
 -- # Running a sub-process
 
@@ -379,3 +377,4 @@ runProcess inpP outP errP spec
       zc <- lift $ wait aErr
       return (xc, yc, zc)
 
+-}
