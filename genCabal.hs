@@ -72,6 +72,7 @@ transformers = closedOpen "transformers" [0,3,0,0] [0,5]
 pipes :: Package
 pipes = closedOpen "pipes" [4,1] [4,2]
 
+-- | Currently not used.
 pipesSafe :: Package
 pipesSafe = closedOpen "pipes-safe" [2,2] [2,3]
 
@@ -89,7 +90,6 @@ libDeps = buildDepends
   [ base
   , transformers
   , pipes
-  , pipesSafe
   , bytestring
   , process
   , async

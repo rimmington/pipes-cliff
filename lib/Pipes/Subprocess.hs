@@ -13,20 +13,6 @@
 -- matter what the handle's encoding setting is or whether it does any
 -- newline conversion.
 --
--- For example, to stream an infinite list of numbers to @less@, try
--- running this in @ghci@:
---
--- >>> import Pipes.Subprocess
--- >>> import Pipes
--- >>> import qualified Data.ByteString.Char8 as Char8
--- >>> let produceNums = each . map (Char8.snoc '\n' . Char8.pack . show) $ [0..]
--- >>> runProcess (RunProxy produceNums id) toStdout toStderr (procSpec "less" [])
---
--- Since @less@ lazily reads its input, and because Pipes produces a
--- lazy stream, you can stream an infinite set of values.  After you
--- quit out of @less@, 'runProcess' returns (among other things) the
--- exit code from @less@.
---
 -- Limitations:
 --
 -- * There is no way to truly interact with the subprocess.
@@ -37,14 +23,12 @@
 --
 -- * Only deals with standard input, standard output, and standard
 -- error; you cannot create additional streams to or from the process.
-module Pipes.Subprocess where
-{-
+module Pipes.Subprocess
   ( -- * Types
     RunProxy(..)
   , RunProducer
   , RunConsumer
-  , RunProducer'
-  , RunConsumer'
+  , StdStream(..)
   , Process.CmdSpec(..)
   , ProcSpec(..)
   , procSpec
@@ -52,30 +36,20 @@ module Pipes.Subprocess where
   -- * Running a sub-process
   , runProcess
 
-  -- * Creating values of type 'RunProxy'
-  , fromStdin
-  , toStdout
-  , toStderr
-  , produceFromFile
-  , consumeWriteToFile
-  , consumeAppendToFile
-
   -- * Creating 'Consumer'' and 'Producer'' from a 'Handle'
   , produceFromHandle
   , consumeToHandle
   ) where
--}
+
 import Control.Monad.IO.Class ()
 import System.Exit (ExitCode)
 import Pipes
   ( MonadIO, Producer', liftIO, yield, Consumer',
-    await, runEffect, (>->), lift, Proxy, X)
-import Pipes.Safe (SafeT)
-import qualified Pipes.Safe as Safe
+    await, runEffect, (>->), Proxy, X, MonadTrans)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified System.Process as Process
-import System.IO (Handle, hClose, stdin, stdout, stderr)
+import System.IO (Handle, hClose)
 import qualified System.IO as IO
 import qualified Control.Exception
 import Control.Monad.Trans.Cont (ContT(ContT), evalContT)
@@ -104,12 +78,6 @@ type RunProducer m = RunProxy X () () ByteString m ()
 
 -- | A 'RunProxy' that consumes 'ByteString'.
 type RunConsumer m = RunProxy () ByteString () X m ()
-
--- | Like 'RunProducer' but is polymorphic.
-type RunProducer' m r = forall x' x. RunProxy x' x () ByteString m r
-
--- | Like 'RunConsumer' but is polymorphic.
-type RunConsumer' m r = forall y' y. RunProxy () ByteString y' y m r
 
 data StdStream a' a b' b m r
   = Inherit
@@ -142,11 +110,11 @@ data ProcSpec = ProcSpec
 
 
 convertProcSpec
-  :: (forall a' a b' b m r. StdStream a' a b' b m r)
+  :: StdStream xa' xa xb' xb xm xr
   -- ^ Stdin
-  -> (forall a' a b' b m r. StdStream a' a b' b m r)
+  -> StdStream ya' ya yb' yb ym yr
   -- ^ Stdout
-  -> (forall a' a b' b m r. StdStream a' a b' b m r)
+  -> StdStream za' za zb' zb zm zr
   -- ^ Stderr
   -> ProcSpec
   -> Process.CreateProcess
@@ -197,6 +165,47 @@ procSpec p a = ProcSpec
 
 -- # Producers and consumers
 
+-- # Running a sub-process
+
+useProcess
+  :: IO (Maybe Handle, Maybe Handle, Maybe Handle, Process.ProcessHandle)
+  -> (Maybe Handle -> Maybe Handle -> Maybe Handle -> IO ())
+  -> IO ExitCode
+useProcess make use = Control.Exception.bracketOnError make rel run
+  where
+    rel (ih, oh, eh, han) = do
+      Process.terminateProcess han
+      _ <- Process.waitForProcess han
+      closeNoThrow ih
+      closeNoThrow oh
+      closeNoThrow eh
+    run tup = runHandles tup use
+
+
+spawn :: IO a -> ContT b IO (Async a)
+spawn io = ContT (withAsync io)
+
+runHandles
+  :: (Maybe Handle, Maybe Handle, Maybe Handle, Process.ProcessHandle)
+  -> (Maybe Handle -> Maybe Handle -> Maybe Handle -> IO ())
+  -> IO ExitCode
+runHandles (inp, out, err, han) use = do
+  use inp out err
+  c <- Process.waitForProcess han
+  closeNoThrow inp
+  closeNoThrow out
+  closeNoThrow err
+  return c
+
+-- | Closes a handle.  Suppresses all IO exceptions; others are thrown.
+closeNoThrow :: Maybe Handle -> IO ()
+closeNoThrow mayH = Control.Exception.catch (maybe (return ()) hClose mayH)
+  han
+  where
+    han :: Control.Exception.IOException -> IO ()
+    han _ = return ()
+
+
 -- | I have no idea what this should be.  I'll start with a simple
 -- small value and see how it works.
 bufSize :: Int
@@ -227,101 +236,6 @@ consumeToHandle h = do
   liftIO $ BS.hPut h bs
   consumeToHandle h
 
-{-
--- | A 'RunProducer'' that will produce values from whatever file or
--- device is hooked to the standard input of the current process.  The
--- device will not be closed when input is done.
-fromStdin :: RunProducer' IO () ()
-fromStdin = RunProxy (produceFromHandle stdin) id
-
--- | A 'RunConsumer'' that will output values to whatever file or
--- device is hooked to the standard output of the current process.
--- The device will not be closed when output is done.
-toStdout :: RunConsumer' IO () ()
-toStdout = RunProxy (consumeToHandle stdout) id
-
--- | A 'RunConsumer'' that will output values to whatever file or
--- device is hooked to the standard error of the current process.  The
--- device will not be closed when output is done.
-toStderr :: RunConsumer' IO () ()
-toStderr = RunProxy (consumeToHandle stderr) id
--}
-
-{-
--- | Creates a 'RunProducer' that will produce values from the file at
--- the given path.  The file handle will be closed when input is
--- complete, and it will also be closed if an exception is thrown.
-produceFromFile :: FilePath -> RunProducer (SafeT IO)
-produceFromFile file = RunProxy pxy Safe.runSafeT
-  where
-    pxy = Safe.bracket
-      (IO.openFile file IO.ReadMode)
-      IO.hClose
-      produceFromHandle
-
-
--- | Creates a 'RunConsumer' that will output values to the file at
--- the given path.  Values are appended to the end of the file if it
--- already exists.  The file handle will be closed when input is
--- complete, and it will also be closed if an exception is thrown.
-consumeAppendToFile :: FilePath -> RunConsumer (SafeT IO)
-consumeAppendToFile file = RunProxy pxy Safe.runSafeT
-  where
-    pxy = Safe.bracket
-      (IO.openFile file IO.AppendMode)
-      IO.hClose
-      consumeToHandle
-
-
--- | Creates a 'RunConsumer' that will output values to the file at
--- the given path.  The file is overwritten if it already exists.  The
--- file handle will be closed when input is complete, and it will also
--- be closed if an exception is thrown.
-consumeWriteToFile :: FilePath -> RunConsumer (SafeT IO)
-consumeWriteToFile file = RunProxy pxy Safe.runSafeT
-  where
-    pxy = Safe.bracket
-      (IO.openFile file IO.WriteMode)
-      IO.hClose
-      consumeToHandle
--}
-
--- # Running a sub-process
-
-useProcess
-  :: ProcSpec
-  -> (Handle -> Handle -> Handle -> IO a)
-  -> IO (a, ExitCode)
-useProcess ps use = Control.Exception.bracketOnError get rel run
-  where
-    get = do
-      (Just inp, Just out, Just err, han) <- Process.createProcess
-        (convertProcSpec ps)
-      return (inp, out, err, han)
-    rel (inp, out, err, han) = do
-      Process.terminateProcess han
-      _ <- Process.waitForProcess han
-      hClose inp
-      hClose out
-      hClose err
-    run tup = runHandles tup use
-
-runHandles
-  :: (Handle, Handle, Handle, Process.ProcessHandle)
-  -> (Handle -> Handle -> Handle -> IO a)
-  -> IO (a, ExitCode)
-runHandles (inp, out, err, han) use = do
-  r <- use inp out err
-  c <- Process.waitForProcess han
-  hClose inp
-  hClose out
-  hClose err
-  return (r, c)
-
-
-spawn :: IO a -> ContT b IO (Async a)
-spawn io = ContT (withAsync io)
-
 -- There is no (easy) way to make the type of the RunConsumer values
 -- polymorphic in the return tpe.  That is, you can't
 --
@@ -350,31 +264,51 @@ spawn io = ContT (withAsync io)
 -- closed.
 runProcess
   :: (MonadIO xm, MonadIO ym, MonadIO zm)
-  => RunProducer' xm xr xc
+  => StdStream X () () ByteString xm ()
   -- ^ Produces bytes for the subprocess standard input.
-  -> RunConsumer' ym () yc
+  -> StdStream () ByteString () X ym ()
   -- ^ Consumes bytes from the subprocess standard output.
-  -> RunConsumer' zm () zc
+  -> StdStream () ByteString () X zm ()
   -- ^ Consumes bytes from the subprocess standard error.
   -> ProcSpec
-  -> IO (ExitCode, xc, yc, zc)
+  -> IO ExitCode
   -- ^ Returns the exit code from the subprocess, along with the
   -- witnesses from each stream.
-runProcess inpP outP errP spec
-  = fmap conv $ useProcess spec user
+runProcess inp out err ps = useProcess make user
   where
-    conv ((xc, yc, zc), cd) = (cd, xc, yc, zc)
+    make = do
+      (i, o, e, h) <- Process.createProcess (convertProcSpec inp out err ps)
+      let set = maybe (return ())
+            (flip IO.hSetBuffering IO.NoBuffering)
+      set i
+      set o
+      set e
+      return (i, o, e, h)
     getter han (RunProxy consmr runner) = runner $ runEffect $
       produceFromHandle han >-> consmr
     pusher han (RunProxy prodcr runner) = runner $ runEffect $
       prodcr >-> consumeToHandle han
     user inH outH errH = evalContT $ do
-      aIn <- spawn (pusher inH inpP)
-      aOut <- spawn (getter outH outP)
-      aErr <- spawn (getter errH errP)
-      xc <- lift $ wait aIn
-      yc <- lift $ wait aOut
-      zc <- lift $ wait aErr
-      return (xc, yc, zc)
+      aIn <- case inp of
+        UseProxy rp -> case inH of
+          Nothing -> error "runProcess: error 1"
+          Just h -> fmap Just . spawn $ pusher h rp
+        _ -> return Nothing
+      bOut <- case out of
+        UseProxy rp -> case outH of
+          Nothing -> error "runProcess: error 2"
+          Just h -> fmap Just . spawn $ getter h rp
+        _ -> return Nothing
+      bErr <- case err of
+        UseProxy rp -> case errH of
+          Nothing -> error "runProcess: error 3"
+          Just h -> fmap Just . spawn $ getter h rp
+        _ -> return Nothing
+      mayWait aIn
+      mayWait bOut
+      mayWait bErr
 
--}
+mayWait
+  :: (MonadIO m, MonadTrans t, Monad (t m), MonadIO (t m))
+  => Maybe (Async ()) -> t m ()
+mayWait = maybe (return ()) (liftIO . wait)
