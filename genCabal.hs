@@ -4,7 +4,7 @@ import Cartel
 
 props :: Properties
 props = blank
-  { name = "pipes-subprocess"
+  { name = "pipes-process"
   , version = [0,2,0,0]
   , cabalVersion = Just (1, 16)
   , buildType = Just simple
@@ -15,23 +15,23 @@ props = blank
   , author = "Omari Norman"
   , maintainer = "omari@smileystation.com"
   , stability = "Experimental"
-  , homepage = "http://www.github.com/massysett/pipes-subprocess"
-  , bugReports = "http://www.github.com/massysett/pipes-subprocess/issues"
+  , homepage = "http://www.github.com/massysett/pipes-process"
+  , bugReports = "http://www.github.com/massysett/pipes-process/issues"
   , synopsis = "Streaming to and from subprocesses using Pipes"
   , description =
-    [ "pipes-subprocess helps you spawn subprocesses and send data to and"
+    [ "pipes-process helps you spawn subprocesses and send data to and"
     , "from them with the Pipes library."
     , "Subprocesses are opened using the"
-    , "subprocess library, and the processes and handles are properly"
+    , "process library, and the processes and handles are properly"
     , "cleaned up even if there are exceptions."
     , ""
     , "Though this library uses the Pipes library, I have not coordinated"
     , "with the author of the Pipes library in any way.  Any bugs or design"
     , "flaws are mine and should be reported to"
     , ""
-    , "<http://www.github.com/massysett/pipes-subprocess/issues>"
+    , "<http://www.github.com/massysett/pipes-process/issues>"
     , ""
-    , "Though I hope pipes-subprocess works on Windows systems, I have only"
+    , "Though I hope pipes-process works on Windows systems, I have only"
     , "tested it on Unix-like systems.  Any reports on how this library works"
     , "on Windows are appreciated."
     ]
@@ -58,7 +58,7 @@ library mods =
 
 sections :: [Section]
 sections =
-  [ githubHead "massysett" "pipes-subprocess"
+  [ githubHead "massysett" "pipes-process"
   ]
 
 -- # Packages

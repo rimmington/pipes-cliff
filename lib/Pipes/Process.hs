@@ -23,7 +23,7 @@
 --
 -- * Only deals with standard input, standard output, and standard
 -- error; you cannot create additional streams to or from the process.
-module Pipes.Subprocess
+module Pipes.Process
   ( -- * Types
     RunProxy(..)
   , RunProducer
