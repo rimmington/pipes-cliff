@@ -232,22 +232,22 @@ consumeToHandle h = do
   liftIO $ BS.hPut h bs
   consumeToHandle h
 
--- | A 'RunProducer' that will produce values from whatever file or
+-- | A 'RunProducer'' that will produce values from whatever file or
 -- device is hooked to the standard input of the current process.  The
 -- device will not be closed when input is done.
-fromStdin :: RunProducer IO
+fromStdin :: RunProducer' IO () ()
 fromStdin = RunProxy (produceFromHandle stdin) id
 
--- | A 'RunConsumer' that will output values to whatever file or
+-- | A 'RunConsumer'' that will output values to whatever file or
 -- device is hooked to the standard output of the current process.
 -- The device will not be closed when output is done.
-toStdout :: RunConsumer IO
+toStdout :: RunConsumer' IO () ()
 toStdout = RunProxy (consumeToHandle stdout) id
 
--- | A 'RunConsumer' that will output values to whatever file or
+-- | A 'RunConsumer'' that will output values to whatever file or
 -- device is hooked to the standard error of the current process.  The
 -- device will not be closed when output is done.
-toStderr :: RunConsumer IO
+toStderr :: RunConsumer' IO () ()
 toStderr = RunProxy (consumeToHandle stderr) id
 
 -- | Creates a 'RunProducer' that will produce values from the file at
