@@ -107,6 +107,9 @@ pipes = closedOpen "pipes" [4,1] [4,2]
 pipesSafe :: Package
 pipesSafe = closedOpen "pipes-safe" [2,2] [2,3]
 
+pipesConcurrency :: Package
+pipesConcurrency = closedOpen "pipes-concurrency" [2,0] [2,1]
+
 bytestring :: Package
 bytestring = closedOpen "bytestring" [0,10,4] [0,11]
 
@@ -124,6 +127,7 @@ libDeps = buildDepends
   , bytestring
   , process
   , async
+  , pipesConcurrency
   ]
 
 main :: IO ()
