@@ -1,6 +1,6 @@
 module Main where
 
-import Pipes.Process.Examples
+import Pipes.Proctee.Examples
 import System.Exit
 
 main :: IO ()

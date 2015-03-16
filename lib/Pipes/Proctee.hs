@@ -37,7 +37,7 @@
 -- 'Producer' (for standard input) or a 'Consumer' (for standard
 -- output or standard error).  This limits your flexibility a lot, but
 -- it can still be useful.
-module Pipes.Process
+module Pipes.Proctee
   ( -- * Types
     StdStream
   , inherit

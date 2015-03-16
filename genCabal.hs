@@ -4,7 +4,7 @@ import Cartel
 
 props :: Properties
 props = blank
-  { name = "pipes-process"
+  { name = "pipes-proctee"
   , version = [0,2,0,0]
   , cabalVersion = Just (1, 16)
   , buildType = Just simple
@@ -15,11 +15,11 @@ props = blank
   , author = "Omari Norman"
   , maintainer = "omari@smileystation.com"
   , stability = "Experimental"
-  , homepage = "http://www.github.com/massysett/pipes-process"
-  , bugReports = "http://www.github.com/massysett/pipes-process/issues"
+  , homepage = "http://www.github.com/massysett/pipes-proctee"
+  , bugReports = "http://www.github.com/massysett/pipes-proctee/issues"
   , synopsis = "Streaming to and from subprocesses using Pipes"
   , description =
-    [ "pipes-process helps you spawn subprocesses and send data to and"
+    [ "pipes-proctee helps you spawn subprocesses and send data to and"
     , "from them with the Pipes library."
     , "Subprocesses are opened using the"
     , "process library, and the processes and handles are properly"
@@ -29,16 +29,16 @@ props = blank
     , "with the author of the Pipes library in any way.  Any bugs or design"
     , "flaws are mine and should be reported to"
     , ""
-    , "<http://www.github.com/massysett/pipes-process/issues>"
+    , "<http://www.github.com/massysett/pipes-proctee/issues>"
     , ""
-    , "Though I hope pipes-process works on Windows systems, I have only"
+    , "Though I hope pipes-proctee works on Windows systems, I have only"
     , "tested it on Unix-like systems.  Any reports on how this library works"
     , "on Windows are appreciated."
     , ""
     , "For more information, see the README.md file, which is located in the"
     , "source tarball and at"
     , ""
-    , "<https://github.com/massysett/pipes-process>"
+    , "<https://github.com/massysett/pipes-proctee>"
     ]
   , category = "Pipes, Concurrency"
   , testedWith = [(ghc, eq [7,8,2])]
@@ -83,7 +83,7 @@ sections
   -- ^ Test modules
   -> [Section]
 sections fl libMods testMods =
-  [ githubHead "massysett" "pipes-process"
+  [ githubHead "massysett" "pipes-proctee"
   , executable "numsToLess" $
     [ mainIs "numsToLess.hs"
     , condBlock (flag fl)
