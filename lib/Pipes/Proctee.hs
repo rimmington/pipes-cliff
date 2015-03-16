@@ -75,6 +75,11 @@ import Control.Concurrent.Async (wait, Async, withAsync)
 -- | Values of this type are used to determine how to handle each of
 -- the standard streams: standard input, standard output, and standard
 -- error.  See 'inherit', 'useHandle', and 'useProxy'.
+--
+-- The type variables have the same meaning as in 'Proxy'.  There is
+-- no type variable for @b'@ because this type will always be ().
+-- Similarly, there is no type variable for the
+-- return type; it is always ().
 data StdStream a' a b m
   = Inherit
   -- ^ Inherit the stream from the current process.
@@ -93,11 +98,6 @@ useHandle = UseHandle
 -- use a 'StreamToInput' or a 'StreamFromOutput', depending on
 -- whether you are trying to handle standard input, standard output,
 -- or standard error.
---
--- The type variables have the same meaning as in 'Proxy'.  There is
--- no type variable for @b'@ because this type will always be ().
--- Similarly, there is no type variable for the
--- return type; it is always ().
 useProxy
   :: Proxy a' a () b m ()
   -- ^ The 'Proxy' to use.
@@ -305,8 +305,7 @@ runProcess
   -- ^ Consumes bytes from the subprocess standard error.
   -> ProcSpec
   -> IO ExitCode
-  -- ^ Returns the exit code from the subprocess, along with the
-  -- witnesses from each stream.
+  -- ^ Returns the exit code from the subprocess.
 runProcess inp out err ps = useProcess make user
   where
     make = do
