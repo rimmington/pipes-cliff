@@ -276,7 +276,7 @@ produceFromHandle h = liftIO get >>= go
 -- close the handle at any time.
 --
 -- Any IO exceptions are caught but are ignored.  After an IO
--- exception, production ceases.
+-- exception, consumption ceases.
 consumeToHandle
   :: MonadIO m
   => Handle
