@@ -131,8 +131,7 @@ makeOutputBox
 makeOutputBox han = do
   (output, input, seal) <- lift $ spawn' messageBuffer
   let act = do
-        let producer = fromInput input
-        runEffect $ producer >-> consumeToHandle han
+        runEffect $ fromInput input >-> consumeToHandle han
         atomically seal
   _ <- ContT $ withAsync act
   return output
@@ -147,8 +146,7 @@ makeInputBox
 makeInputBox han = do
   (output, input, seal) <- lift $ spawn' messageBuffer
   let act = do
-        let consumer = toOutput output
-        runEffect $ produceFromHandle han >-> consumer
+        runEffect $ produceFromHandle han >-> toOutput output
         atomically seal
   _ <- ContT $ withAsync act
   return input
