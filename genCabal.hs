@@ -34,6 +34,11 @@ props = blank
     , "Though I hope pipes-process works on Windows systems, I have only"
     , "tested it on Unix-like systems.  Any reports on how this library works"
     , "on Windows are appreciated."
+    , ""
+    , "For more information, see the README.md file, which is located in the"
+    , "source tarball and at"
+    , ""
+    , "<https://github.com/massysett/pipes-process>"
     ]
   , category = "Pipes, Concurrency"
   , testedWith = [(ghc, eq [7,8,2])]
@@ -56,9 +61,35 @@ library mods =
   , libDeps
   ] ++ defaultOptions
 
-sections :: [Section]
-sections =
+exeOptions
+  :: HasBuildInfo a
+  => [NonEmptyString]
+  -- ^ Library modules
+  -> [NonEmptyString]
+  -- ^ Executable modules
+  -> [a]
+exeOptions libMods exeMods =
+  [ hsSourceDirs ["lib", "tests"]
+  , otherModules (exeMods ++ libMods)
+  , libDeps
+  ]
+
+sections
+  :: FlagName
+  -- ^ Tests flag
+  -> [NonEmptyString]
+  -- ^ Library modules
+  -> [NonEmptyString]
+  -- ^ Test modules
+  -> [Section]
+sections fl libMods testMods =
   [ githubHead "massysett" "pipes-process"
+  , executable "numsToLess" $
+    [ mainIs "numsToLess.hs"
+    , condBlock (flag fl)
+      (buildable True, [])
+      [buildable False]
+    ] ++ defaultOptions ++ exeOptions libMods testMods
   ]
 
 -- # Packages
@@ -98,4 +129,10 @@ libDeps = buildDepends
 main :: IO ()
 main = defaultMain $ do
   libMods <- modules "lib"
-  return ( props, library libMods, sections )
+  testMods <- modules "tests"
+  fl <- makeFlag "tests" $ FlagOpts
+    { flagDescription = "Build test executables"
+    , flagDefault = False
+    , flagManual = True
+    }
+  return ( props, library libMods, sections fl libMods testMods )

@@ -23,12 +23,28 @@
 --
 -- * Only deals with standard input, standard output, and standard
 -- error; you cannot create additional streams to or from the process.
+--
+-- * Any pipelines you create must be created entirely within the
+-- shell.  Ideally this library would create individual Pipe
+-- components, one for each process.  However, that turns out to be a
+-- surprisingly difficult problem.  See
+--
+-- <https://groups.google.com/d/msg/haskell-pipes/JFfyquj5HAg/Lxz7p50JOh4J>
+--
+-- All this library can do is launch a single process (or, perhaps, a
+-- shell pipeline using something like @sh -c@) and hook Pipes 'Proxy'
+-- to each of the standard streams.  However, the 'Proxy' must be a
+-- 'Producer' (for standard input) or a 'Consumer' (for standard
+-- output or standard error).  This limits your flexibility a lot, but
+-- it can still be useful.
 module Pipes.Process
   ( -- * Types
-    RunProxy(..)
-  , RunProducer
-  , RunConsumer
-  , StdStream(..)
+    StdStream
+  , inherit
+  , useHandle
+  , useProxy
+  , StreamToInput
+  , StreamFromOutput
   , Process.CmdSpec(..)
   , ProcSpec(..)
   , procSpec
@@ -56,38 +72,55 @@ import qualified Control.Exception
 import Control.Monad.Trans.Cont (ContT(ContT), evalContT)
 import Control.Concurrent.Async (wait, Async, withAsync)
 
--- # RunProxy
+-- | Values of this type are used to determine how to handle each of
+-- the standard streams: standard input, standard output, and standard
+-- error.  See 'inherit', 'useHandle', and 'useProxy'.
+data StdStream a' a b m
+  = Inherit
+  -- ^ Inherit the stream from the current process.
+  | UseHandle Handle
+  -- ^ Use the given handle for the stream.
+  | UseProxy (Proxy a' a () b m ()) (m () -> IO ())
+-- | Inherit the stream from the current process.
+inherit :: StdStream a' a b IO
+inherit = Inherit
 
--- | 'RunProxy' bundles a 'Proxy' with a function that runs 'Effects'
--- that the 'Proxy' will ultimately produce.
+-- | Use the given handle for the stream.
+useHandle :: Handle -> StdStream a' a b IO
+useHandle = UseHandle
+
+-- | Use a Pipes 'Proxy'.  The type system will only allow you to
+-- use a 'StreamToInput' or a 'StreamFromOutput', depending on
+-- whether you are trying to handle standard input, standard output,
+-- or standard error.
 --
 -- The type variables have the same meaning as in 'Proxy'.  There is
 -- no type variable for @b'@ because this type will always be ().
 -- Similarly, there is no type variable for the
 -- return type; it is always ().
-data RunProxy a' a b m
-  = RunProxy (Proxy a' a () b m ()) (m () -> IO ())
-  -- ^ @RunProxy p f@, where
-  --
-  -- @p@ is a 'Proxy', and
-  --
-  -- @f@ is a function that, when applied to a value in the base
+useProxy
+  :: Proxy a' a () b m ()
+  -- ^ The 'Proxy' to use.
+
+  -> (m () -> IO ())
+  -- A function that, when applied to a value in the base
   -- 'Monad' of the 'Proxy', returns an 'IO' action.  This allows you
   -- to use any base 'Monad' you wish, provided that it is an instance
   -- of 'MonadIO' and that you can pair it with an appropriate
   -- function.
+  -> StdStream a' a b m
+useProxy = UseProxy
 
--- | A 'RunProxy' that produces 'ByteString'.
-type RunProducer m = RunProxy X  ()         ByteString m
 
--- | A 'RunProxy' that consumes 'ByteString'.
-type RunConsumer m = RunProxy () ByteString X          m
 
-data StdStream a' a b m r
-  = Inherit
-  | UseHandle Handle
-  | UseProxy (RunProxy a' a b m)
 
+
+-- | A 'StdStream' that can be used to stream to standard input.
+type StreamToInput m = StdStream X () ByteString m
+
+-- | A 'StdStream' that can be used to stream from standard output or
+-- from standard error.
+type StreamFromOutput m = StdStream () ByteString X m
 
 -- | Specifies how to launch a process.  The "System.Process" module
 -- is used to launch the process.
@@ -114,11 +147,11 @@ data ProcSpec = ProcSpec
 
 
 convertProcSpec
-  :: StdStream xa' xa xb xm xr
+  :: StdStream xa' xa xb xm
   -- ^ Stdin
-  -> StdStream ya' ya yb ym yr
+  -> StdStream ya' ya yb ym
   -- ^ Stdout
-  -> StdStream za' za zb zm zr
+  -> StdStream za' za zb zm
   -- ^ Stderr
   -> ProcSpec
   -> Process.CreateProcess
@@ -135,12 +168,12 @@ convertProcSpec inp out err ps = Process.CreateProcess
   }
 
 convertStdStream
-  :: StdStream a' a b m r
+  :: StdStream a' a b m
   -> Process.StdStream
 convertStdStream s = case s of
   Inherit -> Process.Inherit
   UseHandle h -> Process.UseHandle h
-  UseProxy _ -> Process.CreatePipe
+  UseProxy _ _ -> Process.CreatePipe
 
 -- | Creates a 'ProcSpec' with the given program name and arguments.
 -- In addition:
@@ -219,26 +252,43 @@ bufSize = 1024
 -- | Create a 'Producer'' from a 'Handle'.  The 'Producer'' will get
 -- 'ByteString' from the 'Handle' and produce them.  Does nothing to
 -- close the given 'Handle' at any time.
+--
+-- Any IO exceptions are caught but are ignored.  After an IO
+-- exception, production ceases.
 produceFromHandle
   :: MonadIO m
   => Handle
   -> Producer ByteString m ()
-produceFromHandle h = liftIO (BS.hGetSome h bufSize) >>= go
+produceFromHandle h = liftIO get >>= go
   where
-    go bs | BS.null bs = return ()
-          | otherwise = yield bs >> produceFromHandle h
+    get = Control.Exception.catch (fmap Just $ BS.hGetSome h bufSize)
+      han
+    han :: Control.Exception.IOException -> IO (Maybe a)
+    han _ = return Nothing
+    go Nothing = return ()
+    go (Just bs)
+      | BS.null bs = return ()
+      | otherwise = yield bs >> produceFromHandle h
+
 
 -- | Create a 'Consumer'' from a 'Handle'.  The 'Consumer' will put
 -- each 'ByteString' it receives into the 'Handle'.  Does nothing to
 -- close the handle at any time.
+--
+-- Any IO exceptions are caught but are ignored.  After an IO
+-- exception, production ceases.
 consumeToHandle
   :: MonadIO m
   => Handle
-  -> Consumer ByteString m r
+  -> Consumer ByteString m ()
 consumeToHandle h = do
   bs <- await
-  liftIO $ BS.hPut h bs
-  consumeToHandle h
+  let han :: Control.Exception.IOException -> IO (Maybe a)
+      han _ = return Nothing
+  putRes <- liftIO (Control.Exception.catch (fmap Just (BS.hPut h bs)) han)
+  case putRes of
+    Nothing -> return ()
+    Just _ -> consumeToHandle h
 
 
 -- | Launches and runs a subprocess to completion.  Is exception-safe;
@@ -246,12 +296,12 @@ consumeToHandle h = do
 -- 'Process.terminateProcess' and the associated 'Handle's will be
 -- closed.
 runProcess
-  :: (MonadIO xm, MonadIO ym, MonadIO zm)
-  => StdStream X  ()         ByteString xm ()
-  -- ^ Produces bytes for thebprocess standard input.
-  -> StdStream () ByteString X          ym ()
+  :: (MonadIO im, MonadIO om, MonadIO em)
+  => StreamToInput im
+  -- ^ Produces bytes for the process standard input.
+  -> StreamFromOutput om
   -- ^ Consumes bytes from the subprocess standard output.
-  -> StdStream () ByteString X          zm ()
+  -> StreamFromOutput em
   -- ^ Consumes bytes from the subprocess standard error.
   -> ProcSpec
   -> IO ExitCode
@@ -267,25 +317,25 @@ runProcess inp out err ps = useProcess make user
       set o
       set e
       return (i, o, e, h)
-    getter han (RunProxy consmr runner) = runner $ runEffect $
-      produceFromHandle han >-> consmr
-    pusher han (RunProxy prodcr runner) = runner $ runEffect $
-      prodcr >-> consumeToHandle han
+    getter han prod rnr = rnr $ runEffect $
+      produceFromHandle han >-> prod
+    pusher han prod rnr = rnr $ runEffect $
+      prod >-> consumeToHandle han
     user inH outH errH = evalContT $ do
       aIn <- case inp of
-        UseProxy rp -> case inH of
+        UseProxy prod rnr -> case inH of
           Nothing -> error "runProcess: error 1"
-          Just h -> fmap Just . spawn $ pusher h rp
+          Just h -> fmap Just . spawn $ pusher h prod rnr
         _ -> return Nothing
       bOut <- case out of
-        UseProxy rp -> case outH of
+        UseProxy prod rnr -> case outH of
           Nothing -> error "runProcess: error 2"
-          Just h -> fmap Just . spawn $ getter h rp
+          Just h -> fmap Just . spawn $ getter h prod rnr
         _ -> return Nothing
       bErr <- case err of
-        UseProxy rp -> case errH of
+        UseProxy prod rnr -> case errH of
           Nothing -> error "runProcess: error 3"
-          Just h -> fmap Just . spawn $ getter h rp
+          Just h -> fmap Just . spawn $ getter h prod rnr
         _ -> return Nothing
       mayWait aIn
       mayWait bOut
