@@ -1,4 +1,4 @@
-module Pipes.Proctee.Mailboxes where
+module Pipes.Cliff where
 
 import System.IO
 import Pipes
