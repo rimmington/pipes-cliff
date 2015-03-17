@@ -5,7 +5,7 @@
 -- viewing this on Hackage; look for the @Source@ link.  Or, you can
 -- find the source at
 --
--- <https://github.com/massysett/pipes-process/blob/master/lib/Pipes/Cliff/Examples.hs>
+-- <https://github.com/massysett/pipes-cliff/blob/master/lib/Pipes/Cliff/Examples.hs>
 
 module Pipes.Cliff.Examples where
 
