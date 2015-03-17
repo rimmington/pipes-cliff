@@ -16,7 +16,7 @@ import qualified Pipes.Proctee.Mailboxes as M
 import Control.Monad.Trans.Cont
 import qualified Data.ByteString.Char8 as BS8
 import System.Exit
-import System.Process (waitForProcess, terminateProcess)
+import System.Process (waitForProcess)
 
 -- | Streams an infinite list of numbers to @less@.
 numsToLess :: IO ExitCode
@@ -25,7 +25,7 @@ numsToLess = runProcess (useProxy produceNumbers id) inherit inherit
 
 numsToLess' :: IO ExitCode
 numsToLess' = flip runContT return $ do
-  M.Newman (Just out) _ _ han <- M.createProcess
+  M.Mailboxes (Just out) _ _ han <- M.createProcess
     (M.procSpec "less" []) { M.std_in = M.Mailbox }
   lift . runEffect $ produceNumbers >-> toOutput out
   lift $ waitForProcess han
@@ -34,16 +34,16 @@ numsToLess' = flip runContT return $ do
 -- Perfectly useless, but shows how to build pipelines.
 alphaNumbers :: IO ExitCode
 alphaNumbers = flip runContT return $ do
-  M.Newman (Just toTr) (Just fromTr) _ trHan <- M.createProcess
+  M.Mailboxes (Just toTr) (Just fromTr) _ _ <- M.createProcess
     (M.procSpec "tr" ["[0-9]", "[a-z]"]) { M.std_in = M.Mailbox
                                          , M.std_out = M.Mailbox
                                          }
-  M.Newman (Just toLess) _ _ lessHan <- M.createProcess
+  M.Mailboxes (Just toLess) _ _ lessHan <- M.createProcess
     (M.procSpec "less" []) { M.std_in = M.Mailbox }
   _ <- M.background . runEffect $ fromInput fromTr >-> toOutput toLess
   _ <- M.background . runEffect $ produceNumbers >-> toOutput toTr
-  lift $ waitForProcess lessHan
-  -- lift $ terminateProcess trHan
+  r <- lift $ waitForProcess lessHan
+  return r
 
 -- | Produces a stream of ByteString, where each ByteString is a shown
 -- integer.

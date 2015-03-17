@@ -41,15 +41,6 @@ data ProcSpec = ProcSpec
   -- module for details.
   }
 
--- | Closes a handle.  Suppresses all IO exceptions; others are thrown.
-closeNoThrow :: Maybe Handle -> IO ()
-closeNoThrow mayH = Control.Exception.catch (maybe (return ()) hClose mayH)
-  han
-  where
-    han :: Control.Exception.IOException -> IO ()
-    han _ = return ()
-
-
 -- Waiting on a process handle more than once will merely return the
 -- same code more than once.  See the source code for System.Process.
 
@@ -65,16 +56,23 @@ useProcess ps = ContT f
   where
     f = Control.Exception.bracket acq rel
     acq = Process.createProcess (convertProcSpec ps)
-    rel (i, o, e, h) = do
-      closeNoThrow i
-      closeNoThrow o
-      closeNoThrow e
-      putStrLn $ "running terminator "
-        ++ let Process.RawCommand nm _ = cmdspec ps in nm
+    rel (i, o, e, h)= do
       Process.terminateProcess h
       _ <- Process.waitForProcess h
+      let shut = maybe (return ()) (ignoreIOExceptions . hClose)
+      shut i >> shut o >> shut e
       return ()
 
+-- | Runs a particular action, ignoring all IO errors.  Sometimes
+-- using hClose will result in a broken pipe error.  Since the process
+-- may have already been shut down, this is to be expected.  Since
+-- there is nothing that can really be done to respond to any IO error
+-- that results from closing a handle, just ignore these errors.
+ignoreIOExceptions :: IO () -> IO ()
+ignoreIOExceptions a = Control.Exception.catch a f
+  where
+    f :: Control.Exception.IOException -> IO ()
+    f _ = return ()
 
 -- | Create a 'Producer'' from a 'Handle'.  The 'Producer'' will get
 -- 'ByteString' from the 'Handle' and produce them.  Does nothing to
@@ -86,14 +84,9 @@ produceFromHandle
   :: MonadIO m
   => Handle
   -> Producer ByteString m ()
-produceFromHandle h = liftIO get >>= go
+produceFromHandle h = liftIO (BS.hGetSome h bufSize) >>= go
   where
-    get = Control.Exception.catch (fmap Just $ BS.hGetSome h bufSize)
-      han
-    han :: Control.Exception.IOException -> IO (Maybe a)
-    han _ = return Nothing
-    go Nothing = return ()
-    go (Just bs)
+    go bs
       | BS.null bs = return ()
       | otherwise = yield bs >> produceFromHandle h
 
@@ -101,23 +94,29 @@ produceFromHandle h = liftIO get >>= go
 -- | Create a 'Consumer'' from a 'Handle'.  The 'Consumer' will put
 -- each 'ByteString' it receives into the 'Handle'.  Does nothing to
 -- close the handle at any time.
---
--- Any IO exceptions are caught but are ignored.  After an IO
--- exception, consumption ceases.
 consumeToHandle
   :: MonadIO m
   => Handle
-  -> Consumer ByteString m ()
+  -> Consumer ByteString m a
 consumeToHandle h = do
   bs <- await
-  let han :: Control.Exception.IOException -> IO (Maybe a)
-      han _ = return Nothing
-  putRes <- liftIO (Control.Exception.catch (fmap Just (BS.hPut h bs)) han)
-  case putRes of
-    Nothing -> return ()
-    Just _ -> consumeToHandle h
+  liftIO $ BS.hPut h bs
+  consumeToHandle h
+
+-- | Creates a mailbox; seals it when done.
+withMailbox :: ContT r IO (Output a, Input a)
+withMailbox = ContT f
+  where
+    f calc = Control.Exception.bracket acq rel use
+      where
+        acq = spawn' messageBuffer
+        rel (_, _, seal) = atomically seal
+        use (out, inp, _) = calc (out, inp)
 
 
+-- | A buffer that holds 10 messages.  I have no idea if this is the
+-- ideal size.  Don't use an unbounded buffer, though, because with
+-- unbounded producers an unbounded buffer will fill up your RAM.
 messageBuffer :: Buffer a
 messageBuffer = bounded 10
 
@@ -131,9 +130,9 @@ makeOutputBox
   :: Handle
   -> ContT r IO (Output ByteString)
 makeOutputBox han = do
-  (output, input) <- withMailbox messageBuffer
+  (output, input) <- withMailbox
   let act = runEffect $ fromInput input >-> consumeToHandle han
-  _ <- ContT $ withAsync act
+  _ <- background act
   return output
 
         
@@ -144,9 +143,9 @@ makeInputBox
   :: Handle
   -> ContT r IO (Input ByteString)
 makeInputBox han = do
-  (output, input) <- withMailbox messageBuffer
+  (output, input) <- withMailbox
   let act = runEffect $ produceFromHandle han >-> toOutput output
-  _ <- ContT $ withAsync act
+  _ <- background act
   return input
 
 makeBox
@@ -169,11 +168,11 @@ makeBoxes (mayIn, mayOut, mayErr) = do
   err <- makeBox mayErr makeInputBox
   return (inp, out, err)
 
-data Newman = Newman
-  { newmanStdIn :: Maybe (Output ByteString)
-  , newmanStdOut :: Maybe (Input ByteString)
-  , newmanStdErr :: Maybe (Input ByteString)
-  , newmanHandle :: Process.ProcessHandle
+data Mailboxes = Mailboxes
+  { mbxStdIn :: Maybe (Output ByteString)
+  , mbxStdOut :: Maybe (Input ByteString)
+  , mbxStdErr :: Maybe (Input ByteString)
+  , mbxHandle :: Process.ProcessHandle
   }
 
 -- | Launch and use a subprocess.
@@ -202,11 +201,11 @@ data Newman = Newman
 -- function to run your processes.
 createProcess
   :: ProcSpec
-  -> ContT r IO Newman
+  -> ContT r IO Mailboxes
 createProcess spec = do
   (inp, out, err, han) <- useProcess spec
   (inp', out', err') <- makeBoxes (inp, out, err)
-  return $ Newman inp' out' err' han
+  return $ Mailboxes inp' out' err' han
 
 -- | Runs created processes, in a safe way.  No resources will leak
 -- from the computation even if exceptions are thrown.  You will have
@@ -226,15 +225,6 @@ runCreatedProcess = flip runContT (const (return ()))
 -- small value and see how it works.
 bufSize :: Int
 bufSize = 1024
-
-withMailbox :: Buffer a -> ContT r IO (Output a, Input a)
-withMailbox buf = ContT f
-  where
-    f runner = Control.Exception.bracket acq rel use
-      where
-        use (out, inp, _) = runner (out, inp)
-        acq = spawn' buf
-        rel (_, _, seal) = putStrLn "sealing" >> atomically seal
 
 -- | Runs a thread in the background.  Be sure to use this for each
 -- 'Effect' if you need to run multiple 'Effect's that form part of a
