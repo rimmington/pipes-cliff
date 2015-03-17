@@ -13,7 +13,7 @@ import Control.Monad.Trans.Cont
 data StdStream
   = Inherit
   | UseHandle Handle
-  | MakeMailbox
+  | Mailbox
 
 data ProcSpec = ProcSpec
   { cmdspec :: Process.CmdSpec
@@ -63,12 +63,14 @@ useProcess
                 , Process.ProcessHandle)
 useProcess ps = ContT f
   where
-    f runner = Control.Exception.bracket acq rel runner
+    f = Control.Exception.bracket acq rel
     acq = Process.createProcess (convertProcSpec ps)
     rel (i, o, e, h) = do
       closeNoThrow i
       closeNoThrow o
       closeNoThrow e
+      putStrLn $ "running terminator "
+        ++ let Process.RawCommand nm _ = cmdspec ps in nm
       Process.terminateProcess h
       _ <- Process.waitForProcess h
       return ()
@@ -129,10 +131,8 @@ makeOutputBox
   :: Handle
   -> ContT r IO (Output ByteString)
 makeOutputBox han = do
-  (output, input, seal) <- lift $ spawn' messageBuffer
-  let act = do
-        runEffect $ fromInput input >-> consumeToHandle han
-        atomically seal
+  (output, input) <- withMailbox messageBuffer
+  let act = runEffect $ fromInput input >-> consumeToHandle han
   _ <- ContT $ withAsync act
   return output
 
@@ -144,10 +144,8 @@ makeInputBox
   :: Handle
   -> ContT r IO (Input ByteString)
 makeInputBox han = do
-  (output, input, seal) <- lift $ spawn' messageBuffer
-  let act = do
-        runEffect $ produceFromHandle han >-> toOutput output
-        atomically seal
+  (output, input) <- withMailbox messageBuffer
+  let act = runEffect $ produceFromHandle han >-> toOutput output
   _ <- ContT $ withAsync act
   return input
 
@@ -171,11 +169,11 @@ makeBoxes (mayIn, mayOut, mayErr) = do
   err <- makeBox mayErr makeInputBox
   return (inp, out, err)
 
-data Wire = Wire
-  { wireStdIn :: Maybe (Output ByteString)
-  , wireStdOut :: Maybe (Input ByteString)
-  , wireStdErr :: Maybe (Input ByteString)
-  , wireHandle :: Process.ProcessHandle
+data Newman = Newman
+  { newmanStdIn :: Maybe (Output ByteString)
+  , newmanStdOut :: Maybe (Input ByteString)
+  , newmanStdErr :: Maybe (Input ByteString)
+  , newmanHandle :: Process.ProcessHandle
   }
 
 -- | Launch and use a subprocess.
@@ -204,11 +202,11 @@ data Wire = Wire
 -- function to run your processes.
 createProcess
   :: ProcSpec
-  -> ContT r IO Wire
+  -> ContT r IO Newman
 createProcess spec = do
   (inp, out, err, han) <- useProcess spec
   (inp', out', err') <- makeBoxes (inp, out, err)
-  return $ Wire inp' out' err' han
+  return $ Newman inp' out' err' han
 
 -- | Runs created processes, in a safe way.  No resources will leak
 -- from the computation even if exceptions are thrown.  You will have
@@ -229,6 +227,26 @@ runCreatedProcess = flip runContT (const (return ()))
 bufSize :: Int
 bufSize = 1024
 
+withMailbox :: Buffer a -> ContT r IO (Output a, Input a)
+withMailbox buf = ContT f
+  where
+    f runner = Control.Exception.bracket acq rel use
+      where
+        use (out, inp, _) = runner (out, inp)
+        acq = spawn' buf
+        rel (_, _, seal) = putStrLn "sealing" >> atomically seal
+
+-- | Runs a thread in the background.  Be sure to use this for each
+-- 'Effect' if you need to run multiple 'Effect's that form part of a
+-- pipeline; if you have a pipeline but you only start one thread at a
+-- time, you may get a deadlock.  The 'Async' that is returned allows
+-- you to later kill the thread if you need to.  The associated thread
+-- will be killed when the entire 'ContT' computation completes; to
+-- prevent this from happening, use 'wait'.
+
+background :: IO a -> ContT r IO (Async a)
+background = ContT . withAsync
+
 convertProcSpec :: ProcSpec -> Process.CreateProcess
 convertProcSpec a = Process.CreateProcess
   { Process.cmdspec = cmdspec a
@@ -248,7 +266,7 @@ convertStdStream :: StdStream -> Process.StdStream
 convertStdStream a = case a of
   Inherit -> Process.Inherit
   UseHandle h -> Process.UseHandle h
-  MakeMailbox -> Process.CreatePipe
+  Mailbox -> Process.CreatePipe
 
 procSpec
   :: String

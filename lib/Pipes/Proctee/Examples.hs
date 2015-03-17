@@ -16,35 +16,39 @@ import qualified Pipes.Proctee.Mailboxes as M
 import Control.Monad.Trans.Cont
 import qualified Data.ByteString.Char8 as BS8
 import System.Exit
-import System.Process (waitForProcess)
+import System.Process (waitForProcess, terminateProcess)
 
 -- | Streams an infinite list of numbers to @less@.
 numsToLess :: IO ExitCode
-numsToLess = runProcess (useProxy prod id) inherit inherit
+numsToLess = runProcess (useProxy produceNumbers id) inherit inherit
   (procSpec "less" [])
-  where
-    prod
-      = each
-      . fmap mkNumStr
-      $ [(0 :: Int) ..]
-    mkNumStr
-      = flip BS8.snoc '\n'
-      . BS8.pack
-      . show
 
 numsToLess' :: IO ExitCode
 numsToLess' = flip runContT return $ do
-  M.Wire (Just out) _ _ han <- M.createProcess
-    (M.procSpec "less" []) { M.std_in = M.MakeMailbox }
-  lift . runEffect $ prod >-> toOutput out
+  M.Newman (Just out) _ _ han <- M.createProcess
+    (M.procSpec "less" []) { M.std_in = M.Mailbox }
+  lift . runEffect $ produceNumbers >-> toOutput out
   lift $ waitForProcess han
-  where
-    prod
-      = each
-      . fmap mkNumStr
-      $ [(0 :: Int) ..]
-    mkNumStr
-      = flip BS8.snoc '\n'
-      . BS8.pack
-      . show
 
+-- | Streams an infinite list of numbers to @tr@ and then to @less@.
+-- Perfectly useless, but shows how to build pipelines.
+alphaNumbers :: IO ExitCode
+alphaNumbers = flip runContT return $ do
+  M.Newman (Just toTr) (Just fromTr) _ trHan <- M.createProcess
+    (M.procSpec "tr" ["[0-9]", "[a-z]"]) { M.std_in = M.Mailbox
+                                         , M.std_out = M.Mailbox
+                                         }
+  M.Newman (Just toLess) _ _ lessHan <- M.createProcess
+    (M.procSpec "less" []) { M.std_in = M.Mailbox }
+  _ <- M.background . runEffect $ fromInput fromTr >-> toOutput toLess
+  _ <- M.background . runEffect $ produceNumbers >-> toOutput toTr
+  lift $ waitForProcess lessHan
+  -- lift $ terminateProcess trHan
+
+-- | Produces a stream of ByteString, where each ByteString is a shown
+-- integer.
+
+produceNumbers :: Monad m => Producer BS8.ByteString m ()
+produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
+  where
+    mkNumStr = flip BS8.snoc '\n' . BS8.pack . show
