@@ -1,4 +1,12 @@
-module Pipes.Cliff where
+module Pipes.Cliff
+  ( StdStream(..)
+  , ProcSpec(..)
+  , Mailboxes(..)
+  , procSpec
+  , createProcess
+  , runCreatedProcess
+  , background
+  ) where
 
 import System.IO
 import Pipes
@@ -186,11 +194,10 @@ data Mailboxes = Mailboxes
 -- process--you just can't return something that must perform IO to
 -- interact with the process.
 --
--- Also, by default, exiting the 'ContT' monad
--- immediately destroys all subprocesses.  If you want to make sure
--- the process terminates first, use 'Process.waitForProcess' on the
--- handle which you can get from 'wireHandle' before leaving the
--- 'ContT' monad.
+-- Also, exiting the 'ContT' monad immediately destroys all
+-- subprocesses.  If you want to make sure the process terminates
+-- first, use 'Process.waitForProcess' on the handle which you can get
+-- from 'mbxHandle' before leaving the 'ContT' monad.
 --
 -- The upside of this warning is that because all subprocess resources
 -- are destroyed after leaving the 'ContT' monad, this function is
