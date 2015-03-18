@@ -33,6 +33,14 @@ sh generate
 
 (at least, this is how you would do it on a Unix-like system.)
 
+If you are having trouble getting pipes-cliff to build, examine the
+build history here:
+
+[![Build Status](https://travis-ci.org/massysett/pipes-cliff.svg?branch=master)](https://travis-ci.org/massysett/pipes-cliff)
+
+Previous builds will show you the dependencies that were used in the
+past to build the library.
+
 ## Why the name?
 
 It's named after Cliff Clavin, the mailman on the TV show
