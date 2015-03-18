@@ -1,0 +1,21 @@
+language: haskell
+ghc:
+  - 7.6
+  - 7.8
+
+before_install:
+  - cabal update
+  - cabal install cartel
+  - pwd
+  - sh generate
+  - packdeps pipes-cliff.cabal
+
+install:
+  - cabal install --only-dependencies
+
+script:
+  - ghc-pkg list
+  - cabal sdist --output-directory=tarball
+  - cd tarball
+  - pwd
+  - cabal install -ftests
