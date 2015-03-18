@@ -113,6 +113,9 @@ transformers = closedOpen "transformers" [0,3,0,0] [0,5]
 pipes :: Package
 pipes = closedOpen "pipes" [4,1] [4,2]
 
+pipesSafe :: Package
+pipesSafe = closedOpen "pipes-safe" [2,2] [2,3]
+
 pipesConcurrency :: Package
 pipesConcurrency = closedOpen "pipes-concurrency" [2,0] [2,1]
 
@@ -125,11 +128,16 @@ process = closedOpen "process" [1,2,0,0] [1,3]
 async :: Package
 async = closedOpen "async" [2,0] [2,1]
 
+-- Not currently used.
+stm :: Package
+stm = closedOpen "stm" [2,4] [2,5]
+
 libDeps :: HasBuildInfo a => a
 libDeps = buildDepends
   [ base
   , transformers
   , pipes
+  , pipesSafe
   , bytestring
   , process
   , async

@@ -60,7 +60,8 @@
 -- find more useful than this one.
 --
 -- For some simple examples, consult "Pipes.Cliff.Examples".
-module Pipes.Cliff
+module Pipes.Cliff where
+{-
   ( StdStream(..)
   , CreateProcess(..)
   , Mailboxes(..)
@@ -78,18 +79,20 @@ module Pipes.Cliff
   , module Pipes.Concurrent
   , module System.Exit
   ) where
-
+-}
 import System.IO
 import Pipes
 import Pipes.Concurrent
 import qualified Control.Concurrent.Async (Async, withAsync)
 import Control.Monad.Trans.Cont (ContT(..), evalContT)
-import Control.Concurrent.Async (wait, Async)
+import Control.Monad (liftM)
+import Control.Concurrent.Async (wait, Async, async, cancel)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified System.Process as Process
 import System.Process (waitForProcess)
 import qualified Control.Exception
+import Pipes.Safe
 import System.Exit
 
 -- # Exception handling
@@ -148,24 +151,28 @@ data CreateProcess = CreateProcess
   -- module for details.
   }
 
+data ToProcess = ToProcess (Output ByteString) ReleaseKey
+
+data FromProcess = FromProcess (Input ByteString) ReleaseKey
+
 -- | Contains any mailboxes that communicate with the subprocess,
 -- along with the process handle.
 data Mailboxes = Mailboxes
 
-  { mbxStdIn :: Maybe (Output ByteString)
+  { mbxStdIn :: Maybe ToProcess
   -- ^ Mailbox to send data to the standard input, if you requested
   -- such a mailbox using 'Mailbox' for 'std_in'.  Each 'ByteString'
   -- that you place into the 'Output' will be sent to the subprocess
   -- using 'BS.hPut'.
 
-  , mbxStdOut :: Maybe (Input ByteString)
+  , mbxStdOut :: Maybe FromProcess
   -- ^ Mailbox to receive data from the standard output, if you
   -- requested such a mailbox using 'Mailbox' for 'std_out'.  The
   -- output from the subprocess is read in arbitrarily sized chunks
   -- (currently this arbitrary size is 1024 bytes) and resulting
   -- chunks are placed in this 'Input'.
 
-  , mbxStdErr :: Maybe (Input ByteString)
+  , mbxStdErr :: Maybe FromProcess
   -- ^ Mailbox to receive data from the standard error, if you
   -- requested such a mailbox using 'Mailbox' for 'std_err'.  The
   -- output from the subprocess is read in arbitrarily sized chunks
@@ -237,6 +244,7 @@ proc prog args = CreateProcess
   , delegate_ctlc = False
   }
 
+
 -- # Pipes
 
 -- | I have no idea what this should be.  I'll start with a simple
@@ -270,18 +278,6 @@ consumeToHandle h = do
   liftIO $ BS.hPut h bs
   consumeToHandle h
 
--- # Mailboxes
-
--- | Creates a mailbox; seals it when done.
-withMailbox :: ContT r IO (Output a, Input a)
-withMailbox = ContT f
-  where
-    f calc = Control.Exception.bracket acq rel use
-      where
-        acq = spawn' messageBuffer
-        rel (_, _, seal) = atomically seal
-        use (out, inp, _) = calc (out, inp)
-
 
 -- | A buffer that holds 10 messages.  I have no idea if this is the
 -- ideal size.  Don't use an unbounded buffer, though, because with
@@ -289,52 +285,104 @@ withMailbox = ContT f
 messageBuffer :: Buffer a
 messageBuffer = bounded 10
 
+initialize
+  :: (MonadSafe m, MonadIO m)
+  => IO a
+  -> (a -> IO ())
+  -> m (a, ReleaseKey)
+initialize make destroy = mask $ \_ -> do
+  thing <- liftIO make
+  key <- register (liftIO (destroy thing))
+  return (thing, key)
+
+-- | Creates a mailbox; seals it when done.
+newMailbox
+  :: (MonadSafe m, MonadIO m)
+  => m (Output a, Input a, ReleaseKey)
+newMailbox = liftM (\((inp, out, stm), key) -> (inp, out, key)) $
+  initialize (spawn' messageBuffer)
+  (\(_, _, seal) -> atomically seal)
+
+background :: (MonadSafe m, MonadIO m) => IO a -> m (Async a, ReleaseKey)
+background action= initialize (async action) cancel
+
+processPump
+  :: (MonadSafe m, MonadIO m)
+  => Handle
+  -> Input ByteString
+  -> m ()
+processPump handle input = do
+  let pumper = runSafeT $ do
+        register (liftIO $ ignoreIOExceptions $ hClose handle)
+        liftIO . runEffect $
+          fromInput input >-> consumeToHandle handle
+  _ <- background pumper
+  return ()
+
+processPull
+  :: (MonadSafe m, MonadIO m)
+  => Handle
+  -> Output ByteString
+  -> m ()
+processPull handle output = do
+  let puller = runSafeT $ do
+        register (liftIO $ ignoreIOExceptions $ hClose handle)
+        liftIO . runEffect $
+          produceFromHandle handle >-> toOutput output
+  _ <- background puller
+  return ()
+
+
+makeToProcess
+  :: (MonadSafe m, MonadIO m)
+  => Handle
+  -> m ToProcess
+makeToProcess handle = do
+  (out, inp, key) <- newMailbox
+  processPump handle inp
+  return $ ToProcess out key
+
+makeFromProcess
+  :: (MonadSafe m, MonadIO m)
+  => Handle
+  -> m FromProcess
+makeFromProcess handle = do
+  (out, inp, key) <- newMailbox
+  processPull handle out
+  return $ FromProcess inp key
+
+
+makeBox
+  :: Monad m
+  => Maybe Handle
+  -> (Handle -> m a)
+  -> m (Maybe a)
+makeBox mayHan mkr = case mayHan of
+  Nothing -> return Nothing
+  Just h -> liftM Just $ mkr h
+
+makeBoxes
+  :: (MonadIO m, MonadSafe m)
+  => (Maybe Handle, Maybe Handle, Maybe Handle)
+  -> m ( Maybe ToProcess, Maybe FromProcess, Maybe FromProcess )
+makeBoxes (mayIn, mayOut, mayErr) = do
+  inp <- makeBox mayIn makeToProcess
+  out <- makeBox mayOut makeFromProcess
+  err <- makeBox mayErr makeFromProcess
+  return (inp, out, err)
+
+{-
+-- # Mailboxes
+
 -- | Given a Handle that provides standard input to a process, return
 -- an Output that can be used to put messages in for the standard
 -- input.  Spawns another thread to feed to the process's standard
 -- input.
 
-makeOutputBox
-  :: Handle
-  -> ContT r IO (Output ByteString)
-makeOutputBox han = do
-  (output, input) <- withMailbox
-  let act = runEffect $ fromInput input >-> consumeToHandle han
-  _ <- background act
-  return output
-
         
 -- | Given a Handle that provides standard output or standard error
 -- from a process, return an Input that can be used to receive
 -- messages.
-makeInputBox
-  :: Handle
-  -> ContT r IO (Input ByteString)
-makeInputBox han = do
-  (output, input) <- withMailbox
-  let act = runEffect $ produceFromHandle han >-> toOutput output
-  _ <- background act
-  return input
-
-makeBox
-  :: Maybe Handle
-  -> (Handle -> ContT r m b)
-  -> ContT r m (Maybe b)
-makeBox mayHan mkr = case mayHan of
-  Nothing -> return Nothing
-  Just h -> fmap Just $ mkr h
-
-makeBoxes
-  :: (Maybe Handle, Maybe Handle, Maybe Handle)
-  -> ContT r IO ( Maybe (Output ByteString)
-                , Maybe (Input ByteString)
-                , Maybe (Input ByteString)
-                )
-makeBoxes (mayIn, mayOut, mayErr) = do
-  inp <- makeBox mayIn makeOutputBox
-  out <- makeBox mayOut makeInputBox
-  err <- makeBox mayErr makeInputBox
-  return (inp, out, err)
 
 -- # Subprocesses
 
@@ -422,4 +470,5 @@ safeCliff = evalContT
    * "System.Exit" reexports all bindings
 
    * "System.Process" reexports 'waitForProcess'
+-}
 -}
