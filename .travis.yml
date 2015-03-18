@@ -5,7 +5,7 @@ ghc:
 
 before_install:
   - cabal update
-  - cabal install cartel
+  - cabal install cartel packdeps
   - pwd
   - sh generate
   - packdeps pipes-cliff.cabal
