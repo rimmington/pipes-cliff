@@ -13,20 +13,39 @@
 -- standard output and standard error.  You then interact with the
 -- subprocess using "Pipes" and "Pipes.Concurrent".
 --
--- This module uses the 'ContT' monad.  It's simply a way to manage
--- the resources created, such as the subprocesses and background
--- threads.  Once a computation in the 'ContT' monad is complete, all
--- allocated resources are destroyed.  That means that all
--- subprocesses that are still running will be terminated after the
--- 'ContT' computation is complete.  That makes the 'ContT'
--- computations exception safe.
+-- __Use the @-threaded@ GHC option__ when compiling your programs or
+-- when using GHCi.  Internally, this module uses
+-- 'System.Process.waitForProcess' from the "System.Process" module;
+-- it's also quite likely that you will use this function when you
+-- write code using this library.  As the documentation for
+-- 'waitForProcess' states, you must use the @-threaded@ option to
+-- prevent every thread in the system from suspending when you use
+-- 'waitForProcess'.  So, if your program experiences deadlocks, be
+-- sure you used the @-threaded@ option.
 --
--- 'ContT' is an instance of 'MonadIO', so you can perform IO
--- computations while in the 'ContT' monad by using 'liftIO'.
+-- This module relies on the "Pipes", "Pipes.Concurrent", and
+-- "System.Process" modules.  You will want to have basic familiarity
+-- with what all of those modules do before using this module.
+--
+-- This module also uses the 'ContT' type constructor from
+-- "Control.Monad.Trans.Cont" to help with resource management.  You
+-- can use 'ContT' like you would use any other 'Monad'.  Values from
+-- this module that use the 'ContT' type constructor will
+-- automatically deallocate or destroy the resource when the 'ContT'
+-- computation copmletes.  That means that all threads and
+-- subprocesses that you create in the 'ContT' computation are
+-- destroyed when the computation completes, even if excptions are
+-- thrown.  This also means you must take care to not use any of the
+-- resources outside of the 'ContT' computation.  The 'safeCliff'
+-- function will help you with this; or, for less safety but more
+-- flexibility, use 'evalContT' from "Control.Monad.Trans.Cont".  You
+-- can use 'liftIO' to run IO computations as part of 'ContT'
+-- computations.
 --
 -- All communcation with subprocesses is done with strict
 -- 'ByteString's.  If you are dealing with textual data, the @text@
--- library has functions to convert a 'ByteString' to a @Text@.
+-- library has functions to convert a 'ByteString' to a @Text@; you
+-- will want to look at @Data.Text.Encoding@.
 --
 -- Nobody would mistake this module for a shell; nothing beats the
 -- shell as a language for starting other programs, as the shell is
@@ -40,15 +59,6 @@
 -- There you will find references to other libraries that you might
 -- find more useful than this one.
 --
--- __Use the @-threaded@ GHC option__ when compiling your programs.
--- Internally, this module uses 'System.Process.waitForProcess' from
--- the "System.Process" module; it's also quite likely that you will
--- use this function when you write code using this library.  As the
--- documentation for 'waitForProcess' states, you must use the
--- @-threaded@ option to prevent every thread in the system from
--- suspending when you use 'waitForProcess'.  So, if your program
--- experiences deadlocks, be sure you used the @-threaded@ option.
---
 -- For some simple examples, consult "Pipes.Cliff.Examples".
 module Pipes.Cliff
   ( StdStream(..)
@@ -56,8 +66,8 @@ module Pipes.Cliff
   , Mailboxes(..)
   , proc
   , createProcess
-  , runCreatedProcess
   , background
+  , safeCliff
 
   -- * Re-exports
   -- $reexports
@@ -73,15 +83,30 @@ import System.IO
 import Pipes
 import Pipes.Concurrent
 import qualified Control.Concurrent.Async (Async, withAsync)
-import Control.Concurrent.Async (wait)
+import Control.Monad.Trans.Cont (ContT(..), evalContT)
+import Control.Concurrent.Async (wait, Async)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified System.Process as Process
 import System.Process (waitForProcess)
 import qualified Control.Exception
-import Control.Monad.Trans.Cont (ContT, evalContT)
-import qualified Control.Monad.Trans.Cont as Cont
 import System.Exit
+
+-- # Exception handling
+
+-- | Runs a particular action, ignoring all IO errors.  Sometimes
+-- using hClose will result in a broken pipe error.  Since the process
+-- may have already been shut down, this is to be expected.  Since
+-- there is nothing that can really be done to respond to any IO error
+-- that results from closing a handle, just ignore these errors.
+ignoreIOExceptions :: IO () -> IO ()
+ignoreIOExceptions a = Control.Exception.catch a f
+  where
+    f :: Control.Exception.IOException -> IO ()
+    f _ = return ()
+
+
+-- # Configuration and result types
 
 -- | How will the subprocess get its information for this stream?
 data StdStream
@@ -123,134 +148,8 @@ data CreateProcess = CreateProcess
   -- module for details.
   }
 
--- Waiting on a process handle more than once will merely return the
--- same code more than once.  See the source code for System.Process.
-
--- | Use a Process.  Do not return any of the acquired resources in
--- the result, as they will be destroyed.
-useProcess
-  :: CreateProcess
-  -> ContT r IO ( Maybe Handle
-                , Maybe Handle
-                , Maybe Handle
-                , Process.ProcessHandle)
-useProcess ps = Cont.ContT f
-  where
-    f = Control.Exception.bracket acq rel
-    acq = Process.createProcess (convertCreateProcess ps)
-    rel (i, o, e, h)= do
-      Process.terminateProcess h
-      _ <- Process.waitForProcess h
-      let shut = maybe (return ()) (ignoreIOExceptions . hClose)
-      shut i >> shut o >> shut e
-      return ()
-
--- | Runs a particular action, ignoring all IO errors.  Sometimes
--- using hClose will result in a broken pipe error.  Since the process
--- may have already been shut down, this is to be expected.  Since
--- there is nothing that can really be done to respond to any IO error
--- that results from closing a handle, just ignore these errors.
-ignoreIOExceptions :: IO () -> IO ()
-ignoreIOExceptions a = Control.Exception.catch a f
-  where
-    f :: Control.Exception.IOException -> IO ()
-    f _ = return ()
-
--- | Create a 'Producer'' from a 'Handle'.  The 'Producer'' will get
--- 'ByteString' from the 'Handle' and produce them.  Does nothing to
--- close the given 'Handle' at any time.
---
--- Any IO exceptions are caught but are ignored.  After an IO
--- exception, production ceases.
-produceFromHandle
-  :: MonadIO m
-  => Handle
-  -> Producer ByteString m ()
-produceFromHandle h = liftIO (BS.hGetSome h bufSize) >>= go
-  where
-    go bs
-      | BS.null bs = return ()
-      | otherwise = yield bs >> produceFromHandle h
-
-
--- | Create a 'Consumer'' from a 'Handle'.  The 'Consumer' will put
--- each 'ByteString' it receives into the 'Handle'.  Does nothing to
--- close the handle at any time.
-consumeToHandle
-  :: MonadIO m
-  => Handle
-  -> Consumer ByteString m a
-consumeToHandle h = do
-  bs <- await
-  liftIO $ BS.hPut h bs
-  consumeToHandle h
-
--- | Creates a mailbox; seals it when done.
-withMailbox :: ContT r IO (Output a, Input a)
-withMailbox = Cont.ContT f
-  where
-    f calc = Control.Exception.bracket acq rel use
-      where
-        acq = spawn' messageBuffer
-        rel (_, _, seal) = atomically seal
-        use (out, inp, _) = calc (out, inp)
-
-
--- | A buffer that holds 10 messages.  I have no idea if this is the
--- ideal size.  Don't use an unbounded buffer, though, because with
--- unbounded producers an unbounded buffer will fill up your RAM.
-messageBuffer :: Buffer a
-messageBuffer = bounded 10
-
--- | Given a Handle that provides standard input to a process, return
--- an Output that can be used to put messages in for the standard
--- input.  Spawns another thread to feed to the process's standard
--- input.  Do not attempt to use the Output once you return out of the
--- ContT, as it will not work.
-
-makeOutputBox
-  :: Handle
-  -> ContT r IO (Output ByteString)
-makeOutputBox han = do
-  (output, input) <- withMailbox
-  let act = runEffect $ fromInput input >-> consumeToHandle han
-  _ <- background act
-  return output
-
-        
--- | Given a Handle that provides standard output or standard error
--- from a process, return an Input that can be used to receive
--- messages.
-makeInputBox
-  :: Handle
-  -> ContT r IO (Input ByteString)
-makeInputBox han = do
-  (output, input) <- withMailbox
-  let act = runEffect $ produceFromHandle han >-> toOutput output
-  _ <- background act
-  return input
-
-makeBox
-  :: Maybe Handle
-  -> (Handle -> ContT r IO b)
-  -> ContT r IO (Maybe b)
-makeBox mayHan mkr = case mayHan of
-  Nothing -> return Nothing
-  Just h -> fmap Just $ mkr h
-
-makeBoxes
-  :: (Maybe Handle, Maybe Handle, Maybe Handle)
-  -> ContT r IO ( Maybe (Output ByteString)
-                , Maybe (Input ByteString)
-                , Maybe (Input ByteString)
-                )
-makeBoxes (mayIn, mayOut, mayErr) = do
-  inp <- makeBox mayIn makeOutputBox
-  out <- makeBox mayOut makeInputBox
-  err <- makeBox mayErr makeInputBox
-  return (inp, out, err)
-
--- | Communication with the subprocess.
+-- | Contains any mailboxes that communicate with the subprocess,
+-- along with the process handle.
 data Mailboxes = Mailboxes
 
   { mbxStdIn :: Maybe (Output ByteString)
@@ -280,68 +179,6 @@ data Mailboxes = Mailboxes
   -- process finishes running, use 'Process.waitForProcess' from the
   -- "System.Process" module.
   }
-
--- | Launch and use a subprocess.
---
--- /Warning/ - do not attempt to use any of the resources created by
--- the process after leaving the 'ContT' monad.  They are all
--- destroyed.  So any Pipes you create using the 'Output' or 'Input'
--- that connect to the process must finish their IO before you leave
--- the 'ContT' monad.  It's okay to return the 'System.Exit.ExitCode'
--- that you get from running the process, or any data you get from the
--- process--you just can't return something that must perform IO to
--- interact with the process.
---
--- Also, exiting the 'ContT' monad immediately destroys all
--- subprocesses.  If you want to make sure the process terminates
--- first, use 'Process.waitForProcess' on the handle which you can get
--- from 'mbxHandle' before leaving the 'ContT' monad.
---
--- The upside of this warning is that because all subprocess resources
--- are destroyed after leaving the 'ContT' monad, this function is
--- exception safe.
---
--- If you want a safe interface which helps prevent you from shooting
--- yourself in the foot here, use only the 'runCreatedProcess'
--- function to run your processes.
-createProcess
-  :: CreateProcess
-  -> ContT r IO Mailboxes
-createProcess spec = do
-  (inp, out, err, han) <- useProcess spec
-  (inp', out', err') <- makeBoxes (inp, out, err)
-  return $ Mailboxes inp' out' err' han
-
--- | Runs created processes, in a safe way.  No resources will leak
--- from the computation even if exceptions are thrown.  You will have
--- to use the process entirely within the 'ContT' monad, which will
--- prevent you from trying to use resources after they have been
--- destroyed.
---
--- Because 'IO' is involved, I can think of ways to circumvent the
--- safety that this function provides (you could, for instance, use an
--- @IORef@ or an @MVar@ to sneak values out of the 'ContT'
--- computation) but this function does prevent you from making
--- mistakes due to inadvertence.
-runCreatedProcess :: ContT () IO a -> IO ()
-runCreatedProcess = flip Cont.runContT (const (return ()))
-
--- | I have no idea what this should be.  I'll start with a simple
--- small value and see how it works.
-bufSize :: Int
-bufSize = 1024
-
--- | Runs a thread in the background.  Be sure to use this for each
--- 'Effect' if you need to run multiple 'Effect's that form part of a
--- pipeline; if you have a pipeline but you only start one thread at a
--- time, you may get a deadlock.  The 'Control.Concurrent.Async' that
--- is returned allows you to later kill the thread if you need to.
--- The associated thread will be killed when the entire 'ContT'
--- computation completes; to prevent this from happening, use
--- 'Control.Concurrent.Async.wait' from "Control.Concurrent.Async".
-
-background :: IO a -> ContT r IO (Control.Concurrent.Async.Async a)
-background = Cont.ContT . Control.Concurrent.Async.withAsync
 
 convertCreateProcess :: CreateProcess -> Process.CreateProcess
 convertCreateProcess a = Process.CreateProcess
@@ -400,10 +237,183 @@ proc prog args = CreateProcess
   , delegate_ctlc = False
   }
 
-{- $reexports
-   * "Control.Concurrent.Async" reexports 'wait'
+-- # Pipes
 
-   * "Pipes" reexports all bindings"
+-- | I have no idea what this should be.  I'll start with a simple
+-- small value and see how it works.
+bufSize :: Int
+bufSize = 1024
+
+-- | Create a 'Producer'' from a 'Handle'.  The 'Producer'' will get
+-- 'ByteString' from the 'Handle' and produce them.  Does nothing to
+-- close the given 'Handle' at any time.
+produceFromHandle
+  :: MonadIO m
+  => Handle
+  -> Producer ByteString m ()
+produceFromHandle h = liftIO (BS.hGetSome h bufSize) >>= go
+  where
+    go bs
+      | BS.null bs = return ()
+      | otherwise = yield bs >> produceFromHandle h
+
+
+-- | Create a 'Consumer'' from a 'Handle'.  The 'Consumer' will put
+-- each 'ByteString' it receives into the 'Handle'.  Does nothing to
+-- close the handle at any time.
+consumeToHandle
+  :: MonadIO m
+  => Handle
+  -> Consumer ByteString m a
+consumeToHandle h = do
+  bs <- await
+  liftIO $ BS.hPut h bs
+  consumeToHandle h
+
+-- # Mailboxes
+
+-- | Creates a mailbox; seals it when done.
+withMailbox :: ContT r IO (Output a, Input a)
+withMailbox = ContT f
+  where
+    f calc = Control.Exception.bracket acq rel use
+      where
+        acq = spawn' messageBuffer
+        rel (_, _, seal) = atomically seal
+        use (out, inp, _) = calc (out, inp)
+
+
+-- | A buffer that holds 10 messages.  I have no idea if this is the
+-- ideal size.  Don't use an unbounded buffer, though, because with
+-- unbounded producers an unbounded buffer will fill up your RAM.
+messageBuffer :: Buffer a
+messageBuffer = bounded 10
+
+-- | Given a Handle that provides standard input to a process, return
+-- an Output that can be used to put messages in for the standard
+-- input.  Spawns another thread to feed to the process's standard
+-- input.
+
+makeOutputBox
+  :: Handle
+  -> ContT r IO (Output ByteString)
+makeOutputBox han = do
+  (output, input) <- withMailbox
+  let act = runEffect $ fromInput input >-> consumeToHandle han
+  _ <- background act
+  return output
+
+        
+-- | Given a Handle that provides standard output or standard error
+-- from a process, return an Input that can be used to receive
+-- messages.
+makeInputBox
+  :: Handle
+  -> ContT r IO (Input ByteString)
+makeInputBox han = do
+  (output, input) <- withMailbox
+  let act = runEffect $ produceFromHandle han >-> toOutput output
+  _ <- background act
+  return input
+
+makeBox
+  :: Maybe Handle
+  -> (Handle -> ContT r m b)
+  -> ContT r m (Maybe b)
+makeBox mayHan mkr = case mayHan of
+  Nothing -> return Nothing
+  Just h -> fmap Just $ mkr h
+
+makeBoxes
+  :: (Maybe Handle, Maybe Handle, Maybe Handle)
+  -> ContT r IO ( Maybe (Output ByteString)
+                , Maybe (Input ByteString)
+                , Maybe (Input ByteString)
+                )
+makeBoxes (mayIn, mayOut, mayErr) = do
+  inp <- makeBox mayIn makeOutputBox
+  out <- makeBox mayOut makeInputBox
+  err <- makeBox mayErr makeInputBox
+  return (inp, out, err)
+
+-- # Subprocesses
+
+-- Waiting on a process handle more than once will merely return the
+-- same code more than once.  See the source code for System.Process.
+
+useProcess
+  :: CreateProcess
+  -> ContT r IO ( Maybe Handle
+                , Maybe Handle
+                , Maybe Handle
+                , Process.ProcessHandle)
+useProcess ps = ContT (Control.Exception.bracket acq rel)
+  where
+    acq = Process.createProcess (convertCreateProcess ps)
+    rel (i, o, e, h)= do
+      Process.terminateProcess h
+      _ <- Process.waitForProcess h
+      let shut = maybe (return ()) (ignoreIOExceptions . hClose)
+      shut i >> shut o >> shut e
+      return ()
+
+-- | Launch and use a subprocess.
+--
+-- /Warning/ - do not attempt to use any of the resources created by
+-- the process after leaving the 'ContT' computation.  They are all
+-- destroyed.  So any Pipes you create using the 'Output' or 'Input'
+-- that connect to the process must finish their IO before you leave
+-- the 'ContT' computation.  It's okay to return the
+-- 'System.Exit.ExitCode' that you get from running the process, or
+-- any data you get from the process--you just can't return something
+-- that must perform IO to interact with the process.
+--
+-- Also, exiting the 'ContT' computation immediately destroys all
+-- subprocesses.  If you want to make sure the process terminates
+-- first, use 'Process.waitForProcess' on the handle which you can get
+-- from 'mbxHandle' before leaving the 'ContT' computation.
+--
+-- The upside of this warning is that because all subprocess resources
+-- are destroyed after leaving the 'ContT' computation, this function
+-- is exception safe.
+--
+-- To increase the safety when using values with the 'ContT' type,
+-- you can use 'safeCliff'.
+createProcess
+  :: CreateProcess
+  -> ContT r IO Mailboxes
+createProcess spec = do
+  (inp, out, err, han) <- useProcess spec
+  (inp', out', err') <- makeBoxes (inp, out, err)
+  return $ Mailboxes inp' out' err' han
+
+-- | Runs a thread in the background.  Be sure to use this for each
+-- 'Effect' if you need to run multiple 'Effect's that form part of a
+-- pipeline; if you have a pipeline but you only start one thread at a
+-- time, you may get a deadlock.  The 'Control.Concurrent.Async' that
+-- is returned allows you to later kill the thread if you need to.
+-- The associated thread will be killed when the entire 'ContT'
+-- computation completes; to prevent this from happening, use
+-- 'Control.Concurrent.Async.wait' from "Control.Concurrent.Async".
+
+background :: IO a -> ContT r IO (Async a)
+background = ContT . Control.Concurrent.Async.withAsync
+
+-- | Runs a 'ContT' computation.  Since the computation can only
+-- return the unit type, this function increases safety by making it
+-- difficult to inadvertently use values from the 'ContT' computation
+-- outside of the computation.  That keeps you from using allocated
+-- resources after they have been destroyed.
+safeCliff :: ContT () IO ()-> IO ()
+safeCliff = evalContT
+
+{- $reexports
+   * "Control.Concurrent.Async" reexports 'Async' and 'wait'
+
+   * "Control.Monad.Trans.Cont" reexports the 'ContT' type constructor
+      and data constructor, 'runContT', and 'evalContT'
+
+   * "Pipes" reexports all bindings
 
    * "Pipes.Concurrent" reexports all bindings
 

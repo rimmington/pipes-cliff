@@ -31,10 +31,6 @@ props = blank
     , ""
     , "<http://www.github.com/massysett/pipes-cliff/issues>"
     , ""
-    , "Though I hope pipes-cliff works on Windows systems, I have only"
-    , "tested it on Unix-like systems.  Any reports on how this library works"
-    , "on Windows are appreciated."
-    , ""
     , "For more information, see the README.md file, which is located in the"
     , "source tarball and at"
     , ""
@@ -104,15 +100,12 @@ sections fl libMods testMods =
 base :: Package
 base = closedOpen "base" [4,7,0,0] [4,8]
 
+-- Currently not used
 transformers :: Package
 transformers = closedOpen "transformers" [0,3,0,0] [0,5]
 
 pipes :: Package
 pipes = closedOpen "pipes" [4,1] [4,2]
-
--- | Currently not used.
-pipesSafe :: Package
-pipesSafe = closedOpen "pipes-safe" [2,2] [2,3]
 
 pipesConcurrency :: Package
 pipesConcurrency = closedOpen "pipes-concurrency" [2,0] [2,1]
