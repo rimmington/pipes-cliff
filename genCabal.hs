@@ -71,6 +71,23 @@ exeOptions libMods exeMods =
   , ghcOptions ["-threaded"]
   ]
 
+testExe
+  :: FlagName
+  -- ^ Tests flag
+  -> [NonEmptyString]
+  -- ^ Library modules
+  -> [NonEmptyString]
+  -- ^ Test modules
+  -> String
+  -- ^ Name of executable
+  -> Section
+testExe fl libMods testMods nm = executable nm $
+  [ mainIs (nm ++ ".hs")
+  , condBlock (flag fl)
+    (buildable True, [])
+    [buildable False]
+  ] ++ defaultOptions ++ exeOptions libMods testMods
+
 sections
   :: FlagName
   -- ^ Tests flag
@@ -81,19 +98,8 @@ sections
   -> [Section]
 sections fl libMods testMods =
   [ githubHead "massysett" "pipes-cliff"
-  , executable "numsToLess" $
-    [ mainIs "numsToLess.hs"
-    , condBlock (flag fl)
-      (buildable True, [])
-      [buildable False]
-    ] ++ defaultOptions ++ exeOptions libMods testMods
-  , executable "alphaNumbers" $
-    [ mainIs "alphaNumbers.hs"
-    , condBlock (flag fl)
-      (buildable True, [])
-      [buildable False]
-    ] ++ defaultOptions ++ exeOptions libMods testMods
-  ]
+  ] ++ map (testExe fl libMods testMods)
+           [ "numsToLess", "alphaNumbers", "limitedAlphaNumbers" ]
 
 -- # Packages
 

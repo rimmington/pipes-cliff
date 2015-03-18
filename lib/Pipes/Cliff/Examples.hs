@@ -14,6 +14,7 @@
 module Pipes.Cliff.Examples where
 
 import Pipes.Cliff
+import qualified Pipes.Prelude as P
 import qualified Data.ByteString.Char8 as BS8
 
 -- | Streams an infinite list of numbers to @less@.
@@ -87,8 +88,8 @@ alphaNumbers :: IO ExitCode
 alphaNumbers = evalContT $ do
   Mailboxes (Just toTr) (Just fromTr) _ _ <- createProcess
     (proc "tr" ["[0-9]", "[a-z]"]) { std_in = Mailbox
-                                         , std_out = Mailbox
-                                         }
+                                   , std_out = Mailbox
+                                   }
   Mailboxes (Just toLess) _ _ lessHan <- createProcess
     (proc "less" []) { std_in = Mailbox }
   _ <- background . runEffect $ fromInput fromTr >-> toOutput toLess
@@ -103,3 +104,19 @@ produceNumbers :: Monad m => Producer BS8.ByteString m ()
 produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
   where
     mkNumStr = flip BS8.snoc '\n' . BS8.pack . show
+
+-- | Like 'alphaNumbers' but just sends a limited number
+-- of numbers to @cat@.  A useful test to make sure that pipelines
+-- shut down automatically.
+limitedAlphaNumbers :: IO ExitCode
+limitedAlphaNumbers = evalContT $ do
+  Mailboxes (Just toTr) (Just fromTr) _ _ <- createProcess
+    (proc "tr" ["[0-9]", "[a-z]"]) { std_in = Mailbox
+                                   , std_out = Mailbox
+                                   }
+  Mailboxes (Just toCat) _ _ catHan <- createProcess
+    (proc "cat" []) { std_in = Mailbox }
+  _ <- background . runEffect $ fromInput fromTr >-> toOutput toCat
+  _ <- background . runEffect
+        $ produceNumbers >-> P.take 300 >-> toOutput toTr
+  lift $ waitForProcess catHan
