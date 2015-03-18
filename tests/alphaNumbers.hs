@@ -4,4 +4,4 @@ import Pipes.Cliff.Examples
 import System.Exit
 
 main :: IO ()
-main = numsToLess >>= exitWith
+main = alphaNumbers >>= exitWith

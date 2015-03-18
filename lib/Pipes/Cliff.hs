@@ -1,29 +1,100 @@
+-- | Spawn subprocesses and interact with them using "Pipes.Concurrent"
+--
+-- The interface in this module deliberately resembles the interface
+-- in "System.Process".  However, one consequence of this is that you
+-- will not want to have unqualified names from this module and from
+-- "System.Process" in scope at the same time.
+--
+-- As in "System.Process", you create a subprocess by creating a
+-- 'CreateProcess' record and then applying 'createProcess' to that
+-- record.  The difference is that 'createProcess' returns 'Mailboxes'
+-- to you.  You can request the creation of an 'Output' corresponding
+-- to the subprocess standard input, and an 'Input' for each of
+-- standard output and standard error.  You then interact with the
+-- subprocess using "Pipes" and "Pipes.Concurrent".
+--
+-- This module uses the 'ContT' monad.  It's simply a way to manage
+-- the resources created, such as the subprocesses and background
+-- threads.  Once a computation in the 'ContT' monad is complete, all
+-- allocated resources are destroyed.  That means that all
+-- subprocesses that are still running will be terminated after the
+-- 'ContT' computation is complete.  That makes the 'ContT'
+-- computations exception safe.
+--
+-- 'ContT' is an instance of 'MonadIO', so you can perform IO
+-- computations while in the 'ContT' monad by using 'liftIO'.
+--
+-- All communcation with subprocesses is done with strict
+-- 'ByteString's.  If you are dealing with textual data, the @text@
+-- library has functions to convert a 'ByteString' to a @Text@.
+--
+-- Nobody would mistake this module for a shell; nothing beats the
+-- shell as a language for starting other programs, as the shell is
+-- designed for that.  This module allows you to perform simple
+-- streaming with subprocesses without leaving the comfort of Haskell.
+-- Take a look at the README.md file, which is distributed with the
+-- tarball or is available at Github at
+--
+-- <https://github.com/massysett/pipes-cliff>
+--
+-- There you will find references to other libraries that you might
+-- find more useful than this one.
+--
+-- __Use the @-threaded@ GHC option__ when compiling your programs.
+-- Internally, this module uses 'System.Process.waitForProcess' from
+-- the "System.Process" module; it's also quite likely that you will
+-- use this function when you write code using this library.  As the
+-- documentation for 'waitForProcess' states, you must use the
+-- @-threaded@ option to prevent every thread in the system from
+-- suspending when you use 'waitForProcess'.  So, if your program
+-- experiences deadlocks, be sure you used the @-threaded@ option.
+--
+-- For some simple examples, consult "Pipes.Cliff.Examples".
 module Pipes.Cliff
   ( StdStream(..)
-  , ProcSpec(..)
+  , CreateProcess(..)
   , Mailboxes(..)
-  , procSpec
+  , proc
   , createProcess
   , runCreatedProcess
   , background
+
+  -- * Re-exports
+  -- $reexports
+  , module Control.Concurrent.Async
+  , module Control.Monad.Trans.Cont
+  , module System.Process
+  , module Pipes
+  , module Pipes.Concurrent
+  , module System.Exit
   ) where
 
 import System.IO
 import Pipes
 import Pipes.Concurrent
-import Control.Concurrent.Async
+import qualified Control.Concurrent.Async (Async, withAsync)
+import Control.Concurrent.Async (wait)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified System.Process as Process
+import System.Process (waitForProcess)
 import qualified Control.Exception
-import Control.Monad.Trans.Cont
+import Control.Monad.Trans.Cont (ContT, evalContT)
+import qualified Control.Monad.Trans.Cont as Cont
+import System.Exit
 
+-- | How will the subprocess get its information for this stream?
 data StdStream
   = Inherit
+  -- ^ Use whatever stream that the parent process has.
   | UseHandle Handle
+  -- ^ Use the given handle for input or output
   | Mailbox
+  -- ^ Set up a mailbox
 
-data ProcSpec = ProcSpec
+-- | Like 'System.Process.CreateProcess' in "System.Process",
+-- this gives the necessary information to create a subprocess.
+data CreateProcess = CreateProcess
   { cmdspec :: Process.CmdSpec
     -- ^ Executable and arguments, or shell command
   , cwd :: Maybe FilePath
@@ -34,8 +105,11 @@ data ProcSpec = ProcSpec
   -- calling process's working directory.
 
   , std_in :: StdStream
+  -- ^ Use this kind of stream for standard input
   , std_out :: StdStream
+  -- ^ Use this kind of stream for standard output
   , std_err :: StdStream
+  -- ^ Use this kind of stream for standard error
 
   , close_fds :: Bool
   -- ^ If 'True', close all file descriptors other than the standard
@@ -55,15 +129,15 @@ data ProcSpec = ProcSpec
 -- | Use a Process.  Do not return any of the acquired resources in
 -- the result, as they will be destroyed.
 useProcess
-  :: ProcSpec
+  :: CreateProcess
   -> ContT r IO ( Maybe Handle
                 , Maybe Handle
                 , Maybe Handle
                 , Process.ProcessHandle)
-useProcess ps = ContT f
+useProcess ps = Cont.ContT f
   where
     f = Control.Exception.bracket acq rel
-    acq = Process.createProcess (convertProcSpec ps)
+    acq = Process.createProcess (convertCreateProcess ps)
     rel (i, o, e, h)= do
       Process.terminateProcess h
       _ <- Process.waitForProcess h
@@ -113,7 +187,7 @@ consumeToHandle h = do
 
 -- | Creates a mailbox; seals it when done.
 withMailbox :: ContT r IO (Output a, Input a)
-withMailbox = ContT f
+withMailbox = Cont.ContT f
   where
     f calc = Control.Exception.bracket acq rel use
       where
@@ -176,11 +250,35 @@ makeBoxes (mayIn, mayOut, mayErr) = do
   err <- makeBox mayErr makeInputBox
   return (inp, out, err)
 
+-- | Communication with the subprocess.
 data Mailboxes = Mailboxes
+
   { mbxStdIn :: Maybe (Output ByteString)
+  -- ^ Mailbox to send data to the standard input, if you requested
+  -- such a mailbox using 'Mailbox' for 'std_in'.  Each 'ByteString'
+  -- that you place into the 'Output' will be sent to the subprocess
+  -- using 'BS.hPut'.
+
   , mbxStdOut :: Maybe (Input ByteString)
+  -- ^ Mailbox to receive data from the standard output, if you
+  -- requested such a mailbox using 'Mailbox' for 'std_out'.  The
+  -- output from the subprocess is read in arbitrarily sized chunks
+  -- (currently this arbitrary size is 1024 bytes) and resulting
+  -- chunks are placed in this 'Input'.
+
   , mbxStdErr :: Maybe (Input ByteString)
+  -- ^ Mailbox to receive data from the standard error, if you
+  -- requested such a mailbox using 'Mailbox' for 'std_err'.  The
+  -- output from the subprocess is read in arbitrarily sized chunks
+  -- (currently this arbitrary size is 1024 bytes) and resulting
+  -- chunks are placed in this 'Input'.
+
   , mbxHandle :: Process.ProcessHandle
+  -- ^ A process handle.  The process begins running in the background
+  -- immediately.  Remember that the subprocess will be terminated
+  -- right away after you leave the 'ContT' monad.  To wait until the
+  -- process finishes running, use 'Process.waitForProcess' from the
+  -- "System.Process" module.
   }
 
 -- | Launch and use a subprocess.
@@ -207,7 +305,7 @@ data Mailboxes = Mailboxes
 -- yourself in the foot here, use only the 'runCreatedProcess'
 -- function to run your processes.
 createProcess
-  :: ProcSpec
+  :: CreateProcess
   -> ContT r IO Mailboxes
 createProcess spec = do
   (inp, out, err, han) <- useProcess spec
@@ -226,7 +324,7 @@ createProcess spec = do
 -- computation) but this function does prevent you from making
 -- mistakes due to inadvertence.
 runCreatedProcess :: ContT () IO a -> IO ()
-runCreatedProcess = flip runContT (const (return ()))
+runCreatedProcess = flip Cont.runContT (const (return ()))
 
 -- | I have no idea what this should be.  I'll start with a simple
 -- small value and see how it works.
@@ -236,16 +334,17 @@ bufSize = 1024
 -- | Runs a thread in the background.  Be sure to use this for each
 -- 'Effect' if you need to run multiple 'Effect's that form part of a
 -- pipeline; if you have a pipeline but you only start one thread at a
--- time, you may get a deadlock.  The 'Async' that is returned allows
--- you to later kill the thread if you need to.  The associated thread
--- will be killed when the entire 'ContT' computation completes; to
--- prevent this from happening, use 'wait'.
+-- time, you may get a deadlock.  The 'Control.Concurrent.Async' that
+-- is returned allows you to later kill the thread if you need to.
+-- The associated thread will be killed when the entire 'ContT'
+-- computation completes; to prevent this from happening, use
+-- 'Control.Concurrent.Async.wait' from "Control.Concurrent.Async".
 
-background :: IO a -> ContT r IO (Async a)
-background = ContT . withAsync
+background :: IO a -> ContT r IO (Control.Concurrent.Async.Async a)
+background = Cont.ContT . Control.Concurrent.Async.withAsync
 
-convertProcSpec :: ProcSpec -> Process.CreateProcess
-convertProcSpec a = Process.CreateProcess
+convertCreateProcess :: CreateProcess -> Process.CreateProcess
+convertCreateProcess a = Process.CreateProcess
   { Process.cmdspec = cmdspec a
   , Process.cwd = cwd a
   , Process.env = env a
@@ -265,11 +364,31 @@ convertStdStream a = case a of
   UseHandle h -> Process.UseHandle h
   Mailbox -> Process.CreatePipe
 
-procSpec
+-- | Create a 'CreateProcess' record with default settings.  The
+-- default settings are:
+--
+-- * a raw command (as opposed to a shell command) is created
+--
+-- * the current working directory is not changed from the parent process
+--
+-- * the environment is not changed from the parent process
+--
+-- * standard input, standard output, and standard error are all
+-- inherited from the parent process
+--
+-- * the parent's other file descriptors are also inherited
+--
+-- * a new process group is not created
+--
+-- * 'delegate_ctlc' is 'False'
+
+proc
   :: String
+  -- ^ The name of the program to run, such as @less@.
   -> [String]
-  -> ProcSpec
-procSpec prog args = ProcSpec
+  -- ^ Command-line arguments
+  -> CreateProcess
+proc prog args = CreateProcess
   { cmdspec = Process.RawCommand prog args
   , cwd = Nothing
   , env = Nothing
@@ -280,3 +399,15 @@ procSpec prog args = ProcSpec
   , create_group = False
   , delegate_ctlc = False
   }
+
+{- $reexports
+   * "Control.Concurrent.Async" reexports 'wait'
+
+   * "Pipes" reexports all bindings"
+
+   * "Pipes.Concurrent" reexports all bindings
+
+   * "System.Exit" reexports all bindings
+
+   * "System.Process" reexports 'waitForProcess'
+-}

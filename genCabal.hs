@@ -72,6 +72,7 @@ exeOptions libMods exeMods =
   [ hsSourceDirs ["lib", "tests"]
   , otherModules (exeMods ++ libMods)
   , libDeps
+  , ghcOptions ["-threaded"]
   ]
 
 sections
@@ -86,6 +87,12 @@ sections fl libMods testMods =
   [ githubHead "massysett" "pipes-cliff"
   , executable "numsToLess" $
     [ mainIs "numsToLess.hs"
+    , condBlock (flag fl)
+      (buildable True, [])
+      [buildable False]
+    ] ++ defaultOptions ++ exeOptions libMods testMods
+  , executable "alphaNumbers" $
+    [ mainIs "alphaNumbers.hs"
     , condBlock (flag fl)
       (buildable True, [])
       [buildable False]

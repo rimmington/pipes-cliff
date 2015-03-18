@@ -6,35 +6,36 @@
 -- find the source at
 --
 -- <https://github.com/massysett/pipes-cliff/blob/master/lib/Pipes/Cliff/Examples.hs>
+--
+-- __Be sure to use the @-threaded@ option__ when compiling code that
+-- uses "Pipes.Cliff", including this code; see the warning in
+-- "Pipes.Cliff" for more details.
 
 module Pipes.Cliff.Examples where
 
-import Pipes
 import Pipes.Cliff
-import Pipes.Concurrent
-import Control.Monad.Trans.Cont
 import qualified Data.ByteString.Char8 as BS8
-import System.Exit
-import System.Process (waitForProcess)
 
 -- | Streams an infinite list of numbers to @less@.
 numsToLess :: IO ExitCode
-numsToLess = flip runContT return $ do
+numsToLess = evalContT $ do
   Mailboxes (Just out) _ _ han <- createProcess
-    (procSpec "less" []) { std_in = Mailbox }
+    (proc "less" []) { std_in = Mailbox }
   lift . runEffect $ produceNumbers >-> toOutput out
   lift $ waitForProcess han
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
--- Perfectly useless, but shows how to build pipelines.
+-- Perfectly useless, but shows how to build pipelines.  Notice how
+-- the components of the pipeline are run in the 'background'; if you
+-- run one of them in the foreground, you might get a deadlock.
 alphaNumbers :: IO ExitCode
-alphaNumbers = flip runContT return $ do
+alphaNumbers = evalContT $ do
   Mailboxes (Just toTr) (Just fromTr) _ _ <- createProcess
-    (procSpec "tr" ["[0-9]", "[a-z]"]) { std_in = Mailbox
+    (proc "tr" ["[0-9]", "[a-z]"]) { std_in = Mailbox
                                          , std_out = Mailbox
                                          }
   Mailboxes (Just toLess) _ _ lessHan <- createProcess
-    (procSpec "less" []) { std_in = Mailbox }
+    (proc "less" []) { std_in = Mailbox }
   _ <- background . runEffect $ fromInput fromTr >-> toOutput toLess
   _ <- background . runEffect $ produceNumbers >-> toOutput toTr
   r <- lift $ waitForProcess lessHan
