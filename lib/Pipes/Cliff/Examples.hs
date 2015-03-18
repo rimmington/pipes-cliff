@@ -17,11 +17,22 @@ import Pipes.Cliff
 import qualified Data.ByteString.Char8 as BS8
 
 -- | Streams an infinite list of numbers to @less@.
+-- The 'Effect' that streams values to the process is run in the
+-- background, even though there is only one process; otherwise,
+-- errors such as @thread blocked indefinitely in an STM transaction@
+-- may result.
+--
+-- At the end of the computation, 'waitForProcess' ensures that the
+-- program pauses until @less@ exits; otherwise, the 'ContT'
+-- computation will complete and it will terminate the @less@ process
+-- before the user has had a chance to use it.  When the computation
+-- completes, the associated thread run by 'background' will be
+-- terminated.
 numsToLess :: IO ExitCode
 numsToLess = evalContT $ do
   Mailboxes (Just out) _ _ han <- createProcess
     (proc "less" []) { std_in = Mailbox }
-  lift . runEffect $ produceNumbers >-> toOutput out
+  _ <- background . runEffect $ produceNumbers >-> toOutput out
   lift $ waitForProcess han
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
@@ -38,8 +49,8 @@ alphaNumbers = evalContT $ do
     (proc "less" []) { std_in = Mailbox }
   _ <- background . runEffect $ fromInput fromTr >-> toOutput toLess
   _ <- background . runEffect $ produceNumbers >-> toOutput toTr
-  r <- lift $ waitForProcess lessHan
-  return r
+  lift $ waitForProcess lessHan
+
 
 -- | Produces a stream of ByteString, where each ByteString is a shown
 -- integer.

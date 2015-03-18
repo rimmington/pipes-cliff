@@ -387,14 +387,16 @@ createProcess spec = do
   (inp', out', err') <- makeBoxes (inp, out, err)
   return $ Mailboxes inp' out' err' han
 
--- | Runs a thread in the background.  Be sure to use this for each
--- 'Effect' if you need to run multiple 'Effect's that form part of a
--- pipeline; if you have a pipeline but you only start one thread at a
--- time, you may get a deadlock.  The 'Control.Concurrent.Async' that
--- is returned allows you to later kill the thread if you need to.
--- The associated thread will be killed when the entire 'ContT'
--- computation completes; to prevent this from happening, use
--- 'Control.Concurrent.Async.wait' from "Control.Concurrent.Async".
+-- | Runs a thread in the background.  Be sure to use this every time
+-- you run an 'Effect' that streams values to or from a mailbox
+-- associated with a process, even if you only use a single
+-- process. Otherwise, you might get deadlocks or errors such as
+-- @thread blocked indefinitely in an STM transaction@.  The
+-- 'Control.Concurrent.Async' that is returned allows you to later
+-- kill the thread if you need to.  The associated thread will be
+-- killed when the entire 'ContT' computation completes; to prevent
+-- this from happening, use 'Control.Concurrent.Async.wait' from
+-- "Control.Concurrent.Async".
 
 background :: IO a -> ContT r IO (Async a)
 background = ContT . Control.Concurrent.Async.withAsync
