@@ -1,3 +1,4 @@
+{-# LANGUAGE RankNTypes #-}
 -- | Spawn subprocesses and interact with them using "Pipes.Concurrent"
 --
 -- The interface in this module deliberately resembles the interface
@@ -60,31 +61,33 @@
 -- find more useful than this one.
 --
 -- For some simple examples, consult "Pipes.Cliff.Examples".
-module Pipes.Cliff where
-{-
+module Pipes.Cliff
   ( StdStream(..)
   , CreateProcess(..)
+  , ToProcess(..)
+  , FromProcess(..)
+  , toProcess
+  , fromProcess
   , Mailboxes(..)
   , proc
   , createProcess
   , background
-  , safeCliff
+  , conveyor
 
   -- * Re-exports
   -- $reexports
   , module Control.Concurrent.Async
-  , module Control.Monad.Trans.Cont
-  , module System.Process
   , module Pipes
   , module Pipes.Concurrent
+  , module Pipes.Safe
   , module System.Exit
+  , module System.Process
   ) where
--}
+
 import System.IO
 import Pipes
 import Pipes.Concurrent
-import qualified Control.Concurrent.Async (Async, withAsync)
-import Control.Monad.Trans.Cont (ContT(..), evalContT)
+import qualified Control.Concurrent.Async (Async)
 import Control.Monad (liftM)
 import Control.Concurrent.Async (wait, Async, async, cancel)
 import Data.ByteString (ByteString)
@@ -151,9 +154,37 @@ data CreateProcess = CreateProcess
   -- module for details.
   }
 
-data ToProcess = ToProcess (Output ByteString) ReleaseKey
+-- | A mailbox that sends messages to a process.  Although a 'ToProcess'
+-- mailbox can receive mail from multiple places, currently the
+-- "Pipes.Cliff" API does not make it easy to employ such a use case.
+-- It's easiest to use 'toProcess', which creates a 'Consumer''
+-- that feeds messages to this 'ToProcess' mailbox.  When the
+-- 'Consumer'' is done feeding messages to the mailbox, it will
+-- automatically seal the mailbox.  This will ensure that the mailbox
+-- is properly flushed of all messages.
+data ToProcess = ToProcess (Output ByteString) (STM ())
+  -- ^ @ToProcess o s@, where
+  --
+  -- @o@ is the output mailbox, and
+  --
+  -- @s@ is an action that seals the mailbox.
 
-data FromProcess = FromProcess (Input ByteString) ReleaseKey
+-- | A mailbox that receives messages from a process.  Although a
+-- 'FromProcess' mailbox can dispense its contents to multiple
+-- recipients, currently the "Pipes.Cliff" API does not make it easy
+-- to employ such a use case.  It's easiest to use
+-- 'fromProcess', which creates a 'Producer'' that streams
+-- messgaes received from the process.  When the 'Producer'' is done
+-- streaming contents received from the mailbox, it will automatically
+-- seal the mailbox.  This will ensure that the mailbox is properly
+-- flushed of all messages.
+data FromProcess = FromProcess (Input ByteString) (STM ())
+  -- ^ @FromProcess i s@, where
+  --
+  -- @i@ is the input mailbox, and
+  --
+  -- @s@ is an action that seals the mailbox.
+
 
 -- | Contains any mailboxes that communicate with the subprocess,
 -- along with the process handle.
@@ -285,70 +316,95 @@ consumeToHandle h = do
 messageBuffer :: Buffer a
 messageBuffer = bounded 10
 
+-- | Acquires a resource and registers a finalizer.
 initialize
   :: (MonadSafe m, MonadIO m)
   => IO a
   -> (a -> IO ())
-  -> m (a, ReleaseKey)
+  -> m a
 initialize make destroy = mask $ \_ -> do
   thing <- liftIO make
-  key <- register (liftIO (destroy thing))
-  return (thing, key)
+  _ <- register (liftIO (destroy thing))
+  return thing
 
 -- | Creates a mailbox; seals it when done.
 newMailbox
   :: (MonadSafe m, MonadIO m)
-  => m (Output a, Input a, ReleaseKey)
-newMailbox = liftM (\((inp, out, stm), key) -> (inp, out, key)) $
+  => m (Output a, Input a, STM ())
+newMailbox =
   initialize (spawn' messageBuffer)
   (\(_, _, seal) -> atomically seal)
 
-background :: (MonadSafe m, MonadIO m) => IO a -> m (Async a, ReleaseKey)
-background action= initialize (async action) cancel
+-- | Runs a thread in the background.  Initializes a finalizer that
+-- will cancel the thread.  Be sure to use this every time you run an
+-- 'Effect' that streams values to or from a mailbox associated with a
+-- process, even if you only use a single process. Otherwise, you
+-- might get deadlocks or errors such as @thread blocked indefinitely
+-- in an STM transaction@.  The 'Control.Concurrent.Async' that is
+-- returned allows you to later kill the thread if you need to.  The
+-- associated thread will be killed when the entire 'MonadSafe'
+-- computation completes; to prevent this from happening, use
+-- 'Control.Concurrent.Async.wait' from "Control.Concurrent.Async".
 
+background :: (MonadSafe m, MonadIO m) => IO a -> m (Async a)
+background action = initialize (async action) cancel
+
+-- | Creates a thread that will run in the background and pump
+-- messages from the given mailbox to the process via its handle.
+-- Closes the Handle when done.
 processPump
-  :: (MonadSafe m, MonadIO m)
+  :: (MonadIO m, MonadSafe m)
   => Handle
   -> Input ByteString
   -> m ()
-processPump handle input = do
-  let pumper = runSafeT $ do
-        register (liftIO $ ignoreIOExceptions $ hClose handle)
-        liftIO . runEffect $
-          fromInput input >-> consumeToHandle handle
+processPump hndle input = do
+  let pumper = flip Control.Exception.finally cleanup .
+        runEffect $
+          fromInput input >-> consumeToHandle hndle
   _ <- background pumper
   return ()
+  where
+    cleanup = liftIO . ignoreIOExceptions . hClose $ hndle
 
+-- | Creates a thread that will run in the background and pull
+-- messages from the process and place them into the given mailbox.
+-- Closes the handle when done.
 processPull
   :: (MonadSafe m, MonadIO m)
   => Handle
   -> Output ByteString
   -> m ()
-processPull handle output = do
-  let puller = runSafeT $ do
-        register (liftIO $ ignoreIOExceptions $ hClose handle)
-        liftIO . runEffect $
-          produceFromHandle handle >-> toOutput output
+processPull hndle output = do
+  let puller = flip Control.Exception.finally cleanup .
+        runEffect $
+          produceFromHandle hndle >-> toOutput output
   _ <- background puller
   return ()
+  where
+    cleanup = liftIO . ignoreIOExceptions . hClose $ hndle
 
 
+-- | Creates a mailbox that sends messages to the given process, and
+-- sets up and runs threads to pump messages to the process.
 makeToProcess
   :: (MonadSafe m, MonadIO m)
   => Handle
   -> m ToProcess
-makeToProcess handle = do
+makeToProcess hndle = do
   (out, inp, key) <- newMailbox
-  processPump handle inp
+  processPump hndle inp
   return $ ToProcess out key
 
+-- | Creates a mailbox that receives messages from the given process,
+-- and sets up and runs threads to receive the messages and deliver
+-- them to the mailbox.
 makeFromProcess
   :: (MonadSafe m, MonadIO m)
   => Handle
   -> m FromProcess
-makeFromProcess handle = do
+makeFromProcess hndle = do
   (out, inp, key) <- newMailbox
-  processPull handle out
+  processPull hndle out
   return $ FromProcess inp key
 
 
@@ -361,6 +417,7 @@ makeBox mayHan mkr = case mayHan of
   Nothing -> return Nothing
   Just h -> liftM Just $ mkr h
 
+-- | Given the process handles, creates all mailboxes.
 makeBoxes
   :: (MonadIO m, MonadSafe m)
   => (Maybe Handle, Maybe Handle, Maybe Handle)
@@ -371,34 +428,19 @@ makeBoxes (mayIn, mayOut, mayErr) = do
   err <- makeBox mayErr makeFromProcess
   return (inp, out, err)
 
-{-
--- # Mailboxes
-
--- | Given a Handle that provides standard input to a process, return
--- an Output that can be used to put messages in for the standard
--- input.  Spawns another thread to feed to the process's standard
--- input.
-
-        
--- | Given a Handle that provides standard output or standard error
--- from a process, return an Input that can be used to receive
--- messages.
-
 -- # Subprocesses
 
 -- Waiting on a process handle more than once will merely return the
 -- same code more than once.  See the source code for System.Process.
 
 useProcess
-  :: CreateProcess
-  -> ContT r IO ( Maybe Handle
-                , Maybe Handle
-                , Maybe Handle
-                , Process.ProcessHandle)
-useProcess ps = ContT (Control.Exception.bracket acq rel)
+  :: (MonadIO m, MonadSafe m)
+  => CreateProcess
+  -> m (Maybe Handle, Maybe Handle, Maybe Handle, Process.ProcessHandle)
+useProcess cp = initialize make destroy
   where
-    acq = Process.createProcess (convertCreateProcess ps)
-    rel (i, o, e, h)= do
+    make = Process.createProcess (convertCreateProcess cp)
+    destroy (i, o, e, h) = do
       Process.terminateProcess h
       _ <- Process.waitForProcess h
       let shut = maybe (return ()) (ignoreIOExceptions . hClose)
@@ -427,48 +469,60 @@ useProcess ps = ContT (Control.Exception.bracket acq rel)
 --
 -- To increase the safety when using values with the 'ContT' type,
 -- you can use 'safeCliff'.
+
 createProcess
-  :: CreateProcess
-  -> ContT r IO Mailboxes
+  :: (MonadIO m, MonadSafe m)
+  => CreateProcess
+  -> m Mailboxes
 createProcess spec = do
   (inp, out, err, han) <- useProcess spec
   (inp', out', err') <- makeBoxes (inp, out, err)
   return $ Mailboxes inp' out' err' han
 
--- | Runs a thread in the background.  Be sure to use this every time
--- you run an 'Effect' that streams values to or from a mailbox
--- associated with a process, even if you only use a single
--- process. Otherwise, you might get deadlocks or errors such as
--- @thread blocked indefinitely in an STM transaction@.  The
--- 'Control.Concurrent.Async' that is returned allows you to later
--- kill the thread if you need to.  The associated thread will be
--- killed when the entire 'ContT' computation completes; to prevent
--- this from happening, use 'Control.Concurrent.Async.wait' from
--- "Control.Concurrent.Async".
 
-background :: IO a -> ContT r IO (Async a)
-background = ContT . Control.Concurrent.Async.withAsync
+-- | Creates a 'Consumer'' that sends a stream to the associated
+-- 'ToProcess'.  The 'ToProcess' mailbox is sealed when the
+-- 'Consumer'' finishes sending messages.
+toProcess
+  :: (MonadIO m, MonadSafe m)
+  => ToProcess
+  -> Consumer' ByteString m ()
+toProcess (ToProcess box seal)
+  = toOutput box `finally` (liftIO $ atomically seal)
 
--- | Runs a 'ContT' computation.  Since the computation can only
--- return the unit type, this function increases safety by making it
--- difficult to inadvertently use values from the 'ContT' computation
--- outside of the computation.  That keeps you from using allocated
--- resources after they have been destroyed.
-safeCliff :: ContT () IO ()-> IO ()
-safeCliff = evalContT
+
+-- | Creates a 'Producer'' that sends a stream of messages received at
+-- the associated 'FromProcess' mailbox.  The 'FromProcess' mailbox is
+-- sealed when the 'Producer'' is done receiving messages.
+fromProcess
+  :: (MonadIO m, MonadSafe m)
+  => FromProcess
+  -> Producer' ByteString m ()
+fromProcess (FromProcess box seal)
+  = fromInput box `finally` (liftIO $ atomically seal)
+
+
+-- | Runs in the background an effect, typically one that is moving
+-- data from one mailbox to another.  For examples of its usage, see
+-- "Pipes.Cliff.Examples".  Returns an 'Async' that can be used to
+-- kill the thread later if needed.  The thread will be killed
+-- automatically upon exiting the 'SafeT' computation if it is not
+-- killed or waited on.
+conveyor :: Effect (SafeT IO) a -> SafeT IO (Async a)
+conveyor = background . liftIO . runSafeT . runEffect
+
 
 {- $reexports
    * "Control.Concurrent.Async" reexports 'Async' and 'wait'
-
-   * "Control.Monad.Trans.Cont" reexports the 'ContT' type constructor
-      and data constructor, 'runContT', and 'evalContT'
 
    * "Pipes" reexports all bindings
 
    * "Pipes.Concurrent" reexports all bindings
 
+   * "Pipes.Safe" reexports all bindings
+
    * "System.Exit" reexports all bindings
 
    * "System.Process" reexports 'waitForProcess'
--}
+
 -}

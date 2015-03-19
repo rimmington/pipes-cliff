@@ -74,10 +74,10 @@ import qualified Data.ByteString.Char8 as BS8
 -- trade-offs, though, which is why I wrote this one.
 
 numsToLess :: IO ExitCode
-numsToLess = evalContT $ do
+numsToLess = runSafeT $ do
   Mailboxes (Just out) _ _ han <- createProcess
     (proc "less" []) { std_in = Mailbox }
-  _ <- background . runEffect $ produceNumbers >-> toOutput out
+  _ <- conveyor $ produceNumbers >-> toProcess out
   lift $ waitForProcess han
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
@@ -85,15 +85,15 @@ numsToLess = evalContT $ do
 -- the components of the pipeline are run in the 'background'; if you
 -- run one of them in the foreground, you might get a deadlock.
 alphaNumbers :: IO ExitCode
-alphaNumbers = evalContT $ do
+alphaNumbers = runSafeT $ do
   Mailboxes (Just toTr) (Just fromTr) _ _ <- createProcess
     (proc "tr" ["[0-9]", "[a-z]"]) { std_in = Mailbox
                                    , std_out = Mailbox
                                    }
   Mailboxes (Just toLess) _ _ lessHan <- createProcess
     (proc "less" []) { std_in = Mailbox }
-  _ <- background . runEffect $ fromInput fromTr >-> toOutput toLess
-  _ <- background . runEffect $ produceNumbers >-> toOutput toTr
+  _ <- conveyor $ produceNumbers >-> toProcess toTr
+  _ <- conveyor $ fromProcess fromTr >-> toProcess toLess
   lift $ waitForProcess lessHan
 
 
@@ -105,18 +105,21 @@ produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
   where
     mkNumStr = flip BS8.snoc '\n' . BS8.pack . show
 
+
 -- | Like 'alphaNumbers' but just sends a limited number
 -- of numbers to @cat@.  A useful test to make sure that pipelines
 -- shut down automatically.
 limitedAlphaNumbers :: IO ExitCode
-limitedAlphaNumbers = evalContT $ do
+limitedAlphaNumbers = runSafeT $ do
   Mailboxes (Just toTr) (Just fromTr) _ _ <- createProcess
     (proc "tr" ["[0-9]", "[a-z]"]) { std_in = Mailbox
                                    , std_out = Mailbox
                                    }
   Mailboxes (Just toCat) _ _ catHan <- createProcess
     (proc "cat" []) { std_in = Mailbox }
-  _ <- background . runEffect $ fromInput fromTr >-> toOutput toCat
-  _ <- background . runEffect
-        $ produceNumbers >-> P.take 300 >-> toOutput toTr
+  _ <- conveyor $ produceNumbers >-> P.take 300 >-> toProcess toTr
+  _ <- conveyor $ fromProcess fromTr >-> toProcess toCat
   lift $ waitForProcess catHan
+
+
+
