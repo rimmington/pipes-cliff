@@ -70,7 +70,7 @@ module Pipes.Cliff
   , fromProcess
   , Mailboxes(..)
   , proc
-  , createProcess
+  -- , createProcess
   , background
   , conveyor
 
@@ -93,10 +93,13 @@ import Control.Concurrent.Async (wait, Async, async, cancel)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified System.Process as Process
-import System.Process (waitForProcess)
+import System.Process (waitForProcess, ProcessHandle)
 import qualified Control.Exception
 import Pipes.Safe
 import System.Exit
+import System.Environment (getProgName)
+import qualified System.IO as IO
+import Control.Monad (when)
 
 -- # Exception handling
 
@@ -105,11 +108,16 @@ import System.Exit
 -- may have already been shut down, this is to be expected.  Since
 -- there is nothing that can really be done to respond to any IO error
 -- that results from closing a handle, just ignore these errors.
-ignoreIOExceptions :: IO () -> IO ()
-ignoreIOExceptions a = Control.Exception.catch a f
+ignoreIOExceptions :: Bool -> IO () -> IO ()
+ignoreIOExceptions quiet a = Control.Exception.catch a f
   where
     f :: Control.Exception.IOException -> IO ()
-    f _ = return ()
+    f exc = when (not quiet) $ do
+      pn <- getProgName
+      let msg = pn ++ ": warning: ignoring exception caught when "
+                ++ "closing handle: " ++ show exc
+      IO.hPutStrLn IO.stderr msg
+      return ()
 
 
 -- # Configuration and result types
@@ -120,8 +128,6 @@ data StdStream
   -- ^ Use whatever stream that the parent process has.
   | UseHandle Handle
   -- ^ Use the given handle for input or output
-  | Mailbox
-  -- ^ Set up a mailbox
 
 -- | Like 'System.Process.CreateProcess' in "System.Process",
 -- this gives the necessary information to create a subprocess.
@@ -134,13 +140,6 @@ data CreateProcess = CreateProcess
   , env :: Maybe [(String, String)]
   -- ^ The environment for the subprocess; if 'Nothing', use the
   -- calling process's working directory.
-
-  , std_in :: StdStream
-  -- ^ Use this kind of stream for standard input
-  , std_out :: StdStream
-  -- ^ Use this kind of stream for standard output
-  , std_err :: StdStream
-  -- ^ Use this kind of stream for standard error
 
   , close_fds :: Bool
   -- ^ If 'True', close all file descriptors other than the standard
@@ -218,14 +217,19 @@ data Mailboxes = Mailboxes
   -- "System.Process" module.
   }
 
-convertCreateProcess :: CreateProcess -> Process.CreateProcess
-convertCreateProcess a = Process.CreateProcess
+convertCreateProcess
+  :: Maybe StdStream
+  -> Maybe StdStream
+  -> Maybe StdStream
+  -> CreateProcess
+  -> Process.CreateProcess
+convertCreateProcess inp out err a = Process.CreateProcess
   { Process.cmdspec = cmdspec a
   , Process.cwd = cwd a
   , Process.env = env a
-  , Process.std_in = conv . std_in $ a
-  , Process.std_out = conv . std_out $ a
-  , Process.std_err = conv . std_err $ a
+  , Process.std_in = conv inp
+  , Process.std_out = conv out
+  , Process.std_err = conv err
   , Process.close_fds = close_fds a
   , Process.create_group = create_group a
   , Process.delegate_ctlc = delegate_ctlc a
@@ -233,11 +237,11 @@ convertCreateProcess a = Process.CreateProcess
   where
     conv = convertStdStream
 
-convertStdStream :: StdStream -> Process.StdStream
+convertStdStream :: Maybe StdStream -> Process.StdStream
 convertStdStream a = case a of
-  Inherit -> Process.Inherit
-  UseHandle h -> Process.UseHandle h
-  Mailbox -> Process.CreatePipe
+  Nothing -> Process.CreatePipe
+  Just Inherit -> Process.Inherit
+  Just (UseHandle h) -> Process.UseHandle h
 
 -- | Create a 'CreateProcess' record with default settings.  The
 -- default settings are:
@@ -267,9 +271,6 @@ proc prog args = CreateProcess
   { cmdspec = Process.RawCommand prog args
   , cwd = Nothing
   , env = Nothing
-  , std_in = Inherit
-  , std_out = Inherit
-  , std_err = Inherit
   , close_fds = False
   , create_group = False
   , delegate_ctlc = False
@@ -354,10 +355,12 @@ background action = initialize (async action) cancel
 -- Closes the Handle when done.
 processPump
   :: (MonadIO m, MonadSafe m)
-  => Handle
+  => Bool
+  -- ^ Quiet?
+  -> Handle
   -> (Input ByteString, STM ())
   -> m ()
-processPump hndle (input, seal) = do
+processPump quiet hndle (input, seal) = do
   let pumper = flip Control.Exception.finally cleanup .
         runEffect $
           fromInput input >-> consumeToHandle hndle
@@ -365,7 +368,7 @@ processPump hndle (input, seal) = do
   return ()
   where
     cleanup = liftIO $ do
-      ignoreIOExceptions $ hClose hndle
+      ignoreIOExceptions quiet $ hClose hndle
       atomically seal
 
 -- | Creates a thread that will run in the background and pull
@@ -438,6 +441,7 @@ makeBoxes (mayIn, mayOut, mayErr) = do
 -- Waiting on a process handle more than once will merely return the
 -- same code more than once.  See the source code for System.Process.
 
+{-
 useProcess
   :: (MonadIO m, MonadSafe m)
   => CreateProcess
@@ -451,7 +455,7 @@ useProcess cp = initialize make destroy
       let shut = maybe (return ()) (ignoreIOExceptions . hClose)
       shut i >> shut o >> shut e
       return ()
-
+-}
 -- | Launch and use a subprocess.
 --
 -- /Warning/ - do not attempt to use any of the resources created by
@@ -475,6 +479,7 @@ useProcess cp = initialize make destroy
 -- To increase the safety when using values with the 'ContT' type,
 -- you can use 'safeCliff'.
 
+{-
 createProcess
   :: (MonadIO m, MonadSafe m)
   => CreateProcess
@@ -483,7 +488,7 @@ createProcess spec = do
   (inp, out, err, han) <- useProcess spec
   (inp', out', err') <- makeBoxes (inp, out, err)
   return $ Mailboxes inp' out' err' han
-
+-}
 
 -- | Creates a 'Consumer'' that sends a stream to the associated
 -- 'ToProcess'.  The 'ToProcess' mailbox is sealed when the
@@ -516,6 +521,123 @@ fromProcess (FromProcess box seal)
 conveyor :: Effect (SafeT IO) a -> SafeT IO (Async a)
 conveyor = background . liftIO . runSafeT . runEffect
 
+pipeNone
+  :: (MonadIO m, MonadSafe m)
+  => StdStream
+  -- ^ Standard input
+  -> StdStream
+  -- ^ Standard output
+  -> StdStream
+  -- ^ Standard error
+  -> CreateProcess
+  -> m Process.ProcessHandle
+pipeNone sIn sOut sErr cp = undefined
+  where
+    cp' = convertCreateProcess (Just sIn) (Just sOut) (Just sErr)
+      cp
+
+pipeInput
+  :: (MonadIO mi, MonadSafe mi, MonadIO m, MonadSafe m)
+  => StdStream
+  -- ^ Standard output
+  -> StdStream
+  -- ^ Standard error
+  -> CreateProcess
+  -> m (Consumer ByteString mi r, Process.ProcessHandle)
+  -- ^ A 'Consumer' for standard input, and the 'ProcessHandle'
+pipeInput sOut sErr cp = undefined
+  where
+    cp' = convertCreateProcess Nothing (Just sOut) (Just sErr)
+      cp
+
+pipeOutput
+  :: (MonadIO mi, MonadSafe mi, MonadIO m, MonadSafe m)
+  => StdStream
+  -- ^ Standard input
+  -> StdStream
+  -- ^ Standard error
+  -> CreateProcess
+  -> m (Producer ByteString mi (), Process.ProcessHandle)
+  -- ^ A 'Producer' for standard output, and the 'ProcessHandle'
+pipeOutput sIn sErr cp = undefined
+  where
+    cp' = convertCreateProcess (Just sIn) Nothing (Just sErr) cp
+
+pipeError
+  :: (MonadIO mi, MonadSafe mi, MonadIO m, MonadSafe m)
+  => StdStream
+  -- ^ Standard input
+  -> StdStream
+  -- ^ Standard output
+  -> CreateProcess
+  -> m (Producer ByteString mi (), Process.ProcessHandle)
+  -- ^ A 'Producer' for standard error, and the 'ProcessHandle'
+pipeError sIn sOut cp = undefined
+  where
+    cp' = convertCreateProcess (Just sIn) (Just sOut) Nothing cp
+
+pipeInputOutput
+  :: ( MonadIO mi, MonadSafe mi, MonadIO mo, MonadSafe mo
+     , MonadIO m, MonadSafe m)
+  => StdStream
+  -- ^ Standard error
+  -> CreateProcess
+  -> m ( Consumer ByteString mi r
+       , Producer ByteString mo ()
+       , Process.ProcessHandle
+       )
+  -- ^ A 'Consumer' for standard input, a 'Producer' for standard
+  -- output, and a 'ProcessHandle'
+pipeInputOutput sErr cp = undefined
+  where
+    cp' = convertCreateProcess Nothing Nothing (Just sErr) cp
+
+pipeInputError
+  :: ( MonadIO mi, MonadSafe mi, MonadIO mo, MonadSafe mo
+     , MonadIO m, MonadSafe m)
+  => StdStream
+  -- ^ Standard output
+  -> CreateProcess
+  -> m ( Consumer ByteString mi r
+       , Producer ByteString mo ()
+       , Process.ProcessHandle
+       )
+  -- ^ A 'Consumer' for standard input, a 'Producer' for standard
+  -- error, and a 'ProcessHandle'
+pipeInputError sOut cp = undefined
+  where
+    cp' = convertCreateProcess Nothing (Just sOut) Nothing cp
+
+pipeOutputError
+  :: ( MonadIO mi, MonadSafe mi, MonadIO mo, MonadSafe mo, MonadIO m
+     , MonadSafe m)
+  => StdStream
+  -- ^ Standard input
+  -> CreateProcess
+  -> m ( Producer ByteString mi r
+       , Producer ByteString mo ()
+       , Process.ProcessHandle
+       )
+  -- ^ A 'Producer' for standard output, a 'Producer' for standard
+  -- error, and a 'ProcessHandle'
+pipeOutputError sIn cp = undefined
+  where
+    cp' = convertCreateProcess (Just sIn) Nothing Nothing cp
+
+pipeInputOutputError
+  :: ( MonadIO mi, MonadSafe mi, MonadIO mo, MonadSafe mo,
+       MonadIO me, MonadSafe me, MonadIO m, MonadSafe m)
+  => CreateProcess
+  -> m ( Consumer ByteString mi r
+       , Producer ByteString mo ()
+       , Producer ByteString me ()
+       , Process.ProcessHandle
+       )
+  -- ^ A 'Consumer' for standard input, a 'Producer' for standard
+  -- output, a 'Producer' for standard error, and a 'ProcessHandle'
+pipeInputOutputError cp = undefined
+  where
+    cp' = convertCreateProcess Nothing Nothing Nothing cp
 
 {- $reexports
    * "Control.Concurrent.Async" reexports 'Async' and 'wait'
