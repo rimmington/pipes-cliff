@@ -355,16 +355,18 @@ background action = initialize (async action) cancel
 processPump
   :: (MonadIO m, MonadSafe m)
   => Handle
-  -> Input ByteString
+  -> (Input ByteString, STM ())
   -> m ()
-processPump hndle input = do
+processPump hndle (input, seal) = do
   let pumper = flip Control.Exception.finally cleanup .
         runEffect $
           fromInput input >-> consumeToHandle hndle
   _ <- background pumper
   return ()
   where
-    cleanup = liftIO . ignoreIOExceptions . hClose $ hndle
+    cleanup = liftIO $ do
+      ignoreIOExceptions $ hClose hndle
+      atomically seal
 
 -- | Creates a thread that will run in the background and pull
 -- messages from the process and place them into the given mailbox.
@@ -372,16 +374,19 @@ processPump hndle input = do
 processPull
   :: (MonadSafe m, MonadIO m)
   => Handle
-  -> Output ByteString
+  -> (Output ByteString, STM ())
+  -- ^ Output box, paired with action to close the box.
   -> m ()
-processPull hndle output = do
+processPull hndle (output, seal) = do
   let puller = flip Control.Exception.finally cleanup .
         runEffect $
           produceFromHandle hndle >-> toOutput output
   _ <- background puller
   return ()
   where
-    cleanup = liftIO . ignoreIOExceptions . hClose $ hndle
+    cleanup = liftIO $ do
+      ignoreIOExceptions $ hClose hndle
+      atomically seal
 
 
 -- | Creates a mailbox that sends messages to the given process, and
@@ -391,9 +396,9 @@ makeToProcess
   => Handle
   -> m ToProcess
 makeToProcess hndle = do
-  (out, inp, key) <- newMailbox
-  processPump hndle inp
-  return $ ToProcess out key
+  (out, inp, seal) <- newMailbox
+  processPump hndle (inp, seal)
+  return $ ToProcess out seal
 
 -- | Creates a mailbox that receives messages from the given process,
 -- and sets up and runs threads to receive the messages and deliver
@@ -403,9 +408,9 @@ makeFromProcess
   => Handle
   -> m FromProcess
 makeFromProcess hndle = do
-  (out, inp, key) <- newMailbox
-  processPull hndle out
-  return $ FromProcess inp key
+  (out, inp, seal) <- newMailbox
+  processPull hndle (out, seal)
+  return $ FromProcess inp seal
 
 
 makeBox
@@ -488,7 +493,7 @@ toProcess
   => ToProcess
   -> Consumer' ByteString m ()
 toProcess (ToProcess box seal)
-  = toOutput box `finally` (liftIO $ atomically seal)
+  = toOutput box `finally` (liftIO (atomically seal))
 
 
 -- | Creates a 'Producer'' that sends a stream of messages received at

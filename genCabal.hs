@@ -104,7 +104,7 @@ sections fl libMods testMods =
 -- # Packages
 
 base :: Package
-base = closedOpen "base" [4,7,0,0] [4,8]
+base = closedOpen "base" [4,6,0,0] [4,8]
 
 -- Currently not used
 transformers :: Package
