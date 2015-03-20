@@ -96,9 +96,34 @@ import qualified Pipes.Safe
 import System.Exit
 import System.Environment (getProgName)
 import qualified System.IO as IO
-import Control.Monad (when)
+import Control.Monad (when, liftM)
 
 -- # Exception handling
+
+-- | Runs a particular action.  Any IO errors are caught; a warning
+-- message is printed if we're not being quiet, and 'Nothing' is
+-- returned.  Otherwise, the result is returned.
+
+catchAndWarn
+  :: (Pipes.Safe.MonadCatch m, MonadIO m)
+  => Bool
+  -- ^ Be quiet?
+  -> String
+  -- ^ What are we doing?  Used for warning message.
+  -> m a
+  -- ^ Do this
+  -> m (Maybe a)
+catchAndWarn beQuiet desc act
+  = Pipes.Safe.catch (liftM Just act) handle
+  where
+    handle e = do
+      let _types = e :: Control.Exception.IOException
+      when (not beQuiet) . liftIO $ do
+        pn <- getProgName
+        let msg = pn ++ ": warning: caught exception when "
+              ++ desc ++ ": " ++ show e
+        IO.hPutStrLn IO.stderr msg
+      return Nothing
 
 -- | Runs a particular action, ignoring all IO errors.  Sometimes
 -- using hClose will result in a broken pipe error.  Since the process
@@ -252,33 +277,43 @@ bufSize = 1024
 
 -- | Create a 'Producer' from a 'Handle'.  The 'Producer' will get
 -- 'ByteString' from the 'Handle' and produce them.  Does nothing to
--- close the given 'Handle' at any time.
---
--- TODO IO Errors
+-- close the given 'Handle' at any time.  If there is an IO error
+-- while receiving data, the error is caught and production ceases.
+-- The exception is not re-thrown.
 produceFromHandle
-  :: MonadIO m
-  => Handle
+  :: (MonadIO m, Pipes.Safe.MonadCatch m)
+  => Bool
+  -- ^ Be quiet?
+  -> Handle
   -> Producer ByteString m ()
-produceFromHandle h = liftIO (BS.hGetSome h bufSize) >>= go
+produceFromHandle beQuiet h = catchAndWarn beQuiet desc act >>= go
   where
-    go bs
+    desc = "receiving data from process"
+    act = liftIO (BS.hGetSome h bufSize)
+    go Nothing = return ()
+    go (Just bs)
       | BS.null bs = return ()
-      | otherwise = yield bs >> produceFromHandle h
+      | otherwise = yield bs >> produceFromHandle beQuiet h
 
 
 -- | Create a 'Consumer' from a 'Handle'.  The 'Consumer' will put
 -- each 'ByteString' it receives into the 'Handle'.  Does nothing to
--- close the handle at any time.
---
--- TODO IO errors
+-- close the handle at any time.  If there is an IO error while
+-- sending data, the error is caught and consumption ceases.  The
+-- exception is not re-thrown.
 consumeToHandle
-  :: MonadIO m
-  => Handle
-  -> Consumer ByteString m a
-consumeToHandle h = do
+  :: (MonadIO m, Pipes.Safe.MonadCatch m)
+  => Bool
+  -- ^ Be quiet?
+  -> Handle
+  -> Consumer ByteString m ()
+consumeToHandle beQuiet h = do
   bs <- await
-  liftIO $ BS.hPut h bs
-  consumeToHandle h
+  mayRes <- catchAndWarn beQuiet "sending data to process"
+    (liftIO $ BS.hPut h bs)
+  case mayRes of
+    Nothing -> return ()
+    Just _ -> consumeToHandle beQuiet h
 
 
 -- | A buffer that holds 10 messages.  I have no idea if this is the
@@ -324,7 +359,7 @@ processPump
 processPump beQuiet hndle (input, seal) = do
   let pumper = flip Control.Exception.finally cleanup .
         runEffect $
-          fromInput input >-> consumeToHandle hndle
+          fromInput input >-> consumeToHandle beQuiet hndle
   _ <- background pumper
   return ()
   where
@@ -346,7 +381,7 @@ processPull
 processPull beQuiet hndle (output, seal) = do
   let puller = flip Control.Exception.finally cleanup .
         runEffect $
-          produceFromHandle hndle >-> toOutput output
+          produceFromHandle beQuiet hndle >-> toOutput output
   _ <- background puller
   return ()
   where
@@ -478,6 +513,8 @@ running; that's why the monad stack of each 'Proxy' must contain a
 "Pipes.Cliff.Examples".
 
 -}
+
+-- | Do not create any 'Proxy' to or from the process.
 pipeNone
   :: (MonadIO m, Pipes.Safe.MonadSafe m)
   => NonPipe
@@ -495,6 +532,7 @@ pipeNone sIn sOut sErr cp = do
     cp' = convertCreateProcess (Just sIn) (Just sOut) (Just sErr)
       cp
 
+-- | Create a 'Consumer' for standard input.
 pipeInput
   :: (MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO m, Pipes.Safe.MonadSafe m)
   => NonPipe
@@ -512,6 +550,7 @@ pipeInput sOut sErr cp = do
     cp' = convertCreateProcess Nothing (Just sOut) (Just sErr)
       cp
 
+-- | Create a 'Producer' for standard output.
 pipeOutput
   :: (MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO m, Pipes.Safe.MonadSafe m)
   => NonPipe
@@ -528,6 +567,7 @@ pipeOutput sIn sErr cp = do
   where
     cp' = convertCreateProcess (Just sIn) Nothing (Just sErr) cp
 
+-- | Create a 'Producer' for standard error.
 pipeError
   :: (MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO m, Pipes.Safe.MonadSafe m)
   => NonPipe
@@ -544,6 +584,8 @@ pipeError sIn sOut cp = do
   where
     cp' = convertCreateProcess (Just sIn) (Just sOut) Nothing cp
 
+-- | Create a 'Consumer' for standard input and a 'Producer' for
+-- standard output.
 pipeInputOutput
   :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo, Pipes.Safe.MonadSafe mo
      , MonadIO m, Pipes.Safe.MonadSafe m)
@@ -564,6 +606,8 @@ pipeInputOutput sErr cp = do
   where
     cp' = convertCreateProcess Nothing Nothing (Just sErr) cp
 
+-- | Create a 'Consumer' for standard input and a 'Producer' for
+-- standard error.
 pipeInputError
   :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo, Pipes.Safe.MonadSafe mo
      , MonadIO m, Pipes.Safe.MonadSafe m)
@@ -584,6 +628,8 @@ pipeInputError sOut cp = do
   where
     cp' = convertCreateProcess Nothing (Just sOut) Nothing cp
 
+-- | Create a 'Producer' for standard output and a 'Producer' for
+-- standard error.
 pipeOutputError
   :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo
      , Pipes.Safe.MonadSafe mo, MonadIO m
@@ -605,6 +651,8 @@ pipeOutputError sIn cp = do
   where
     cp' = convertCreateProcess (Just sIn) Nothing Nothing cp
 
+-- | Create a 'Consumer' for standard input, a 'Producer' for standard
+-- output, and a 'Producer' for standard error.
 pipeInputOutputError
   :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo, Pipes.Safe.MonadSafe mo,
        MonadIO me, Pipes.Safe.MonadSafe me, MonadIO m, Pipes.Safe.MonadSafe m)

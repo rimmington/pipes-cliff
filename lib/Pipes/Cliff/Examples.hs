@@ -66,3 +66,27 @@ limitedAlphaNumbers = runSafeT $ do
   conveyor $ produceNumbers >-> P.take 300 >-> toTr
   conveyor $ fromTr >-> toCat
   waitForProcess catHan
+
+-- | Produces a finite list of numbers, sends it to @tr@ for some
+-- mangling, and then puts the results into a 'BS8.ByteString' for
+-- further processing.  Unlike previous examples, there is no use of
+-- 'waitForProcess'.  This is OK because the 'Effect' that retrieves
+-- the results from @tr@ will pull all the data; the @tr@ process will
+-- then shut down because its standard input will be closed when the
+-- source 'Producer' is exhausted.  This example shows how you can use
+-- this library to place the results of a pipeline into a simple
+-- strict data type.
+--
+-- When the 'SafeT' computation completes, a
+-- 'System.Process.terminateProcess' is automatically sent to the @tr@
+-- process--which does nothing, as @tr@ has already died.  Only after
+-- the process is waited for is it fully removed from the system
+-- process table.  A 'System.Process.waitForProcess' from
+-- "System.Process" is automatically done as well.  Therefore, you
+-- will not get zombie processes if you use this library.
+alphaNumbersByteString :: IO BS8.ByteString
+alphaNumbersByteString = runSafeT $ do
+  (toTr, fromTr, _) <- pipeInputOutput Inherit
+    (procSpec "tr" ["[0-9]", "[a-z]"])
+  conveyor $ produceNumbers >-> P.take 300 >-> toTr
+  P.fold BS8.append BS8.empty id fromTr
