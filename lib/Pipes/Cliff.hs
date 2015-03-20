@@ -7,7 +7,7 @@
 -- "System.Process" in scope at the same time.
 --
 -- As in "System.Process", you create a subprocess by creating a
--- 'CreateProcess' record and then applying 'createProcess' to that
+-- 'CreateProcess' record and then applying a function to that
 -- record.  Unlike "System.Process", you use functions such as
 -- 'pipeInput' or 'pipeInputOutput' to specify what streams you want
 -- to use a 'Proxy' for and what streams you wish to be 'Inherit'ed
@@ -250,7 +250,7 @@ procSpec prog args = CreateProcess
 bufSize :: Int
 bufSize = 1024
 
--- | Create a 'Producer'' from a 'Handle'.  The 'Producer'' will get
+-- | Create a 'Producer' from a 'Handle'.  The 'Producer' will get
 -- 'ByteString' from the 'Handle' and produce them.  Does nothing to
 -- close the given 'Handle' at any time.
 --
@@ -266,7 +266,7 @@ produceFromHandle h = liftIO (BS.hGetSome h bufSize) >>= go
       | otherwise = yield bs >> produceFromHandle h
 
 
--- | Create a 'Consumer'' from a 'Handle'.  The 'Consumer' will put
+-- | Create a 'Consumer' from a 'Handle'.  The 'Consumer' will put
 -- each 'ByteString' it receives into the 'Handle'.  Does nothing to
 -- close the handle at any time.
 --

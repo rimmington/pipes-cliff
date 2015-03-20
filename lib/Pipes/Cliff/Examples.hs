@@ -30,8 +30,9 @@ numsToLess = runSafeT $ do
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
 -- Perfectly useless, but shows how to build pipelines.  Notice how
--- the components of the pipeline are run in the 'background'; if you
--- run one of them in the foreground, you might get a deadlock.
+-- the components of the pipeline are run in the background using
+-- 'conveyor'; if you run one of them in the foreground, you might get
+-- a deadlock.
 
 alphaNumbers :: IO ExitCode
 alphaNumbers = runSafeT $ do
