@@ -55,7 +55,7 @@ though neither was posted to Hackage.
 
 Take a look at these other libraries; they might meet your needs.
 
-### Focused on subprocesses generally
+### Subprocesses generally
 
 * process-streaming
 

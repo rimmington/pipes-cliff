@@ -171,7 +171,10 @@ data NonPipe
   -- ^ Use the given handle for input or output
 
 -- | Like 'System.Process.CreateProcess' in "System.Process",
--- this gives the necessary information to create a subprocess.
+-- this gives the necessary information to create a subprocess.  All
+-- but one of these fields is also present in
+-- 'System.Process.CreateProcess', and they all have the same meaning;
+-- the only field that is different is the 'quiet' field.
 data CreateProcess = CreateProcess
   { cmdspec :: Process.CmdSpec
     -- ^ Executable and arguments, or shell command
@@ -240,12 +243,10 @@ convertNonPipe a = case a of
 --
 -- * the environment is not changed from the parent process
 --
--- * standard input, standard output, and standard error are all
--- inherited from the parent process
+-- * the parent's file descriptors (other than standard input,
+-- standard output, and standard error) are inherited
 --
--- * the parent's other file descriptors are also inherited
---
--- * a new process group is not created
+-- * no new process group is created
 --
 -- * 'delegate_ctlc' is 'False'
 --
@@ -469,7 +470,7 @@ createProcess beQuiet cp = initialize (Process.createProcess cp) destroy
 -- data from one process to another.  For examples of its usage, see
 -- "Pipes.Cliff.Examples".  The associated thread is killed when the
 -- 'SafeT' computation completes.
-conveyor :: Effect (Pipes.Safe.SafeT IO) a -> Pipes.Safe.SafeT IO ()
+conveyor :: Effect (Pipes.Safe.SafeT IO) () -> Pipes.Safe.SafeT IO ()
 conveyor efct
   = (background . liftIO . runSafeT . runEffect $ efct) >> return ()
 
@@ -506,11 +507,11 @@ computation if you need to keep a resource around.  'waitForProcess'
 can be handy for this.  All functions in this section return a
 'ProcessHandle' for use with 'waitForProcess'.
 
-Each 'Proxy' automatically destroys associated file handles and
-other behind-the-scenes resources after its computation finishes
-running; that's why the monad stack of each 'Proxy' must contain a
-'Pipes.Safe.MonadSafe'.  For an example of how to use this, consule
-"Pipes.Cliff.Examples".
+Each 'Proxy' automatically destroys associated file handles and other
+behind-the-scenes resources after its computation finishes running;
+that's why the monad stack of each 'Proxy' must contain a
+'Pipes.Safe.MonadSafe'.  For an example of how to deal with the
+'Pipes.Safe.MonadSafe' class, consult "Pipes.Cliff.Examples".
 
 -}
 
