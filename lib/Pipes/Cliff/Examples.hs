@@ -70,12 +70,12 @@ limitedAlphaNumbers = runSafeT $ do
 -- | Produces a finite list of numbers, sends it to @tr@ for some
 -- mangling, and then puts the results into a 'BS8.ByteString' for
 -- further processing.  Unlike previous examples, there is no use of
--- 'waitForProcess'.  This is OK because the 'Effect' that retrieves
--- the results from @tr@ will pull all the data; the @tr@ process will
--- then shut down because its standard input will be closed when the
--- source 'Producer' is exhausted.  This example shows how you can use
--- this library to place the results of a pipeline into a simple
--- strict data type.
+-- 'waitForProcess' or 'conveyor'.  This is OK because the 'Effect'
+-- that retrieves the results from @tr@ will pull all the data; the
+-- @tr@ process will then shut down because its standard input will be
+-- closed when the source 'Producer' is exhausted.  This example shows
+-- how you can use this library to place the results of a pipeline
+-- into a simple strict data type.
 --
 -- When the 'SafeT' computation completes, a
 -- 'System.Process.terminateProcess' is automatically sent to the @tr@
