@@ -1,5 +1,5 @@
 {-# LANGUAGE RankNTypes #-}
--- | Spawn subprocesses and interact with them using "Pipes.Concurrent"
+-- | Spawn subprocesses and interact with them using "Pipes"
 --
 -- The interface in this module deliberately resembles the interface
 -- in "System.Process".  However, one consequence of this is that you
@@ -8,11 +8,11 @@
 --
 -- As in "System.Process", you create a subprocess by creating a
 -- 'CreateProcess' record and then applying 'createProcess' to that
--- record.  The difference is that 'createProcess' returns 'Mailboxes'
--- to you.  You can request the creation of an 'Output' corresponding
--- to the subprocess standard input, and an 'Input' for each of
--- standard output and standard error.  You then interact with the
--- subprocess using "Pipes" and "Pipes.Concurrent".
+-- record.  Unlike "System.Process", you use functions such as
+-- 'pipeInput' or 'pipeInputOutput' to specify what streams you want
+-- to use a 'Proxy' for and what streams you wish to be 'Inherit'ed
+-- or if you want to 'UseHandle'.  You then send or receive
+-- information using the returned 'Proxy'.
 --
 -- __Use the @-threaded@ GHC option__ when compiling your programs or
 -- when using GHCi.  Internally, this module uses
@@ -24,24 +24,12 @@
 -- 'waitForProcess'.  So, if your program experiences deadlocks, be
 -- sure you used the @-threaded@ option.
 --
--- This module relies on the "Pipes", "Pipes.Concurrent", and
--- "System.Process" modules.  You will want to have basic familiarity
--- with what all of those modules do before using this module.
---
--- This module also uses the 'ContT' type constructor from
--- "Control.Monad.Trans.Cont" to help with resource management.  You
--- can use 'ContT' like you would use any other 'Monad'.  Values from
--- this module that use the 'ContT' type constructor will
--- automatically deallocate or destroy the resource when the 'ContT'
--- computation copmletes.  That means that all threads and
--- subprocesses that you create in the 'ContT' computation are
--- destroyed when the computation completes, even if excptions are
--- thrown.  This also means you must take care to not use any of the
--- resources outside of the 'ContT' computation.  The 'safeCliff'
--- function will help you with this; or, for less safety but more
--- flexibility, use 'evalContT' from "Control.Monad.Trans.Cont".  You
--- can use 'liftIO' to run IO computations as part of 'ContT'
--- computations.
+-- This module relies on the "Pipes", "Pipes.Safe", and
+-- "System.Process" modules.  You will want to have basic
+-- familiarity with what all of those modules do before using this
+-- module.  It uses "Control.Concurrent.Async" and
+-- "Pipes.Concurrent" behind the scenes; you don't need to know how
+-- these work unless you're curious.
 --
 -- All communcation with subprocesses is done with strict
 -- 'ByteString's.  If you are dealing with textual data, the @text@
@@ -62,23 +50,33 @@
 --
 -- For some simple examples, consult "Pipes.Cliff.Examples".
 module Pipes.Cliff
-  ( StdStream(..)
+  ( -- * Specifying a subprocess's properties
+    NonPipe(..)
   , CreateProcess(..)
-  , ToProcess(..)
-  , FromProcess(..)
-  , toProcess
-  , fromProcess
-  , Mailboxes(..)
-  , proc
-  -- , createProcess
-  , background
+  , procSpec
+
+  -- * Creating processes
+  -- $process
+  , pipeNone
+  , pipeInput
+  , pipeOutput
+  , pipeError
+  , pipeInputOutput
+  , pipeInputError
+  , pipeOutputError
+  , pipeInputOutputError
+
+  -- * Conveniences
+
+  -- | These make it a bit easier to write both simple and
+  -- complicated pipelines.
+
   , conveyor
+  , waitForProcess
 
   -- * Re-exports
   -- $reexports
-  , module Control.Concurrent.Async
   , module Pipes
-  , module Pipes.Concurrent
   , module Pipes.Safe
   , module System.Exit
   , module System.Process
@@ -87,15 +85,14 @@ module Pipes.Cliff
 import System.IO
 import Pipes
 import Pipes.Concurrent
-import qualified Control.Concurrent.Async (Async)
-import Control.Monad (liftM)
-import Control.Concurrent.Async (wait, Async, async, cancel)
+import Control.Concurrent.Async (Async, async, cancel)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified System.Process as Process
-import System.Process (waitForProcess, ProcessHandle)
+import System.Process (ProcessHandle)
 import qualified Control.Exception
-import Pipes.Safe
+import Pipes.Safe (runSafeT)
+import qualified Pipes.Safe
 import System.Exit
 import System.Environment (getProgName)
 import qualified System.IO as IO
@@ -108,22 +105,41 @@ import Control.Monad (when)
 -- may have already been shut down, this is to be expected.  Since
 -- there is nothing that can really be done to respond to any IO error
 -- that results from closing a handle, just ignore these errors.
-ignoreIOExceptions :: Bool -> IO () -> IO ()
-ignoreIOExceptions quiet a = Control.Exception.catch a f
+ignoreIOExceptions :: Bool -> String -> IO () -> IO ()
+ignoreIOExceptions beQuiet desc a = Control.Exception.catch a f
   where
     f :: Control.Exception.IOException -> IO ()
-    f exc = when (not quiet) $ do
+    f exc = when (not beQuiet) $ do
       pn <- getProgName
-      let msg = pn ++ ": warning: ignoring exception caught when "
-                ++ "closing handle: " ++ show exc
+      let msg = pn ++ ": warning: ignoring exception caught when " ++ desc
+                ++ ": " ++ show exc
       IO.hPutStrLn IO.stderr msg
       return ()
+
+-- | Close a handle, ignoring all IO exceptions.
+closeHandle
+  :: Bool
+  -- ^ Be quiet?
+  -> Handle
+  -> IO ()
+closeHandle q h = ignoreIOExceptions q "closing handle" (hClose h)
+
+-- | Terminate a process, ignoring all IO exceptions.
+terminateProcess
+  :: Bool
+  -- ^ Be quiet?
+  -> Process.ProcessHandle
+  -> IO ()
+terminateProcess q h = ignoreIOExceptions q "terminating process" $ do
+  _ <- Process.terminateProcess h
+  _ <- Process.waitForProcess h
+  return ()
 
 
 -- # Configuration and result types
 
 -- | How will the subprocess get its information for this stream?
-data StdStream
+data NonPipe
   = Inherit
   -- ^ Use whatever stream that the parent process has.
   | UseHandle Handle
@@ -151,76 +167,23 @@ data CreateProcess = CreateProcess
   , delegate_ctlc :: Bool
   -- ^ See 'System.Process.delegate_ctlc' in the "System.Process"
   -- module for details.
-  }
 
--- | A mailbox that sends messages to a process.  Although a 'ToProcess'
--- mailbox can receive mail from multiple places, currently the
--- "Pipes.Cliff" API does not make it easy to employ such a use case.
--- It's easiest to use 'toProcess', which creates a 'Consumer''
--- that feeds messages to this 'ToProcess' mailbox.  When the
--- 'Consumer'' is done feeding messages to the mailbox, it will
--- automatically seal the mailbox.  This will ensure that the mailbox
--- is properly flushed of all messages.
-data ToProcess = ToProcess (Output ByteString) (STM ())
-  -- ^ @ToProcess o s@, where
-  --
-  -- @o@ is the output mailbox, and
-  --
-  -- @s@ is an action that seals the mailbox.
-
--- | A mailbox that receives messages from a process.  Although a
--- 'FromProcess' mailbox can dispense its contents to multiple
--- recipients, currently the "Pipes.Cliff" API does not make it easy
--- to employ such a use case.  It's easiest to use
--- 'fromProcess', which creates a 'Producer'' that streams
--- messgaes received from the process.  When the 'Producer'' is done
--- streaming contents received from the mailbox, it will automatically
--- seal the mailbox.  This will ensure that the mailbox is properly
--- flushed of all messages.
-data FromProcess = FromProcess (Input ByteString) (STM ())
-  -- ^ @FromProcess i s@, where
-  --
-  -- @i@ is the input mailbox, and
-  --
-  -- @s@ is an action that seals the mailbox.
-
-
--- | Contains any mailboxes that communicate with the subprocess,
--- along with the process handle.
-data Mailboxes = Mailboxes
-
-  { mbxStdIn :: Maybe ToProcess
-  -- ^ Mailbox to send data to the standard input, if you requested
-  -- such a mailbox using 'Mailbox' for 'std_in'.  Each 'ByteString'
-  -- that you place into the 'Output' will be sent to the subprocess
-  -- using 'BS.hPut'.
-
-  , mbxStdOut :: Maybe FromProcess
-  -- ^ Mailbox to receive data from the standard output, if you
-  -- requested such a mailbox using 'Mailbox' for 'std_out'.  The
-  -- output from the subprocess is read in arbitrarily sized chunks
-  -- (currently this arbitrary size is 1024 bytes) and resulting
-  -- chunks are placed in this 'Input'.
-
-  , mbxStdErr :: Maybe FromProcess
-  -- ^ Mailbox to receive data from the standard error, if you
-  -- requested such a mailbox using 'Mailbox' for 'std_err'.  The
-  -- output from the subprocess is read in arbitrarily sized chunks
-  -- (currently this arbitrary size is 1024 bytes) and resulting
-  -- chunks are placed in this 'Input'.
-
-  , mbxHandle :: Process.ProcessHandle
-  -- ^ A process handle.  The process begins running in the background
-  -- immediately.  Remember that the subprocess will be terminated
-  -- right away after you leave the 'ContT' monad.  To wait until the
-  -- process finishes running, use 'Process.waitForProcess' from the
-  -- "System.Process" module.
+  , quiet :: Bool
+  -- ^ If True, does not print messages to standard error when IO
+  -- exceptions arise when closing handles or terminating processes.
+  -- Sometimes these errors arise due to broken pipes; this can be
+  -- normal, depending on the circumstances.  For example, if you
+  -- are streaming a large set of values to a pager such as @less@
+  -- and you expect that the user will often quit the pager without
+  -- viewing the whole result, a broken pipe will result, which will
+  -- print a warning message.  That can be a nuisance.  If you don't
+  -- want to see these errors, set 'quiet' to 'True'.
   }
 
 convertCreateProcess
-  :: Maybe StdStream
-  -> Maybe StdStream
-  -> Maybe StdStream
+  :: Maybe NonPipe
+  -> Maybe NonPipe
+  -> Maybe NonPipe
   -> CreateProcess
   -> Process.CreateProcess
 convertCreateProcess inp out err a = Process.CreateProcess
@@ -235,10 +198,10 @@ convertCreateProcess inp out err a = Process.CreateProcess
   , Process.delegate_ctlc = delegate_ctlc a
   }
   where
-    conv = convertStdStream
+    conv = convertNonPipe
 
-convertStdStream :: Maybe StdStream -> Process.StdStream
-convertStdStream a = case a of
+convertNonPipe :: Maybe NonPipe -> Process.StdStream
+convertNonPipe a = case a of
   Nothing -> Process.CreatePipe
   Just Inherit -> Process.Inherit
   Just (UseHandle h) -> Process.UseHandle h
@@ -260,20 +223,23 @@ convertStdStream a = case a of
 -- * a new process group is not created
 --
 -- * 'delegate_ctlc' is 'False'
+--
+-- * 'quiet' is 'False'
 
-proc
+procSpec
   :: String
   -- ^ The name of the program to run, such as @less@.
   -> [String]
   -- ^ Command-line arguments
   -> CreateProcess
-proc prog args = CreateProcess
+procSpec prog args = CreateProcess
   { cmdspec = Process.RawCommand prog args
   , cwd = Nothing
   , env = Nothing
   , close_fds = False
   , create_group = False
   , delegate_ctlc = False
+  , quiet = False
   }
 
 
@@ -287,6 +253,8 @@ bufSize = 1024
 -- | Create a 'Producer'' from a 'Handle'.  The 'Producer'' will get
 -- 'ByteString' from the 'Handle' and produce them.  Does nothing to
 -- close the given 'Handle' at any time.
+--
+-- TODO IO Errors
 produceFromHandle
   :: MonadIO m
   => Handle
@@ -301,6 +269,8 @@ produceFromHandle h = liftIO (BS.hGetSome h bufSize) >>= go
 -- | Create a 'Consumer'' from a 'Handle'.  The 'Consumer' will put
 -- each 'ByteString' it receives into the 'Handle'.  Does nothing to
 -- close the handle at any time.
+--
+-- TODO IO errors
 consumeToHandle
   :: MonadIO m
   => Handle
@@ -319,48 +289,39 @@ messageBuffer = bounded 10
 
 -- | Acquires a resource and registers a finalizer.
 initialize
-  :: (MonadSafe m, MonadIO m)
+  :: (Pipes.Safe.MonadSafe m, MonadIO m)
   => IO a
   -> (a -> IO ())
   -> m a
-initialize make destroy = mask $ \_ -> do
+initialize make destroy = Pipes.Safe.mask $ \_ -> do
   thing <- liftIO make
-  _ <- register (liftIO (destroy thing))
+  _ <- Pipes.Safe.register (liftIO (destroy thing))
   return thing
 
 -- | Creates a mailbox; seals it when done.
 newMailbox
-  :: (MonadSafe m, MonadIO m)
+  :: (Pipes.Safe.MonadSafe m, MonadIO m)
   => m (Output a, Input a, STM ())
 newMailbox =
   initialize (spawn' messageBuffer)
   (\(_, _, seal) -> atomically seal)
 
 -- | Runs a thread in the background.  Initializes a finalizer that
--- will cancel the thread.  Be sure to use this every time you run an
--- 'Effect' that streams values to or from a mailbox associated with a
--- process, even if you only use a single process. Otherwise, you
--- might get deadlocks or errors such as @thread blocked indefinitely
--- in an STM transaction@.  The 'Control.Concurrent.Async' that is
--- returned allows you to later kill the thread if you need to.  The
--- associated thread will be killed when the entire 'MonadSafe'
--- computation completes; to prevent this from happening, use
--- 'Control.Concurrent.Async.wait' from "Control.Concurrent.Async".
-
-background :: (MonadSafe m, MonadIO m) => IO a -> m (Async a)
+-- will cancel the thread.
+background :: (Pipes.Safe.MonadSafe m, MonadIO m) => IO a -> m (Async a)
 background action = initialize (async action) cancel
 
 -- | Creates a thread that will run in the background and pump
 -- messages from the given mailbox to the process via its handle.
 -- Closes the Handle when done.
 processPump
-  :: (MonadIO m, MonadSafe m)
+  :: (MonadIO m, Pipes.Safe.MonadSafe m)
   => Bool
   -- ^ Quiet?
   -> Handle
   -> (Input ByteString, STM ())
   -> m ()
-processPump quiet hndle (input, seal) = do
+processPump beQuiet hndle (input, seal) = do
   let pumper = flip Control.Exception.finally cleanup .
         runEffect $
           fromInput input >-> consumeToHandle hndle
@@ -368,19 +329,21 @@ processPump quiet hndle (input, seal) = do
   return ()
   where
     cleanup = liftIO $ do
-      ignoreIOExceptions quiet $ hClose hndle
+      closeHandle beQuiet hndle
       atomically seal
 
 -- | Creates a thread that will run in the background and pull
 -- messages from the process and place them into the given mailbox.
 -- Closes the handle when done.
 processPull
-  :: (MonadSafe m, MonadIO m)
-  => Handle
+  :: (Pipes.Safe.MonadSafe m, MonadIO m)
+  => Bool
+  -- ^ Quiet?
+  -> Handle
   -> (Output ByteString, STM ())
   -- ^ Output box, paired with action to close the box.
   -> m ()
-processPull hndle (output, seal) = do
+processPull beQuiet hndle (output, seal) = do
   let puller = flip Control.Exception.finally cleanup .
         runEffect $
           produceFromHandle hndle >-> toOutput output
@@ -388,74 +351,43 @@ processPull hndle (output, seal) = do
   return ()
   where
     cleanup = liftIO $ do
-      ignoreIOExceptions $ hClose hndle
+      closeHandle beQuiet hndle
       atomically seal
 
 
 -- | Creates a mailbox that sends messages to the given process, and
 -- sets up and runs threads to pump messages to the process.
 makeToProcess
-  :: (MonadSafe m, MonadIO m)
-  => Handle
-  -> m ToProcess
-makeToProcess hndle = do
+  :: (Pipes.Safe.MonadSafe mp, MonadIO mp, Pipes.Safe.MonadSafe m, MonadIO m)
+  => Bool
+  -- ^ Quiet?
+  -> Handle
+  -> m (Consumer ByteString mp ())
+makeToProcess beQuiet hndle = do
   (out, inp, seal) <- newMailbox
-  processPump hndle (inp, seal)
-  return $ ToProcess out seal
+  processPump beQuiet hndle (inp, seal)
+  return $ toOutput out `Pipes.Safe.finally` (liftIO (atomically seal))
 
 -- | Creates a mailbox that receives messages from the given process,
 -- and sets up and runs threads to receive the messages and deliver
 -- them to the mailbox.
 makeFromProcess
-  :: (MonadSafe m, MonadIO m)
-  => Handle
-  -> m FromProcess
-makeFromProcess hndle = do
+  :: (Pipes.Safe.MonadSafe m, MonadIO m, Pipes.Safe.MonadSafe mp, MonadIO mp)
+  => Bool
+  -- ^ Quiet?
+  -> Handle
+  -> m (Producer ByteString mp ())
+makeFromProcess beQuiet hndle = do
   (out, inp, seal) <- newMailbox
-  processPull hndle (out, seal)
-  return $ FromProcess inp seal
+  processPull beQuiet hndle (out, seal)
+  return $ fromInput inp `Pipes.Safe.finally` (liftIO (atomically seal))
 
-
-makeBox
-  :: Monad m
-  => Maybe Handle
-  -> (Handle -> m a)
-  -> m (Maybe a)
-makeBox mayHan mkr = case mayHan of
-  Nothing -> return Nothing
-  Just h -> liftM Just $ mkr h
-
--- | Given the process handles, creates all mailboxes.
-makeBoxes
-  :: (MonadIO m, MonadSafe m)
-  => (Maybe Handle, Maybe Handle, Maybe Handle)
-  -> m ( Maybe ToProcess, Maybe FromProcess, Maybe FromProcess )
-makeBoxes (mayIn, mayOut, mayErr) = do
-  inp <- makeBox mayIn makeToProcess
-  out <- makeBox mayOut makeFromProcess
-  err <- makeBox mayErr makeFromProcess
-  return (inp, out, err)
 
 -- # Subprocesses
 
 -- Waiting on a process handle more than once will merely return the
 -- same code more than once.  See the source code for System.Process.
 
-{-
-useProcess
-  :: (MonadIO m, MonadSafe m)
-  => CreateProcess
-  -> m (Maybe Handle, Maybe Handle, Maybe Handle, Process.ProcessHandle)
-useProcess cp = initialize make destroy
-  where
-    make = Process.createProcess (convertCreateProcess cp)
-    destroy (i, o, e, h) = do
-      Process.terminateProcess h
-      _ <- Process.waitForProcess h
-      let shut = maybe (return ()) (ignoreIOExceptions . hClose)
-      shut i >> shut o >> shut e
-      return ()
--}
 -- | Launch and use a subprocess.
 --
 -- /Warning/ - do not attempt to use any of the resources created by
@@ -479,177 +411,228 @@ useProcess cp = initialize make destroy
 -- To increase the safety when using values with the 'ContT' type,
 -- you can use 'safeCliff'.
 
-{-
+
+-- | Creates a subprocess.  Registers destroyers for each handle
+-- created, as well as for the ProcessHandle.
 createProcess
-  :: (MonadIO m, MonadSafe m)
-  => CreateProcess
-  -> m Mailboxes
-createProcess spec = do
-  (inp, out, err, han) <- useProcess spec
-  (inp', out', err') <- makeBoxes (inp, out, err)
-  return $ Mailboxes inp' out' err' han
--}
-
--- | Creates a 'Consumer'' that sends a stream to the associated
--- 'ToProcess'.  The 'ToProcess' mailbox is sealed when the
--- 'Consumer'' finishes sending messages.
-toProcess
-  :: (MonadIO m, MonadSafe m)
-  => ToProcess
-  -> Consumer' ByteString m ()
-toProcess (ToProcess box seal)
-  = toOutput box `finally` (liftIO (atomically seal))
-
-
--- | Creates a 'Producer'' that sends a stream of messages received at
--- the associated 'FromProcess' mailbox.  The 'FromProcess' mailbox is
--- sealed when the 'Producer'' is done receiving messages.
-fromProcess
-  :: (MonadIO m, MonadSafe m)
-  => FromProcess
-  -> Producer' ByteString m ()
-fromProcess (FromProcess box seal)
-  = fromInput box `finally` (liftIO $ atomically seal)
+  :: (MonadIO m, Pipes.Safe.MonadSafe m)
+  => Bool
+  -- ^ Quiet?
+  -> Process.CreateProcess
+  -> m (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
+createProcess beQuiet cp = initialize (Process.createProcess cp) destroy
+  where
+    destroy (mayIn, mayOut, mayErr, han) = do
+      let close = maybe (return ()) (closeHandle beQuiet)
+      close mayIn
+      close mayOut
+      close mayErr
+      terminateProcess beQuiet han
 
 
 -- | Runs in the background an effect, typically one that is moving
--- data from one mailbox to another.  For examples of its usage, see
--- "Pipes.Cliff.Examples".  Returns an 'Async' that can be used to
--- kill the thread later if needed.  The thread will be killed
--- automatically upon exiting the 'SafeT' computation if it is not
--- killed or waited on.
-conveyor :: Effect (SafeT IO) a -> SafeT IO (Async a)
-conveyor = background . liftIO . runSafeT . runEffect
+-- data from one process to another.  For examples of its usage, see
+-- "Pipes.Cliff.Examples".  The associated thread is killed when the
+-- 'SafeT' computation completes.
+conveyor :: Effect (Pipes.Safe.SafeT IO) a -> Pipes.Safe.SafeT IO ()
+conveyor efct
+  = (background . liftIO . runSafeT . runEffect $ efct) >> return ()
 
+-- | A version of 'System.Process.waitForProcess' with an overloaded
+-- 'MonadIO' return type.
+waitForProcess :: MonadIO m => ProcessHandle -> m ExitCode
+waitForProcess h = liftIO $ Process.waitForProcess h
+
+{- $process
+
+Each of these functions creates a process.  The process begins
+running immediately in a separate process while your Haskell program
+continues concurrently.  A function is provided for each possible
+combination of standard input, standard output, and standard error.
+Use the 'NonPipe' type to describe what you want to do with streams
+you do NOT want to create a stream for.  For example, to create a
+subprocess that does not create a Pipe for any of the standard
+streams, use 'pipeNone'.  You must describe what you want done with
+standard input, standard output, and standard error.  To create a
+subprocess that creates a Pipe for standard input and standard
+output, use 'pipeInputOutput'.  You must describe what you want done
+with standard error.  A 'Producer' is returned for standard output
+and a 'Consumer' for standard input.
+
+Do NOT attempt to use any of the resources created by this function
+outside of the 'Pipes.Safe.MonadSafe' computation.  The
+'Pipes.Safe.MonadSafe' computation will destroy all resources when
+the 'Pipes.Safe.MonadSafe' computation is complete.  This means that
+all these functions are exception safe: all resources--threads and
+processes included--are destroyed when the 'Pipes.Safe.MonadSafe'
+computation is complete, even if an exception is thrown.  However,
+this does mean that you need to stay in the 'Pipes.Safe.MonadSafe'
+computation if you need to keep a resource around.  'waitForProcess'
+can be handy for this.  All functions in this section return a
+'ProcessHandle' for use with 'waitForProcess'.
+
+Each 'Proxy' automatically destroys associated file handles and
+other behind-the-scenes resources after its computation finishes
+running; that's why the monad stack of each 'Proxy' must contain a
+'Pipes.Safe.MonadSafe'.  For an example of how to use this, consule
+"Pipes.Cliff.Examples".
+
+-}
 pipeNone
-  :: (MonadIO m, MonadSafe m)
-  => StdStream
+  :: (MonadIO m, Pipes.Safe.MonadSafe m)
+  => NonPipe
   -- ^ Standard input
-  -> StdStream
+  -> NonPipe
   -- ^ Standard output
-  -> StdStream
+  -> NonPipe
   -- ^ Standard error
   -> CreateProcess
   -> m Process.ProcessHandle
-pipeNone sIn sOut sErr cp = undefined
+pipeNone sIn sOut sErr cp = do
+  (_, _, _, han) <- createProcess (quiet cp) cp'
+  return han
   where
     cp' = convertCreateProcess (Just sIn) (Just sOut) (Just sErr)
       cp
 
 pipeInput
-  :: (MonadIO mi, MonadSafe mi, MonadIO m, MonadSafe m)
-  => StdStream
+  :: (MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO m, Pipes.Safe.MonadSafe m)
+  => NonPipe
   -- ^ Standard output
-  -> StdStream
+  -> NonPipe
   -- ^ Standard error
   -> CreateProcess
-  -> m (Consumer ByteString mi r, Process.ProcessHandle)
+  -> m (Consumer ByteString mi (), Process.ProcessHandle)
   -- ^ A 'Consumer' for standard input, and the 'ProcessHandle'
-pipeInput sOut sErr cp = undefined
+pipeInput sOut sErr cp = do
+  (Just inp, _, _, han) <- createProcess (quiet cp) cp'
+  inp' <- makeToProcess (quiet cp) inp
+  return (inp', han)
   where
     cp' = convertCreateProcess Nothing (Just sOut) (Just sErr)
       cp
 
 pipeOutput
-  :: (MonadIO mi, MonadSafe mi, MonadIO m, MonadSafe m)
-  => StdStream
+  :: (MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO m, Pipes.Safe.MonadSafe m)
+  => NonPipe
   -- ^ Standard input
-  -> StdStream
+  -> NonPipe
   -- ^ Standard error
   -> CreateProcess
   -> m (Producer ByteString mi (), Process.ProcessHandle)
   -- ^ A 'Producer' for standard output, and the 'ProcessHandle'
-pipeOutput sIn sErr cp = undefined
+pipeOutput sIn sErr cp = do
+  (_, Just out, _, han) <- createProcess (quiet cp) cp'
+  out' <- makeFromProcess (quiet cp) out
+  return (out', han)
   where
     cp' = convertCreateProcess (Just sIn) Nothing (Just sErr) cp
 
 pipeError
-  :: (MonadIO mi, MonadSafe mi, MonadIO m, MonadSafe m)
-  => StdStream
+  :: (MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO m, Pipes.Safe.MonadSafe m)
+  => NonPipe
   -- ^ Standard input
-  -> StdStream
+  -> NonPipe
   -- ^ Standard output
   -> CreateProcess
   -> m (Producer ByteString mi (), Process.ProcessHandle)
   -- ^ A 'Producer' for standard error, and the 'ProcessHandle'
-pipeError sIn sOut cp = undefined
+pipeError sIn sOut cp = do
+  (_, _, Just err, han) <- createProcess (quiet cp) cp'
+  err' <- makeFromProcess (quiet cp) err
+  return (err', han)
   where
     cp' = convertCreateProcess (Just sIn) (Just sOut) Nothing cp
 
 pipeInputOutput
-  :: ( MonadIO mi, MonadSafe mi, MonadIO mo, MonadSafe mo
-     , MonadIO m, MonadSafe m)
-  => StdStream
+  :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo, Pipes.Safe.MonadSafe mo
+     , MonadIO m, Pipes.Safe.MonadSafe m)
+  => NonPipe
   -- ^ Standard error
   -> CreateProcess
-  -> m ( Consumer ByteString mi r
+  -> m ( Consumer ByteString mi ()
        , Producer ByteString mo ()
        , Process.ProcessHandle
        )
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output, and a 'ProcessHandle'
-pipeInputOutput sErr cp = undefined
+pipeInputOutput sErr cp = do
+  (Just inp, Just out, _, han) <- createProcess (quiet cp) cp'
+  inp' <- makeToProcess (quiet cp) inp
+  out' <- makeFromProcess (quiet cp) out
+  return (inp', out', han)
   where
     cp' = convertCreateProcess Nothing Nothing (Just sErr) cp
 
 pipeInputError
-  :: ( MonadIO mi, MonadSafe mi, MonadIO mo, MonadSafe mo
-     , MonadIO m, MonadSafe m)
-  => StdStream
+  :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo, Pipes.Safe.MonadSafe mo
+     , MonadIO m, Pipes.Safe.MonadSafe m)
+  => NonPipe
   -- ^ Standard output
   -> CreateProcess
-  -> m ( Consumer ByteString mi r
+  -> m ( Consumer ByteString mi ()
        , Producer ByteString mo ()
        , Process.ProcessHandle
        )
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error, and a 'ProcessHandle'
-pipeInputError sOut cp = undefined
+pipeInputError sOut cp = do
+  (Just inp, _, Just err, han) <- createProcess (quiet cp) cp'
+  inp' <- makeToProcess (quiet cp) inp
+  err' <- makeFromProcess (quiet cp) err
+  return (inp', err', han)
   where
     cp' = convertCreateProcess Nothing (Just sOut) Nothing cp
 
 pipeOutputError
-  :: ( MonadIO mi, MonadSafe mi, MonadIO mo, MonadSafe mo, MonadIO m
-     , MonadSafe m)
-  => StdStream
+  :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo
+     , Pipes.Safe.MonadSafe mo, MonadIO m
+     , Pipes.Safe.MonadSafe m)
+  => NonPipe
   -- ^ Standard input
   -> CreateProcess
-  -> m ( Producer ByteString mi r
+  -> m ( Producer ByteString mi ()
        , Producer ByteString mo ()
        , Process.ProcessHandle
        )
   -- ^ A 'Producer' for standard output, a 'Producer' for standard
   -- error, and a 'ProcessHandle'
-pipeOutputError sIn cp = undefined
+pipeOutputError sIn cp = do
+  (_, Just out, Just err, han) <- createProcess (quiet cp) cp'
+  out' <- makeFromProcess (quiet cp) out
+  err' <- makeFromProcess (quiet cp) err
+  return (out', err', han)
   where
     cp' = convertCreateProcess (Just sIn) Nothing Nothing cp
 
 pipeInputOutputError
-  :: ( MonadIO mi, MonadSafe mi, MonadIO mo, MonadSafe mo,
-       MonadIO me, MonadSafe me, MonadIO m, MonadSafe m)
+  :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo, Pipes.Safe.MonadSafe mo,
+       MonadIO me, Pipes.Safe.MonadSafe me, MonadIO m, Pipes.Safe.MonadSafe m)
   => CreateProcess
-  -> m ( Consumer ByteString mi r
+  -> m ( Consumer ByteString mi ()
        , Producer ByteString mo ()
        , Producer ByteString me ()
        , Process.ProcessHandle
        )
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output, a 'Producer' for standard error, and a 'ProcessHandle'
-pipeInputOutputError cp = undefined
+pipeInputOutputError cp = do
+  (Just inp, Just out, Just err, han) <- createProcess (quiet cp) cp'
+  inp' <- makeToProcess (quiet cp) inp
+  out' <- makeFromProcess (quiet cp) out
+  err' <- makeFromProcess (quiet cp) err
+  return (inp', out', err', han)
   where
     cp' = convertCreateProcess Nothing Nothing Nothing cp
 
 {- $reexports
-   * "Control.Concurrent.Async" reexports 'Async' and 'wait'
 
    * "Pipes" reexports all bindings
 
-   * "Pipes.Concurrent" reexports all bindings
-
-   * "Pipes.Safe" reexports all bindings
+   * "Pipes.Safe" reexports 'runSafeT'
 
    * "System.Exit" reexports all bindings
 
-   * "System.Process" reexports 'waitForProcess'
+   * "System.Process" reexports 'ProcessHandle'
 
 -}

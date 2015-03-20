@@ -19,82 +19,29 @@ import qualified Data.ByteString.Char8 as BS8
 
 -- | Streams an infinite list of numbers to @less@.
 -- The 'Effect' that streams values to the process is run in the
--- background, even though there is only one subprocess.  If you did
--- not run the process in the background, then here's what would
--- happen:
---
--- 1.  'createProcess' launches @less@.
---
--- 2.  The line with 'runEffect' runs in the main Haskell thread.  It
--- streams @ByteString@s to @less@.  You page through @less@ as usual.
--- Just don't press @G@ to go to the end of the file, as there is no
--- end--it's an infinite list of numbers.  Your memory is not filled
--- with an infinite list, though.  The mailbox leading in to @less@ is
--- limited in size, so the 'Producer' that is making the numbers
--- blocks until space is available in the mailbox.
---
--- 3.  You quit @less@ with @q@.  But the IO action with 'runEffect'
--- is still running.  It doesn't fill up your memory--the mailbox
--- leading to @less@ is limited in size.  So the computation just
--- blocks.  Your console shows no activity.
---
--- 4.  If you're lucky, the runtime says
--- @thread blocked indefinitely in an STM transaction@
--- and quits.
--- If you're unlucky, you just get a console with no activity.
--- You hit control-C.
---
--- 5.  The IO action with 'waitForProcess' never runs.
---
--- By using 'background', here's what happens:
---
--- 1.  'createProcess' launches @less@.
---
--- 2.  The line with 'runEffect' runs in another Haskell thread.  It
--- streams @ByteString@ to @less@.  You page through @less@ as usual.
---
--- 3.  Immediately after @less@ opens, the main Haskell thread
--- proceeds to the IO action with 'waitForProcess'.  The main thread
--- pauses to wait until @less@ exits.
---
--- 4.  The 'ContT' computation returns the exit code from the @less@
--- process.
---
--- 5.  The 'ContT' computation destroys all resources created in the
--- 'ContT' computation.  The @less@ process is already dead, but an
--- extra 'System.Process.terminateProcess' is applied (this is
--- harmless.)  The background thread with the 'runEffect' is also
--- killed.
---
--- These are all the things a shell does for you.  Makes me a little
--- more grateful for @bash@ and @zsh@ and such.  There are also some
--- Haskell libraries that do some of these things for you; see the
--- @README.md@ file, which is referenced in the main "Pipes.Cliff"
--- module, for some links to those.  Those libraries make other
--- trade-offs, though, which is why I wrote this one.
+-- background by using 'conveyor', even though there is only one
+-- subprocess.  This is typically what you want.
 
 numsToLess :: IO ExitCode
 numsToLess = runSafeT $ do
-  Mailboxes (Just out) _ _ han <- createProcess
-    (proc "less" []) { std_in = Mailbox }
-  _ <- conveyor $ produceNumbers >-> toProcess out
-  lift $ waitForProcess han
+  (toLess, han) <- pipeInput Inherit Inherit (procSpec "less" [])
+  conveyor $ produceNumbers >-> toLess
+  waitForProcess han
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
 -- Perfectly useless, but shows how to build pipelines.  Notice how
 -- the components of the pipeline are run in the 'background'; if you
 -- run one of them in the foreground, you might get a deadlock.
+
 alphaNumbers :: IO ExitCode
 alphaNumbers = runSafeT $ do
-  Mailboxes (Just toTr) (Just fromTr) _ _ <- createProcess
-    (proc "tr" ["[0-9]", "[a-z]"]) { std_in = Mailbox
-                                   , std_out = Mailbox
-                                   }
-  Mailboxes (Just toLess) _ _ lessHan <- createProcess
-    (proc "less" []) { std_in = Mailbox }
-  _ <- conveyor $ produceNumbers >-> toProcess toTr
-  _ <- conveyor $ fromProcess fromTr >-> toProcess toLess
-  lift $ waitForProcess lessHan
+  (toTr, fromTr, _) <- pipeInputOutput Inherit
+    (procSpec "tr" ["[0-9]", "[a-z]"])
+  (toLess, lessHan) <- pipeInput Inherit Inherit
+    (procSpec "less" [])
+  conveyor $ produceNumbers >-> toTr
+  conveyor $ fromTr >-> toLess
+  waitForProcess lessHan
 
 
 -- | Produces a stream of ByteString, where each ByteString is a shown
@@ -111,15 +58,10 @@ produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
 -- shut down automatically.
 limitedAlphaNumbers :: IO ExitCode
 limitedAlphaNumbers = runSafeT $ do
-  Mailboxes (Just toTr) (Just fromTr) _ _ <- createProcess
-    (proc "tr" ["[0-9]", "[a-z]"]) { std_in = Mailbox
-                                   , std_out = Mailbox
-                                   }
-  Mailboxes (Just toCat) _ _ catHan <- createProcess
-    (proc "cat" []) { std_in = Mailbox }
-  _ <- conveyor $ produceNumbers >-> P.take 300 >-> toProcess toTr
-  _ <- conveyor $ fromProcess fromTr >-> toProcess toCat
-  lift $ waitForProcess catHan
-
-
-
+  (toTr, fromTr, _) <- pipeInputOutput Inherit
+    (procSpec "tr" ["[0-9]", "[a-z]"])
+  (toCat, catHan) <- pipeInput Inherit Inherit
+    (procSpec "cat" [])
+  conveyor $ produceNumbers >-> P.take 300 >-> toTr
+  conveyor $ fromTr >-> toCat
+  waitForProcess catHan
