@@ -20,7 +20,11 @@ import qualified Data.ByteString.Char8 as BS8
 -- | Streams an infinite list of numbers to @less@.
 -- The 'Effect' that streams values to the process is run in the
 -- background by using 'conveyor', even though there is only one
--- subprocess.  This is typically what you want.
+-- subprocess.  This is typically what you want.  Shows off how you
+-- can use "Pipes.Cliff" even for non-finite 'Producer's.  Don't try
+-- to go to the end of the input in @less@, though.  When you quit
+-- @less@, you will get broken pipe warnings printed to standard
+-- error.  This is normal.  To suppress them, see the 'quiet' option.
 
 numsToLess :: IO ExitCode
 numsToLess = runSafeT $ do
@@ -45,8 +49,8 @@ alphaNumbers = runSafeT $ do
   waitForProcess lessHan
 
 
--- | Produces a stream of ByteString, where each ByteString is a shown
--- integer.
+-- | Produces a stream of 'BS8.ByteString', where each
+-- 'BS8.ByteString' is a shown integer.
 
 produceNumbers :: Monad m => Producer BS8.ByteString m ()
 produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
