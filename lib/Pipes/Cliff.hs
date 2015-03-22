@@ -66,13 +66,17 @@ module Pipes.Cliff
   , pipeOutputError
   , pipeInputOutputError
 
-  -- * Conveniences
+  -- * Background operations
 
-  -- | These make it a bit easier to write both simple and
-  -- complicated pipelines.
+  -- | Often it is necessary to run threads in the background; in
+  -- addition, all subprocesses run in the background.  These
+  -- functions allow you to launch threads in the background and to
+  -- wait on background threads and subprocesses.
 
   , conveyor
+  , background
   , waitForProcess
+  , waitForThread
 
   -- * Re-exports
   -- $reexports
@@ -85,7 +89,7 @@ module Pipes.Cliff
 import System.IO
 import Pipes
 import Pipes.Concurrent
-import Control.Concurrent.Async (Async, async, cancel)
+import Control.Concurrent.Async (Async, async, cancel, wait)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified System.Process as Process
@@ -343,7 +347,8 @@ newMailbox =
   (\(_, _, seal) -> atomically seal)
 
 -- | Runs a thread in the background.  Initializes a finalizer that
--- will cancel the thread.
+-- will cancel the thread if it is still running when the
+-- 'Pipes.Safe.MonadSafe' computation completes.
 background :: Pipes.Safe.MonadSafe m => IO a -> m (Async a)
 background action = initialize (async action) cancel
 
@@ -478,6 +483,13 @@ conveyor efct
 -- 'MonadIO' return type.
 waitForProcess :: MonadIO m => ProcessHandle -> m ExitCode
 waitForProcess h = liftIO $ Process.waitForProcess h
+
+-- | A version of 'Control.Concurrent.Async.wait' with an overloaded
+-- 'MonadIO' return type.  Allows you to wait for the return value of
+-- threads launched with 'background'.  If the thread throws an
+-- exception, 'waitForThread' will throw that same exception.
+waitForThread :: MonadIO m => Async a -> m a
+waitForThread = liftIO . wait
 
 {- $process
 

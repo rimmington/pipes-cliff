@@ -58,6 +58,39 @@ produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
     mkNumStr = flip BS8.snoc '\n' . BS8.pack . show
 
 
+-- | Produces an infinite stream of numbers, sends it to @tr@ for some
+-- mangling, and then to @sh@, which will copy each line both to
+-- standard output and to standard error.  From @sh@, standard output
+-- is then sent off to @less@, and standard error is sent to a
+-- separate thread which will collect the results and return them.
+--
+-- This example shows you how to write a pipeline that deals with
+-- both standard output and standard error.
+--
+-- It's also interesting to note here that because of the buffering
+-- that happens in various places throughout the pipeline, and because
+-- less itself also buffers its input, the output you will see from
+-- the @sh@ process's standard error will be much longer than the
+-- output the user actually viewed in @less@.
+standardOutputAndError :: IO BS8.ByteString
+standardOutputAndError = runSafeT $ do
+  (toTr, fromTr, _) <- pipeInputOutput Inherit
+    (procSpec "tr" ["[0-9]", "[a-z]"])
+  (toSh, fromShOut, fromShErr, _) <- pipeInputOutputError
+    (procSpec "sh" ["-c", script])
+  (toLess, _) <- pipeInput Inherit Inherit
+    (procSpec "less" [])
+  conveyor $ produceNumbers >-> toTr
+  conveyor $ fromTr >-> toSh
+  conveyor $ fromShOut >-> toLess
+  thread <- background
+    . runSafeT
+    . P.fold BS8.append BS8.empty id
+    $ fromShErr
+  waitForThread thread
+  where
+    script = "while read line; do echo $line; echo $line 1>&2; done"
+
 -- | Like 'alphaNumbers' but just sends a limited number
 -- of numbers to @cat@.  A useful test to make sure that pipelines
 -- shut down automatically.
@@ -94,3 +127,4 @@ alphaNumbersByteString = runSafeT $ do
     (procSpec "tr" ["[0-9]", "[a-z]"])
   conveyor $ produceNumbers >-> P.take 300 >-> toTr
   P.fold BS8.append BS8.empty id fromTr
+

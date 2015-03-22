@@ -84,9 +84,9 @@ testExe
 testExe fl libMods testMods nm = executable nm $
   [ mainIs (nm ++ ".hs")
   , condBlock (flag fl)
-    (buildable True, [])
+    (buildable True, defaultOptions ++ exeOptions libMods testMods)
     [buildable False]
-  ] ++ defaultOptions ++ exeOptions libMods testMods
+  ]
 
 sections
   :: FlagName
@@ -100,7 +100,7 @@ sections fl libMods testMods =
   [ githubHead "massysett" "pipes-cliff"
   ] ++ map (testExe fl libMods testMods)
            [ "numsToLess", "alphaNumbers", "limitedAlphaNumbers",
-             "alphaNumbersByteString" ]
+             "alphaNumbersByteString", "standardOutputAndError" ]
 
 -- # Packages
 
