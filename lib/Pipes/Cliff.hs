@@ -282,7 +282,7 @@ bufSize = 1024
 -- while receiving data, the error is caught and production ceases.
 -- The exception is not re-thrown.
 produceFromHandle
-  :: (MonadIO m, Pipes.Safe.MonadCatch m)
+  :: (Pipes.Safe.MonadCatch m, MonadIO m)
   => Bool
   -- ^ Be quiet?
   -> Handle
@@ -303,7 +303,7 @@ produceFromHandle beQuiet h = catchAndWarn beQuiet desc act >>= go
 -- sending data, the error is caught and consumption ceases.  The
 -- exception is not re-thrown.
 consumeToHandle
-  :: (MonadIO m, Pipes.Safe.MonadCatch m)
+  :: (Pipes.Safe.MonadCatch m, MonadIO m)
   => Bool
   -- ^ Be quiet?
   -> Handle
@@ -325,7 +325,7 @@ messageBuffer = bounded 10
 
 -- | Acquires a resource and registers a finalizer.
 initialize
-  :: (Pipes.Safe.MonadSafe m, MonadIO m)
+  :: Pipes.Safe.MonadSafe m
   => IO a
   -> (a -> IO ())
   -> m a
@@ -336,7 +336,7 @@ initialize make destroy = Pipes.Safe.mask $ \_ -> do
 
 -- | Creates a mailbox; seals it when done.
 newMailbox
-  :: (Pipes.Safe.MonadSafe m, MonadIO m)
+  :: Pipes.Safe.MonadSafe m
   => m (Output a, Input a, STM ())
 newMailbox =
   initialize (spawn' messageBuffer)
@@ -344,14 +344,14 @@ newMailbox =
 
 -- | Runs a thread in the background.  Initializes a finalizer that
 -- will cancel the thread.
-background :: (Pipes.Safe.MonadSafe m, MonadIO m) => IO a -> m (Async a)
+background :: Pipes.Safe.MonadSafe m => IO a -> m (Async a)
 background action = initialize (async action) cancel
 
 -- | Creates a thread that will run in the background and pump
 -- messages from the given mailbox to the process via its handle.
 -- Closes the Handle when done.
 processPump
-  :: (MonadIO m, Pipes.Safe.MonadSafe m)
+  :: Pipes.Safe.MonadSafe m
   => Bool
   -- ^ Quiet?
   -> Handle
@@ -372,7 +372,7 @@ processPump beQuiet hndle (input, seal) = do
 -- messages from the process and place them into the given mailbox.
 -- Closes the handle when done.
 processPull
-  :: (Pipes.Safe.MonadSafe m, MonadIO m)
+  :: Pipes.Safe.MonadSafe m
   => Bool
   -- ^ Quiet?
   -> Handle
@@ -394,7 +394,7 @@ processPull beQuiet hndle (output, seal) = do
 -- | Creates a mailbox that sends messages to the given process, and
 -- sets up and runs threads to pump messages to the process.
 makeToProcess
-  :: (Pipes.Safe.MonadSafe mp, MonadIO mp, Pipes.Safe.MonadSafe m, MonadIO m)
+  :: (Pipes.Safe.MonadSafe mp, Pipes.Safe.MonadSafe m)
   => Bool
   -- ^ Quiet?
   -> Handle
@@ -408,7 +408,7 @@ makeToProcess beQuiet hndle = do
 -- and sets up and runs threads to receive the messages and deliver
 -- them to the mailbox.
 makeFromProcess
-  :: (Pipes.Safe.MonadSafe m, MonadIO m, Pipes.Safe.MonadSafe mp, MonadIO mp)
+  :: (Pipes.Safe.MonadSafe m, Pipes.Safe.MonadSafe mp)
   => Bool
   -- ^ Quiet?
   -> Handle
@@ -451,7 +451,7 @@ makeFromProcess beQuiet hndle = do
 -- | Creates a subprocess.  Registers destroyers for each handle
 -- created, as well as for the ProcessHandle.
 createProcess
-  :: (MonadIO m, Pipes.Safe.MonadSafe m)
+  :: Pipes.Safe.MonadSafe m
   => Bool
   -- ^ Quiet?
   -> Process.CreateProcess
@@ -517,7 +517,7 @@ that's why the monad stack of each 'Proxy' must contain a
 
 -- | Do not create any 'Proxy' to or from the process.
 pipeNone
-  :: (MonadIO m, Pipes.Safe.MonadSafe m)
+  :: Pipes.Safe.MonadSafe m
   => NonPipe
   -- ^ Standard input
   -> NonPipe
@@ -535,7 +535,7 @@ pipeNone sIn sOut sErr cp = do
 
 -- | Create a 'Consumer' for standard input.
 pipeInput
-  :: (MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO m, Pipes.Safe.MonadSafe m)
+  :: (Pipes.Safe.MonadSafe mi, Pipes.Safe.MonadSafe m)
   => NonPipe
   -- ^ Standard output
   -> NonPipe
@@ -553,7 +553,7 @@ pipeInput sOut sErr cp = do
 
 -- | Create a 'Producer' for standard output.
 pipeOutput
-  :: (MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO m, Pipes.Safe.MonadSafe m)
+  :: (Pipes.Safe.MonadSafe mi, Pipes.Safe.MonadSafe m)
   => NonPipe
   -- ^ Standard input
   -> NonPipe
@@ -570,7 +570,7 @@ pipeOutput sIn sErr cp = do
 
 -- | Create a 'Producer' for standard error.
 pipeError
-  :: (MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO m, Pipes.Safe.MonadSafe m)
+  :: (Pipes.Safe.MonadSafe mi, Pipes.Safe.MonadSafe m)
   => NonPipe
   -- ^ Standard input
   -> NonPipe
@@ -588,8 +588,8 @@ pipeError sIn sOut cp = do
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard output.
 pipeInputOutput
-  :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo, Pipes.Safe.MonadSafe mo
-     , MonadIO m, Pipes.Safe.MonadSafe m)
+  :: ( Pipes.Safe.MonadSafe mi, Pipes.Safe.MonadSafe mo
+     , Pipes.Safe.MonadSafe m)
   => NonPipe
   -- ^ Standard error
   -> CreateProcess
@@ -610,8 +610,8 @@ pipeInputOutput sErr cp = do
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard error.
 pipeInputError
-  :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo, Pipes.Safe.MonadSafe mo
-     , MonadIO m, Pipes.Safe.MonadSafe m)
+  :: ( Pipes.Safe.MonadSafe mi, Pipes.Safe.MonadSafe mo
+     , Pipes.Safe.MonadSafe m)
   => NonPipe
   -- ^ Standard output
   -> CreateProcess
@@ -632,8 +632,8 @@ pipeInputError sOut cp = do
 -- | Create a 'Producer' for standard output and a 'Producer' for
 -- standard error.
 pipeOutputError
-  :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo
-     , Pipes.Safe.MonadSafe mo, MonadIO m
+  :: ( Pipes.Safe.MonadSafe mi
+     , Pipes.Safe.MonadSafe mo
      , Pipes.Safe.MonadSafe m)
   => NonPipe
   -- ^ Standard input
@@ -655,8 +655,8 @@ pipeOutputError sIn cp = do
 -- | Create a 'Consumer' for standard input, a 'Producer' for standard
 -- output, and a 'Producer' for standard error.
 pipeInputOutputError
-  :: ( MonadIO mi, Pipes.Safe.MonadSafe mi, MonadIO mo, Pipes.Safe.MonadSafe mo,
-       MonadIO me, Pipes.Safe.MonadSafe me, MonadIO m, Pipes.Safe.MonadSafe m)
+  :: ( Pipes.Safe.MonadSafe mi, Pipes.Safe.MonadSafe mo,
+       Pipes.Safe.MonadSafe me, Pipes.Safe.MonadSafe m)
   => CreateProcess
   -> m ( Consumer ByteString mi ()
        , Producer ByteString mo ()
