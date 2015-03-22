@@ -1,6 +1,7 @@
 module Pipes.Cliff.Next where
 
 import Control.Monad
+import Control.Exception (IOException)
 import qualified Control.Exception
 import System.IO
 import qualified System.IO as IO
@@ -10,7 +11,7 @@ import System.Process (ProcessHandle)
 import Pipes
 import Pipes.Safe
 import qualified Data.ByteString as BS
-import Pipes.Concurrent
+import qualified Pipes.Concurrent as PC
 import Data.ByteString (ByteString)
 import Control.Concurrent.MVar
 import System.Exit
@@ -19,67 +20,21 @@ import Control.Monad.Trans.Reader
 
 -- # Exception handling
 
--- | Runs a particular action.  Any IO errors are caught; a warning
--- message is printed if we're not being quiet, and 'Nothing' is
--- returned.  Otherwise, the result is returned.
-
-catchAndWarn
-  :: (MonadCatch m, MonadIO m)
-  => Bool
-  -- ^ Be quiet?
-  -> String
-  -- ^ What are we doing?  Used for warning message.
-  -> m a
-  -- ^ Do this
-  -> m (Maybe a)
-catchAndWarn beQuiet desc act
-  = Pipes.Safe.catch (liftM Just act) hndle
-  where
-    hndle e = do
-      let _types = e :: Control.Exception.IOException
-      when (not beQuiet) . liftIO $ do
-        pn <- getProgName
-        let msg = pn ++ ": warning: caught exception when "
-              ++ desc ++ ": " ++ show e
-        IO.hPutStrLn IO.stderr msg
-      return Nothing
-
--- | Runs a particular action, ignoring all IO errors.  Sometimes
--- using hClose will result in a broken pipe error.  Since the process
--- may have already been shut down, this is to be expected.  Since
--- there is nothing that can really be done to respond to any IO error
--- that results from closing a handle, just ignore these errors.
-ignoreIOExceptions :: Bool -> String -> IO () -> IO ()
-ignoreIOExceptions beQuiet desc a = Control.Exception.catch a f
-  where
-    f :: Control.Exception.IOException -> IO ()
-    f exc = when (not beQuiet) $ do
-      pn <- getProgName
-      let msg = pn ++ ": warning: ignoring exception caught when " ++ desc
-                ++ ": " ++ show exc
-      IO.hPutStrLn IO.stderr msg
-      return ()
-
--- | Close a handle, ignoring all IO exceptions.
-closeHandle
-  :: MonadIO m
-  => Bool
-  -- ^ Be quiet?
-  -> Handle
+-- | Run an action, taking all IO errors and sending them to the handler.
+handleErrors
+  :: (MonadIO m, MonadCatch m)
+  => CmdSpec
+  -> Maybe HandleOopsie
+  -> (Oopsie -> IO ())
   -> m ()
-closeHandle q h = liftIO $ ignoreIOExceptions q "closing handle" (hClose h)
-
--- | Terminate a process, ignoring all IO exceptions.
-terminateProcess
-  :: MonadIO m
-  => Bool
-  -- ^ Be quiet?
-  -> Process.ProcessHandle
   -> m ()
-terminateProcess q h = liftIO . ignoreIOExceptions q "terminating process" $ do
-  _ <- Process.terminateProcess h
-  _ <- Process.waitForProcess h
-  return ()
+handleErrors spec mayHandleOops han act = do
+  eiR <- try act
+  case eiR of
+    Left e -> liftIO (han oops) >> return ()
+      where
+        oops = Oopsie mayHandleOops spec e
+    Right () -> return ()
 
 
 -- # Configuration and result types
@@ -91,13 +46,20 @@ data NonPipe
   | UseHandle Handle
   -- ^ Use the given handle for input or output
 
+-- | Like 'Process.CmdSpec' in "System.Process", but also has an
+-- instance for 'Show'.
+data CmdSpec
+  = ShellCommand String
+  | RawCommand FilePath [String]
+  deriving (Eq, Ord, Show)
+
 -- | Like 'System.Process.CreateProcess' in "System.Process",
 -- this gives the necessary information to create a subprocess.  All
 -- but one of these fields is also present in
 -- 'System.Process.CreateProcess', and they all have the same meaning;
 -- the only field that is different is the 'quiet' field.
 data CreateProcess = CreateProcess
-  { cmdspec :: Process.CmdSpec
+  { cmdspec :: CmdSpec
     -- ^ Executable and arguments, or shell command
   , cwd :: Maybe FilePath
   -- ^ A new current working directory for the subprocess; if
@@ -128,14 +90,42 @@ data CreateProcess = CreateProcess
   -- print a warning message.  That can be a nuisance.  If you don't
   -- want to see these errors, set 'quiet' to 'True'.
 
-  , exitCode :: Maybe (MVar ExitCode)
-  , processHandle :: Maybe (MVar Process.ProcessHandle)
+  , exitCode :: Maybe (MVar (Maybe ExitCode))
+  , processHandle :: Maybe (MVar (Maybe Process.ProcessHandle))
+  , handler :: Oopsie -> IO ()
   }
 
+data HandleOopsie = HandleOopsie Activity HandleDesc
+  deriving (Eq,Show)
+
+data Activity
+  = Reading
+  | Writing
+  | Closing
+  deriving (Eq, Ord, Show)
+
+-- | Describes a handle.  From the perspective of the subprocess.
+data HandleDesc
+  = Input
+  | Output
+  | Error
+  deriving (Eq, Ord, Show)
+
+convertCmdSpec :: CmdSpec -> Process.CmdSpec
+convertCmdSpec (ShellCommand s) = Process.ShellCommand s
+convertCmdSpec (RawCommand p ss) = Process.RawCommand p ss
+
+data Oopsie = Oopsie (Maybe HandleOopsie) CmdSpec IOException
+  deriving (Eq, Show)
+
+defaultHandler :: Oopsie -> IO ()
+defaultHandler = undefined
+
 data Env = Env
-  { envQuiet :: Bool
+  { envErrorHandler :: Oopsie -> IO ()
   , envExitCode :: Maybe (MVar ExitCode)
   , envProcessHandle :: Maybe (MVar ProcessHandle)
+  , envCmdSpec :: CmdSpec
   }
 
 convertCreateProcess
@@ -145,7 +135,7 @@ convertCreateProcess
   -> CreateProcess
   -> Process.CreateProcess
 convertCreateProcess inp out err a = Process.CreateProcess
-  { Process.cmdspec = cmdspec a
+  { Process.cmdspec = convertCmdSpec $ cmdspec a
   , Process.cwd = cwd a
   , Process.env = env a
   , Process.std_in = conv inp
@@ -193,7 +183,7 @@ procSpec
   -- ^ Command-line arguments
   -> CreateProcess
 procSpec prog args = CreateProcess
-  { cmdspec = Process.RawCommand prog args
+  { cmdspec = RawCommand prog args
   , cwd = Nothing
   , env = Nothing
   , close_fds = False
@@ -202,160 +192,149 @@ procSpec prog args = CreateProcess
   , quiet = False
   , exitCode = Nothing
   , processHandle = Nothing
+  , handler = defaultHandler
   }
 
-
--- # Pipes
+-- # Production and consumption
 
 -- | I have no idea what this should be.  I'll start with a simple
 -- small value and see how it works.
 bufSize :: Int
 bufSize = 1024
 
--- | Create a 'Producer' from a 'Handle'.  The 'Producer' will get
--- 'ByteString' from the 'Handle' and produce them.  Does nothing to
--- close the given 'Handle' at any time.  If there is an IO error
--- while receiving data, the error is caught and production ceases.
--- The exception is not re-thrown.
-produceFromHandle
-  :: (MonadCatch m, MonadIO m)
-  => Bool
-  -- ^ Be quiet?
-  -> Handle
-  -> Producer ByteString m ()
-produceFromHandle beQuiet h = catchAndWarn beQuiet desc act >>= go
-  where
-    desc = "receiving data from process"
-    act = liftIO (BS.hGetSome h bufSize)
-    go Nothing = return ()
-    go (Just bs)
-      | BS.null bs = return ()
-      | otherwise = yield bs >> produceFromHandle beQuiet h
-
-
--- | Create a 'Consumer' from a 'Handle'.  The 'Consumer' will put
--- each 'ByteString' it receives into the 'Handle'.  Does nothing to
--- close the handle at any time.  If there is an IO error while
--- sending data, the error is caught and consumption ceases.  The
--- exception is not re-thrown.
-consumeToHandle
-  :: (MonadCatch m, MonadIO m)
-  => Bool
-  -- ^ Be quiet?
-  -> Handle
-  -> Consumer ByteString m ()
-consumeToHandle beQuiet h = do
-  bs <- await
-  mayRes <- catchAndWarn beQuiet "sending data to process"
-    (liftIO $ BS.hPut h bs)
-  case mayRes of
-    Nothing -> return ()
-    Just _ -> consumeToHandle beQuiet h
-
-
 -- | A buffer that holds 10 messages.  I have no idea if this is the
 -- ideal size.  Don't use an unbounded buffer, though, because with
 -- unbounded producers an unbounded buffer will fill up your RAM.
-messageBuffer :: Buffer a
-messageBuffer = bounded 1
+messageBuffer :: PC.Buffer a
+messageBuffer = PC.bounded 1
 
--- | Acquires a resource and registers a finalizer.
-initialize
+newMailbox
+  :: (MonadSafe m, MonadSafe mi, MonadSafe mo)
+  => m (Consumer a mi (), Producer a mo ())
+newMailbox = bracket (liftIO $ PC.spawn' messageBuffer) rel use
+  where
+    rel (_, _, seal) = liftIO $ PC.atomically seal
+    use (PC.Output sndr, PC.Input rcvr, seal) = return (csmr, prod)
+      where
+        prod = finally go (liftIO (PC.atomically seal))
+          where
+            go = do
+              mayVal <- liftIO $ PC.atomically rcvr
+              case mayVal of
+                Nothing -> return ()
+                Just val -> yield val >> go
+        csmr = finally go (liftIO (PC.atomically seal))
+          where
+            go = do
+              val <- await
+              rslt <- liftIO $ PC.atomically (sndr val)
+              if rslt then go else return ()
+
+-- | Create a 'Producer' that produces from a 'Handle'.  Takes
+-- ownership of the 'Handle'; closes it when the 'Producer'
+-- terminates.  If any IO errors arise either during production or
+-- when the 'Handle' is closed, they are caught and passed to the
+-- handler.
+produceFromHandle
   :: MonadSafe m
-  => m a
+  => HandleDesc
+  -> Handle
+  -> Reader Env (Producer ByteString m ())
+produceFromHandle hDesc h = do
+  hndlr <- asks envErrorHandler
+  spec <- asks envCmdSpec
+  let catcher e = do
+        handleErrors spec (Just (HandleOopsie Closing hDesc)) hndlr
+          (liftIO $ hClose h)
+        liftIO $ hndlr oops
+        where
+          oops = Oopsie (Just (HandleOopsie Reading hDesc)) spec e
+      go bs
+        | BS.null bs = return ()
+        | otherwise = yield bs >> produce
+      produce = liftIO (BS.hGetSome h bufSize) >>= go
+  return $ catch produce catcher
+
+acquire
+  :: MonadSafe m
+  => Base m a
   -> (a -> Base m ())
   -> m a
-initialize make destroy = Pipes.Safe.mask $ \_ -> do
-  thing <- make
-  _ <- Pipes.Safe.register (destroy thing)
-  return thing
+acquire acq rel = mask $ \restore -> do
+  a' <- liftBase acq
+  register (rel a')
+  restore $ return a'
 
--- | Creates a mailbox; seals it when done.
-newMailbox
+
+background
   :: MonadSafe m
-  => m (Output a, Input a, STM ())
-newMailbox =
-  initialize (liftIO $ spawn' messageBuffer)
-  (\(_, _, seal) -> liftIO $ atomically seal)
+  => IO a
+  -> m (Async a)
+background act = acquire (liftIO $ async act) (liftIO . cancel)
 
--- | Runs a thread in the background.  Initializes a finalizer that
--- will cancel the thread if it is still running when the
--- 'MonadSafe' computation completes.
-background :: MonadSafe m => IO a -> m (Async a)
-background action = initialize (liftIO $ async action) (liftIO . cancel)
 
--- | Creates a thread that will run in the background and pump
--- messages from the given mailbox to the process via its handle.
--- Closes the Handle when done.
-processPump
+-- | Create a 'Consumer' that consumes from a 'Handle'.  Takes
+-- ownership of the 'Handle'; closes it when the 'Consumer'
+-- terminates.  If any IO errors arise either during consumption or
+-- when the 'Handle' is closed, they are caught and passed to the
+-- handler.
+consumeToHandle
   :: MonadSafe m
-  => Bool
-  -- ^ Quiet?
-  -> Handle
-  -> (Input ByteString, STM ())
-  -> m ()
-processPump beQuiet hndle (input, seal) = do
-  let pumper = flip Control.Exception.finally cleanup .
-        runEffect $
-          fromInput input >-> consumeToHandle beQuiet hndle
-  _ <- background pumper
+  => Handle
+  -> Reader Env (Consumer ByteString m ())
+consumeToHandle h = do
+  hndlr <- asks envErrorHandler
+  spec <- asks envCmdSpec
+  let catcher e = do
+        handleErrors spec (Just (HandleOopsie Closing Input)) hndlr
+          (liftIO $ hClose h)
+        liftIO $ hndlr oops
+        where
+          oops = Oopsie (Just (HandleOopsie Writing Input)) spec e
+      consume = do
+        bs <- await
+        liftIO $ BS.hPut h bs
+        consume
+  return $ catch consume catcher
+
+-- | Creates a background thread that will consume to the given Handle
+-- from the given Producer.
+backgroundSendToProcess
+  :: MonadSafe m
+  => Handle
+  -> Producer ByteString (SafeT IO) ()
+  -> ReaderT Env m ()
+backgroundSendToProcess han prod = do
+  env <- ask
+  let csmr = runReader (consumeToHandle han) env
+      act = runSafeT . runEffect $ prod >-> csmr
+  _ <- lift $ background act
   return ()
-  where
-    cleanup = liftIO $ do
-      closeHandle beQuiet hndle
-      atomically seal
 
--- | Creates a thread that will run in the background and pull
--- messages from the process and place them into the given mailbox.
--- Closes the handle when done.
-processPull
+-- | Creates a background thread that will produce from the given
+-- Handle into the given Consumer.
+backgroundReceiveFromProcess
   :: MonadSafe m
-  => Bool
-  -- ^ Quiet?
+  => HandleDesc
   -> Handle
-  -> (Output ByteString, STM ())
-  -- ^ Output box, paired with action to close the box.
-  -> m ()
-processPull beQuiet hndle (output, seal) = do
-  let puller = flip Control.Exception.finally cleanup .
-        runEffect $
-          produceFromHandle beQuiet hndle >-> toOutput output
-  _ <- background puller
+  -> Consumer ByteString (SafeT IO) ()
+  -> ReaderT Env m ()
+backgroundReceiveFromProcess desc han csmr = do
+  env <- ask
+  let prod = runReader (produceFromHandle desc han) env
+      act = runSafeT . runEffect $ prod >-> csmr
+  _ <- lift $ background act
   return ()
-  where
-    cleanup = liftIO $ do
-      closeHandle beQuiet hndle
-      atomically seal
 
+-- | Creates a subprocess.  Registers destroyers for each handle
+-- created, as well as for the ProcessHandle.
+createProcess
+  :: MonadSafe m
+  => Process.CreateProcess
+  -> ReaderT Env m (Maybe Handle, Maybe Handle, Maybe Handle, Process.ProcessHandle)
+createProcess = undefined
 
--- | Creates a mailbox that sends messages to the given process, and
--- sets up and runs threads to pump messages to the process.
-makeToProcess
-  :: (MonadSafe mp, MonadSafe m)
-  => Bool
-  -- ^ Quiet?
-  -> Handle
-  -> m (Consumer ByteString mp ())
-makeToProcess beQuiet hndle = do
-  (out, inp, seal) <- newMailbox
-  processPump beQuiet hndle (inp, seal)
-  return $ toOutput out `Pipes.Safe.finally` (liftIO (atomically seal))
-
--- | Creates a mailbox that receives messages from the given process,
--- and sets up and runs threads to receive the messages and deliver
--- them to the mailbox.
-makeFromProcess
-  :: (MonadSafe m, MonadSafe mp)
-  => Bool
-  -- ^ Quiet?
-  -> Handle
-  -> m (Producer ByteString mp ())
-makeFromProcess beQuiet hndle = do
-  (out, inp, seal) <- newMailbox
-  processPull beQuiet hndle (out, seal)
-  return $ fromInput inp `Pipes.Safe.finally` (liftIO (atomically seal))
-
-
+{-
 -- | Creates a subprocess.  Registers destroyers for each handle
 -- created, as well as for the ProcessHandle.
 createProcess
@@ -490,3 +469,4 @@ pipeInputOutputErrorSplitBoth
        , Producer ByteString m ())
 pipeInputOutputErrorSplitBoth = undefined
 
+-}
