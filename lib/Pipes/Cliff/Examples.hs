@@ -116,8 +116,8 @@ limitedAlphaNumbers = runSafeT $ do
   catHanMVar <- liftIO newEmptyMVar
   let toCat = pipeInput Inherit Inherit
               (procSpec "cat" []) { storeProcessHandle = Just catHanMVar }
-  conveyor $ produceNumbers >-> P.take 300 >-> toTr
-  conveyor $ fromTr >-> toCat
+  conveyor $ ((produceNumbers >-> P.take 300 >-> toTr) >> liftIO (putStrLn "done conveying"))
+  conveyor $ ((fromTr >-> toCat) >> liftIO (putStrLn "done conveying again"))
   han <- liftIO $ takeMVar catHanMVar
   liftIO $ waitForProcess han
 

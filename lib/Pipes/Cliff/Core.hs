@@ -374,6 +374,7 @@ conveyor :: Effect (SafeT IO) () -> SafeT IO ()
 conveyor efct
   = (background . liftIO . runSafeT . runEffect $ efct) >> return ()
 
+
 -- | A version of 'Control.Concurrent.Async.wait' with an overloaded
 -- 'MonadIO' return type.  Allows you to wait for the return value of
 -- threads launched with 'background'.  If the thread throws an
@@ -488,24 +489,38 @@ produceFromHandle hDesc h = fmap f ask
 -- terminates.  If any IO errors arise either during consumption or
 -- when the 'Handle' is closed, they are caught and passed to the
 -- handler.
+--
+-- BROKEN will not close immediately; replace catch with finally?
 consumeToHandle
-  :: MonadSafe m
+  :: (MonadSafe m, MonadCatch (Base m))
   => Handle
   -> Reader Env (Consumer ByteString m ())
 consumeToHandle h = fmap f ask
   where
-    f ev = catch consume hndlr
+    f ev = runConsumer `catch` hndlr
       where
+        hndlr e = do
+          closeHan
+          lift (runReaderT (handleException oops e) ev)
+        oops = Just (HandleOopsie Writing Input)
         closeHan = runReaderT (closeHandleNoThrow h Input) ev
+        runConsumer = do
+          _ <- register closeHan
+          let consume = do
+                bs <- await
+                liftIO $ BS.hPut h bs
+                consume
+          consume
+      
+        
+
+{-
+        closeHan = 
         consume = do
           bs <- await
           liftIO $ BS.hPut h bs
           consume
-        hndlr e = do
-          closeHan
-          lift (runReaderT (handleException oops e) ev)
-    oops = Just (HandleOopsie Writing Input)
-
+-}
 -- | Creates a background thread that will consume to the given Handle
 -- from the given Producer.  Takes ownership of the 'Handle' and
 -- closes it when done.
