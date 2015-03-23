@@ -1,5 +1,10 @@
 {-# LANGUAGE FlexibleContexts #-}
-module Pipes.Cliff.Next where
+
+-- | This contains the innards of Cliff.  You probably won't need
+-- anything that's in here; "Pipes.Cliff" re-exports the most useful
+-- bindings.  But nothing will break if you use what's in here, so
+-- it's here if you need it.
+module Pipes.Cliff.Core where
 
 import System.Environment
 import Data.List (intersperse)

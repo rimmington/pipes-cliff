@@ -13,6 +13,7 @@
 
 module Pipes.Cliff.Examples where
 
+{-
 import Pipes.Cliff
 import qualified Pipes.Prelude as P
 import qualified Data.ByteString.Char8 as BS8
@@ -128,3 +129,4 @@ alphaNumbersByteString = runSafeT $ do
   conveyor $ produceNumbers >-> P.take 300 >-> toTr
   P.fold BS8.append BS8.empty id fromTr
 
+-}
