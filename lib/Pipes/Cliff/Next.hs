@@ -209,7 +209,7 @@ data CreateProcess = CreateProcess
 
 -- | Do not show or do anything with exceptions; useful to use as a
 -- 'handler'.
-squelch :: Oopsie -> IO ()
+squelch :: a -> IO ()
 squelch = const (return ())
 
 -- | Create a 'CreateProcess' record with default settings.  The
