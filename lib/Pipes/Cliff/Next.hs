@@ -1,7 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 module Pipes.Cliff.Next where
 
-import Control.Monad
 import Control.Exception (IOException)
 import System.IO
 import qualified System.Process as Process
@@ -15,8 +14,195 @@ import Control.Concurrent.MVar
 import Control.Concurrent.Async
 import Control.Monad.Trans.Reader
 
--- # Exception handling
+-- * Data types
 
+-- | Like 'Process.CmdSpec' in "System.Process", but also has an
+-- instance for 'Show'.
+data CmdSpec
+  = ShellCommand String
+  | RawCommand FilePath [String]
+  deriving (Eq, Ord, Show)
+
+convertCmdSpec :: CmdSpec -> Process.CmdSpec
+convertCmdSpec (ShellCommand s) = Process.ShellCommand s
+convertCmdSpec (RawCommand p ss) = Process.RawCommand p ss
+
+-- ** Errors
+
+-- | When dealing with a 'Handle', errors can occur when reading from,
+-- writing to, or closing the handle.
+data Activity
+  = Reading
+  | Writing
+  | Closing
+  deriving (Eq, Ord, Show)
+
+-- | Describes a handle.  From the perspective of the subprocess; for
+-- example, 'Input' means that this handle is connected to the
+-- process's standard input.
+data HandleDesc
+  = Input
+  | Output
+  | Error
+  deriving (Eq, Ord, Show)
+
+-- | Describes IO errors tha occur when dealing with a 'Handle'.
+data HandleOopsie = HandleOopsie Activity HandleDesc
+  deriving (Eq,Show)
+
+-- | Describes all IO exceptions.  The 'Oopsie' contains the
+-- 'IOException' itself, along with the 'CmdSpec' that was running
+-- when the exception occurred.  If the exception occurred while
+-- dealing with a 'Handle', there is also a 'HandleOopsie'.  If there
+-- is no 'HandleOopsie', this means that the exception arose when
+-- running 'terminateProcess'.
+data Oopsie = Oopsie (Maybe HandleOopsie) CmdSpec IOException
+  deriving (Eq, Show)
+
+defaultHandler :: Oopsie -> IO ()
+defaultHandler = undefined
+
+-- ** Configuration types
+
+-- | How will the subprocess get its information for this stream?  A
+-- 'NonPipe' is used for streams that will not be assigned to a
+-- 'Proxy' but, instead, will be inherited from the parent or directed
+-- from an existing 'Handle'.
+data NonPipe
+  = Inherit
+  -- ^ Use whatever stream that the parent process has.
+  | UseHandle Handle
+  -- ^ Use the given handle for input or output
+
+convertNonPipe :: Maybe NonPipe -> Process.StdStream
+convertNonPipe a = case a of
+  Nothing -> Process.CreatePipe
+  Just Inherit -> Process.Inherit
+  Just (UseHandle h) -> Process.UseHandle h
+
+-- | Like 'System.Process.CreateProcess' in "System.Process",
+-- this gives the necessary information to create a subprocess.  All
+-- but one of these fields is also present in
+-- 'System.Process.CreateProcess', and they all have the same meaning;
+-- the only field that is different is the 'quiet' field.
+data CreateProcess = CreateProcess
+  { cmdspec :: CmdSpec
+    -- ^ Executable and arguments, or shell command
+  , cwd :: Maybe FilePath
+  -- ^ A new current working directory for the subprocess; if
+  -- 'Nothing', use the calling process's working directory.
+  , env :: Maybe [(String, String)]
+  -- ^ The environment for the subprocess; if 'Nothing', use the
+  -- calling process's working directory.
+
+  , close_fds :: Bool
+  -- ^ If 'True', close all file descriptors other than the standard
+  -- descriptors.  See the documentation for
+  -- 'System.Process.close_fds' for details on how this works in
+  -- Windows.
+  , create_group :: Bool
+  -- ^ If 'True', create a new process group.
+  , delegate_ctlc :: Bool
+  -- ^ See 'System.Process.delegate_ctlc' in the "System.Process"
+  -- module for details.
+
+  , quiet :: Bool
+  -- ^ If True, does not print messages to standard error when IO
+  -- exceptions arise when closing handles or terminating processes.
+  -- Sometimes these errors arise due to broken pipes; this can be
+  -- normal, depending on the circumstances.  For example, if you
+  -- are streaming a large set of values to a pager such as @less@
+  -- and you expect that the user will often quit the pager without
+  -- viewing the whole result, a broken pipe will result, which will
+  -- print a warning message.  That can be a nuisance.  If you don't
+  -- want to see these errors, set 'quiet' to 'True'.
+
+  , storeProcessHandle :: Maybe (MVar Process.ProcessHandle)
+  , handler :: Oopsie -> IO ()
+  }
+
+-- | Create a 'CreateProcess' record with default settings.  The
+-- default settings are:
+--
+-- * a raw command (as opposed to a shell command) is created
+--
+-- * the current working directory is not changed from the parent process
+--
+-- * the environment is not changed from the parent process
+--
+-- * the parent's file descriptors (other than standard input,
+-- standard output, and standard error) are inherited
+--
+-- * no new process group is created
+--
+-- * 'delegate_ctlc' is 'False'
+--
+-- * 'quiet' is 'False'
+--
+-- * 'processHandle' is 'Nothing'
+
+procSpec
+  :: String
+  -- ^ The name of the program to run, such as @less@.
+  -> [String]
+  -- ^ Command-line arguments
+  -> CreateProcess
+procSpec prog args = CreateProcess
+  { cmdspec = RawCommand prog args
+  , cwd = Nothing
+  , env = Nothing
+  , close_fds = False
+  , create_group = False
+  , delegate_ctlc = False
+  , quiet = False
+  , storeProcessHandle = Nothing
+  , handler = defaultHandler
+  }
+
+convertCreateProcess
+  :: Maybe NonPipe
+  -> Maybe NonPipe
+  -> Maybe NonPipe
+  -> CreateProcess
+  -> Process.CreateProcess
+convertCreateProcess inp out err a = Process.CreateProcess
+  { Process.cmdspec = convertCmdSpec $ cmdspec a
+  , Process.cwd = cwd a
+  , Process.env = env a
+  , Process.std_in = conv inp
+  , Process.std_out = conv out
+  , Process.std_err = conv err
+  , Process.close_fds = close_fds a
+  , Process.create_group = create_group a
+  , Process.delegate_ctlc = delegate_ctlc a
+  }
+  where
+    conv = convertNonPipe
+
+-- * Environment
+
+-- | A common environment for many functions.  Contains just the
+-- necessary subset from 'CreateProcess'.
+data Env = Env
+  { envErrorHandler :: Oopsie -> IO ()
+  , envProcessHandle :: Maybe (MVar ProcessHandle)
+  , envCmdSpec :: CmdSpec
+  }
+
+envFromCreateProcess
+  :: CreateProcess
+  -> Env
+envFromCreateProcess cp = Env
+  { envErrorHandler = handler cp
+  , envProcessHandle = storeProcessHandle cp
+  , envCmdSpec = cmdspec cp
+  }
+
+
+-- * Exception handling
+
+-- | Sends an exception using the exception handler specified in the
+-- 'Env'.
 handleException
   :: MonadIO m
   => Maybe HandleOopsie
@@ -63,256 +249,114 @@ terminateProcess han = do
     return ()
 
 
--- # Configuration and result types
+-- | Acquires a resource and ensures it will be destroyed when the
+-- 'Monadsafe' computation completes.
+acquire
+  :: MonadSafe m
+  => Base m a
+  -- ^ Acquirer.
+  -> (a -> Base m ())
+  -- ^ Destroyer.
+  -> m a
+acquire acq rel = mask $ \restore -> do
+  a <- liftBase acq
+  _ <- register (rel a)
+  restore $ return a
 
--- | How will the subprocess get its information for this stream?
-data NonPipe
-  = Inherit
-  -- ^ Use whatever stream that the parent process has.
-  | UseHandle Handle
-  -- ^ Use the given handle for input or output
 
--- | Like 'Process.CmdSpec' in "System.Process", but also has an
--- instance for 'Show'.
-data CmdSpec
-  = ShellCommand String
-  | RawCommand FilePath [String]
-  deriving (Eq, Ord, Show)
+-- * Threads
 
--- | Like 'System.Process.CreateProcess' in "System.Process",
--- this gives the necessary information to create a subprocess.  All
--- but one of these fields is also present in
--- 'System.Process.CreateProcess', and they all have the same meaning;
--- the only field that is different is the 'quiet' field.
-data CreateProcess = CreateProcess
-  { cmdspec :: CmdSpec
-    -- ^ Executable and arguments, or shell command
-  , cwd :: Maybe FilePath
-  -- ^ A new current working directory for the subprocess; if
-  -- 'Nothing', use the calling process's working directory.
-  , env :: Maybe [(String, String)]
-  -- ^ The environment for the subprocess; if 'Nothing', use the
-  -- calling process's working directory.
+-- | Runs a thread in the background.  The thread is terminated when
+-- the 'MonadSafe' computation completes.
+background
+  :: MonadSafe m
+  => IO a
+  -> m (Async a)
+background act = acquire (liftIO $ async act) (liftIO . cancel)
 
-  , close_fds :: Bool
-  -- ^ If 'True', close all file descriptors other than the standard
-  -- descriptors.  See the documentation for
-  -- 'System.Process.close_fds' for details on how this works in
-  -- Windows.
-  , create_group :: Bool
-  -- ^ If 'True', create a new process group.
-  , delegate_ctlc :: Bool
-  -- ^ See 'System.Process.delegate_ctlc' in the "System.Process"
-  -- module for details.
+-- | Runs in the background an effect, typically one that is moving
+-- data from one process to another.  For examples of its usage, see
+-- "Pipes.Cliff.Examples".  The associated thread is killed when the
+-- 'SafeT' computation completes.
+conveyor :: Effect (Pipes.Safe.SafeT IO) () -> Pipes.Safe.SafeT IO ()
+conveyor efct
+  = (background . liftIO . runSafeT . runEffect $ efct) >> return ()
 
-  , quiet :: Bool
-  -- ^ If True, does not print messages to standard error when IO
-  -- exceptions arise when closing handles or terminating processes.
-  -- Sometimes these errors arise due to broken pipes; this can be
-  -- normal, depending on the circumstances.  For example, if you
-  -- are streaming a large set of values to a pager such as @less@
-  -- and you expect that the user will often quit the pager without
-  -- viewing the whole result, a broken pipe will result, which will
-  -- print a warning message.  That can be a nuisance.  If you don't
-  -- want to see these errors, set 'quiet' to 'True'.
+-- | A version of 'Control.Concurrent.Async.wait' with an overloaded
+-- 'MonadIO' return type.  Allows you to wait for the return value of
+-- threads launched with 'background'.  If the thread throws an
+-- exception, 'waitForThread' will throw that same exception.
+waitForThread :: MonadIO m => Async a -> m a
+waitForThread = liftIO . wait
 
-  , storeProcessHandle :: Maybe (MVar Process.ProcessHandle)
-  , handler :: Oopsie -> IO ()
-  }
+-- * Mailboxes
 
-data HandleOopsie = HandleOopsie Activity HandleDesc
-  deriving (Eq,Show)
+-- | A buffer that holds 1 message.  I have no idea if this is the
+-- ideal size.  Don't use an unbounded buffer, though, because with
+-- unbounded producers an unbounded buffer will fill up your RAM.
+--
+-- Since the buffer just holds one size, you might think \"why not
+-- just use an MVar\"?  At least, I have been silly enough to think
+-- that.  Using @Pipes.Concurrent@ also give the mailbox the ability
+-- to be sealed; sealing the mailbox signals to the other side that it
+-- won't be getting any more input or be allowed to send any more
+-- output, which tells the whole pipeline to start shutting down.
+messageBuffer :: PC.Buffer a
+messageBuffer = PC.bounded 1
 
-data Activity
-  = Reading
-  | Writing
-  | Closing
-  deriving (Eq, Ord, Show)
-
--- | Describes a handle.  From the perspective of the subprocess.
-data HandleDesc
-  = Input
-  | Output
-  | Error
-  deriving (Eq, Ord, Show)
-
-convertCmdSpec :: CmdSpec -> Process.CmdSpec
-convertCmdSpec (ShellCommand s) = Process.ShellCommand s
-convertCmdSpec (RawCommand p ss) = Process.RawCommand p ss
-
-data Oopsie = Oopsie (Maybe HandleOopsie) CmdSpec IOException
-  deriving (Eq, Show)
-
-defaultHandler :: Oopsie -> IO ()
-defaultHandler = undefined
-
-data Env = Env
-  { envErrorHandler :: Oopsie -> IO ()
-  , envProcessHandle :: Maybe (MVar ProcessHandle)
-  , envCmdSpec :: CmdSpec
-  }
-
-envFromCreateProcess
-  :: CreateProcess
-  -> Env
-envFromCreateProcess cp = Env
-  { envErrorHandler = handler cp
-  , envProcessHandle = storeProcessHandle cp
-  , envCmdSpec = cmdspec cp
-  }
-
-convertCreateProcess
-  :: Maybe NonPipe
-  -> Maybe NonPipe
-  -> Maybe NonPipe
-  -> CreateProcess
-  -> Process.CreateProcess
-convertCreateProcess inp out err a = Process.CreateProcess
-  { Process.cmdspec = convertCmdSpec $ cmdspec a
-  , Process.cwd = cwd a
-  , Process.env = env a
-  , Process.std_in = conv inp
-  , Process.std_out = conv out
-  , Process.std_err = conv err
-  , Process.close_fds = close_fds a
-  , Process.create_group = create_group a
-  , Process.delegate_ctlc = delegate_ctlc a
-  }
+-- | Creates a new mailbox for sending data to a process.  Returns a
+-- 'PC.Output' which is the sink that accepts values for delivery to
+-- the process, as well as a 'Producer' that will produce what comes
+-- from the mailbox; the 'Producer' should be hooked to the standard
+-- input of the subprocess.  If the Producer shuts down for any
+-- reason, it also seals the mailbox, so the 'PC.Output' will not
+-- accept any new values.
+newMailboxToProcess
+  :: (MonadSafe m, MonadSafe mo)
+  => m (PC.Output a, Producer a mo ())
+newMailboxToProcess = bracket (liftIO $ PC.spawn' messageBuffer) rel use
   where
-    conv = convertNonPipe
+    rel (_, _, seal) = liftIO $ PC.atomically seal
+    use (sndr, PC.Input rcvr, seal) = return (sndr, prod)
+      where
+        prod = finally go (liftIO (PC.atomically seal))
+          where
+            go = do
+              mayVal <- liftIO $ PC.atomically rcvr
+              case mayVal of
+                Nothing -> return ()
+                Just val -> yield val >> go
 
-convertNonPipe :: Maybe NonPipe -> Process.StdStream
-convertNonPipe a = case a of
-  Nothing -> Process.CreatePipe
-  Just Inherit -> Process.Inherit
-  Just (UseHandle h) -> Process.UseHandle h
 
--- | Create a 'CreateProcess' record with default settings.  The
--- default settings are:
---
--- * a raw command (as opposed to a shell command) is created
---
--- * the current working directory is not changed from the parent process
---
--- * the environment is not changed from the parent process
---
--- * the parent's file descriptors (other than standard input,
--- standard output, and standard error) are inherited
---
--- * no new process group is created
---
--- * 'delegate_ctlc' is 'False'
---
--- * 'quiet' is 'False'
---
--- * 'processHandle' is 'Nothing'
+-- | Creates a new mailbox for receiving data from a process.  Returns
+-- a 'PC.Input' which is an exhaustible source of values from the
+-- process, as well as s 'Consumer' that will consume values and place
+-- them into the mailbox; this 'Consumer' should be hooked to the
+-- desired stream (output or error) of the process.  If the Consumer
+-- shuts down for any reason, it also seals the mailbox, so the
+-- 'PC.Input' will not accept any new values.
+newMailboxFromProcess
+  :: (MonadSafe m, MonadSafe mi)
+  => m (Consumer a mi (), PC.Input a)
+newMailboxFromProcess = bracket (liftIO $ PC.spawn' messageBuffer) rel use
+  where
+    rel (_, _, seal) = liftIO $ PC.atomically seal
+    use (PC.Output sndr, rcvr, seal) = return (csmr, rcvr)
+      where
+        csmr = finally go (liftIO (PC.atomically seal))
+          where
+            go = do
+              val <- await
+              rslt <- liftIO $ PC.atomically (sndr val)
+              if rslt then go else return ()
 
-procSpec
-  :: String
-  -- ^ The name of the program to run, such as @less@.
-  -> [String]
-  -- ^ Command-line arguments
-  -> CreateProcess
-procSpec prog args = CreateProcess
-  { cmdspec = RawCommand prog args
-  , cwd = Nothing
-  , env = Nothing
-  , close_fds = False
-  , create_group = False
-  , delegate_ctlc = False
-  , quiet = False
-  , storeProcessHandle = Nothing
-  , handler = defaultHandler
-  }
 
--- # Production and consumption
+-- * Production from and consumption to 'Handle's
 
 -- | I have no idea what this should be.  I'll start with a simple
 -- small value and see how it works.
 bufSize :: Int
 bufSize = 1024
-
--- | A buffer that holds 10 messages.  I have no idea if this is the
--- ideal size.  Don't use an unbounded buffer, though, because with
--- unbounded producers an unbounded buffer will fill up your RAM.
-messageBuffer :: PC.Buffer a
-messageBuffer = PC.bounded 1
-
-newMailbox'
-  :: (MonadIO m, MonadSafe mi, MonadSafe mo)
-  => m (Consumer a mi (), Producer a mo (), PC.STM ())
-newMailbox' = liftM f (liftIO $ PC.spawn' messageBuffer)
-  where
-    f (PC.Output sndr, PC.Input rcvr, seal) = (csmr, prod, seal)
-      where
-        prod = finally go (liftIO (PC.atomically seal))
-          where
-            go = do
-              mayVal <- liftIO $ PC.atomically rcvr
-              case mayVal of
-                Nothing -> return ()
-                Just val -> yield val >> go
-        csmr = finally go (liftIO (PC.atomically seal))
-          where
-            go = do
-              val <- await
-              rslt <- liftIO $ PC.atomically (sndr val)
-              if rslt then go else return ()
-
-
-newMailbox
-  :: (MonadSafe m, MonadSafe mi, MonadSafe mo)
-  => m (Consumer a mi (), Producer a mo ())
-newMailbox = bracket (liftIO $ PC.spawn' messageBuffer) rel use
-  where
-    rel (_, _, seal) = liftIO $ PC.atomically seal
-    use (PC.Output sndr, PC.Input rcvr, seal) = return (csmr, prod)
-      where
-        prod = finally go (liftIO (PC.atomically seal))
-          where
-            go = do
-              mayVal <- liftIO $ PC.atomically rcvr
-              case mayVal of
-                Nothing -> return ()
-                Just val -> yield val >> go
-        csmr = finally go (liftIO (PC.atomically seal))
-          where
-            go = do
-              val <- await
-              rslt <- liftIO $ PC.atomically (sndr val)
-              if rslt then go else return ()
-
-newMailboxToProcess
-  :: (MonadSafe m, MonadSafe mo)
-  => m (PC.Output a, Producer a mo (), PC.STM ())
-newMailboxToProcess = bracket (liftIO $ PC.spawn' messageBuffer) rel use
-  where
-    rel (_, _, seal) = liftIO $ PC.atomically seal
-    use (sndr, PC.Input rcvr, seal) = return (sndr, prod, seal)
-      where
-        prod = finally go (liftIO (PC.atomically seal))
-          where
-            go = do
-              mayVal <- liftIO $ PC.atomically rcvr
-              case mayVal of
-                Nothing -> return ()
-                Just val -> yield val >> go
-
-newMailboxFromProcess
-  :: (MonadSafe m, MonadSafe mi)
-  => m (Consumer a mi (), PC.Input a, PC.STM ())
-newMailboxFromProcess = bracket (liftIO $ PC.spawn' messageBuffer) rel use
-  where
-    rel (_, _, seal) = liftIO $ PC.atomically seal
-    use (PC.Output sndr, rcvr, seal) = return (csmr, rcvr, seal)
-      where
-        csmr = finally go (liftIO (PC.atomically seal))
-          where
-            go = do
-              val <- await
-              rslt <- liftIO $ PC.atomically (sndr val)
-              if rslt then go else return ()
-
 
 -- | Create a 'Producer' that produces from a 'Handle'.  Takes
 -- ownership of the 'Handle'; closes it when the 'Producer'
@@ -337,26 +381,6 @@ produceFromHandle hDesc h = fmap f ask
           closeHan
           lift (runReaderT (handleException oops e) ev)
     oops = Just (HandleOopsie Reading hDesc)
-
-
-acquire
-  :: MonadSafe m
-  => Base m a
-  -> (a -> Base m ())
-  -> m a
-acquire acq rel = do
-  a <- mask_ $ do
-    a' <- liftBase acq
-    _ <- register (rel a')
-    return a'
-  return a
-
-
-background
-  :: MonadSafe m
-  => IO a
-  -> m (Async a)
-background act = acquire (liftIO $ async act) (liftIO . cancel)
 
 
 -- | Create a 'Consumer' that consumes from a 'Handle'.  Takes
@@ -413,19 +437,70 @@ backgroundReceiveFromProcess desc han csmr = do
   _ <- lift $ background act
   return ()
 
-
-destroyProcess
+-- | Creates a 'Consumer' that will pump what it consumes to the
+-- appropriate mailbox.  Does not seal the mailbox; if the mailbox is
+-- exhausted, it's already been sealed.
+processPump
   :: (MonadCatch m, MonadIO m)
-  => (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
-  -> ReaderT Env m ()
-destroyProcess (inp, out, err, han) = do
-  let close mayH d = case mayH of
+  => (a -> PC.STM Bool)
+  -- ^ Reception mailbox
+  -> Consumer a m ()
+processPump toStdinMbox = go
+  where
+    go = do
+      bs <- await
+      res <- liftIO . PC.atomically . toStdinMbox $ bs
+      if res then go else return ()
+
+-- | Does everything necessary to run a 'Handle' that is created to a
+-- process standard input.  Creates mailbox, runs background thread
+-- that pumps data out of the mailbox and into the process standard
+-- input, and returns a Consumer that consumes and places what it
+-- consumes into the mailbox for delivery to the background process.
+runInputHandle
+  :: MonadSafe mi
+  => Handle
+  -> Env
+  -> Consumer ByteString mi ()
+runInputHandle inp ev = do
+  (PC.Output toStdinMbox, fromStdinMbox) <- newMailboxToProcess
+  runReaderT (backgroundSendToProcess inp fromStdinMbox) ev
+  processPump toStdinMbox
+
+-- | Creates a 'Producer' that will pump from the given input source.
+-- Does not seal the mailbox; if the source fails, it has already been
+-- sealed.
+processPuller
+  :: (MonadCatch m, MonadIO m)
+  => PC.STM (Maybe a)
+  -- ^ Where the process delivers new ByteStrings
+  -> Producer a m ()
+processPuller fromOutMbox = go
+  where
+    go = do
+      mayBs <- liftIO $ PC.atomically fromOutMbox
+      case mayBs of
+        Just bs -> yield bs >> go
         Nothing -> return ()
-        Just h -> closeHandleNoThrow h d
-  close inp Input
-  close out Output
-  close err Error
-  terminateProcess han
+
+-- | Does everything necessary to run a 'Handle' that is created to a
+-- process standard output or standard error.  Creates mailbox, runs
+-- background thread that pumps data from the process output 'Handle'
+-- into the mailbox, and returns a Producer that produces what comes
+-- into the mailbox.
+runOutputHandle
+  :: MonadSafe mo
+  => HandleDesc
+  -> Handle
+  -> Env
+  -> Producer ByteString mo ()
+runOutputHandle desc out ev = do
+  (toStdoutMbox, PC.Input fromStdoutMbox) <- newMailboxFromProcess
+  runReaderT (backgroundReceiveFromProcess desc out toStdoutMbox) ev
+  processPuller fromStdoutMbox
+
+
+-- * Creating subprocesses
 
 -- | Creates a subprocess.  Registers destroyers for each handle
 -- created, as well as for the ProcessHandle.
@@ -448,11 +523,17 @@ createProcess cp = mask $ \restore -> do
     Just hanVar -> liftIO $ putMVar hanVar han
   restore $ return (mayIn, mayOut, mayErr)
 
+-- | Convenience wrapper for 'createProcess'.  The subprocess is
+-- terminated and all its handles destroyed when the 'MonadSafe'
+-- computation completes.
 runCreateProcess
   :: (MonadSafe m, MonadCatch (Base m))
   => Maybe NonPipe
+  -- ^ Standard input
   -> Maybe NonPipe
+  -- ^ Standard output
   -> Maybe NonPipe
+  -- ^ Standard error
   -> CreateProcess
   -> m (Maybe Handle, Maybe Handle, Maybe Handle, Env)
 runCreateProcess inp out err cp = do
@@ -460,21 +541,6 @@ runCreateProcess inp out err cp = do
   (inp', out', err') <- runReaderT
       (createProcess (convertCreateProcess inp out err cp)) ev
   return (inp', out', err', ev)
-
--- | Runs in the background an effect, typically one that is moving
--- data from one process to another.  For examples of its usage, see
--- "Pipes.Cliff.Examples".  The associated thread is killed when the
--- 'SafeT' computation completes.
-conveyor :: Effect (Pipes.Safe.SafeT IO) () -> Pipes.Safe.SafeT IO ()
-conveyor efct
-  = (background . liftIO . runSafeT . runEffect $ efct) >> return ()
-
--- | A version of 'Control.Concurrent.Async.wait' with an overloaded
--- 'MonadIO' return type.  Allows you to wait for the return value of
--- threads launched with 'background'.  If the thread throws an
--- exception, 'waitForThread' will throw that same exception.
-waitForThread :: MonadIO m => Async a -> m a
-waitForThread = liftIO . wait
 
 -- | Creating Proxy
 
@@ -490,22 +556,6 @@ pipeNone inp out err cp = flip runReaderT (envFromCreateProcess cp) $ do
     (convertCreateProcess (Just inp) (Just out) (Just err) cp)
   return ()
 
-processPump
-  :: (MonadCatch m, MonadIO m)
-  => (a -> PC.STM Bool)
-  -- ^ Reception mailbox
-  -> PC.STM ()
-  -- ^ Sealer
-  -> Consumer a m ()
-processPump toStdinMbox seal = go
-  where
-    go = do
-      bs <- await
-      res <- liftIO . PC.atomically . toStdinMbox $ bs
-      if res then go else liftIO (PC.atomically seal)
-
-
-
 pipeInput
   :: (MonadSafe m, MonadCatch (Base m))
   => NonPipe
@@ -516,46 +566,8 @@ pipeInput
   -> Consumer ByteString m ()
 pipeInput out err cp = do
   (Just inp, _, _, ev) <- runCreateProcess Nothing (Just out) (Just err) cp
-  (PC.Output toStdinMbox, fromStdinMbox, seal) <- newMailboxToProcess
-  runReaderT (backgroundSendToProcess inp fromStdinMbox) ev
-  processPump toStdinMbox seal
+  runInputHandle inp ev
 
-processPuller
-  :: (MonadCatch m, MonadIO m)
-  => PC.STM (Maybe a)
-  -- ^ Where the process delivers new ByteStrings
-  -> PC.STM ()
-  -- ^ Seals the mailbox
-  -> Producer a m ()
-processPuller fromOutMbox seal = go
-  where
-    go = do
-      mayBs <- liftIO $ PC.atomically fromOutMbox
-      case mayBs of
-        Just bs -> yield bs >> go
-        Nothing -> liftIO (PC.atomically seal)
-
-
-runInputHandle
-  :: MonadSafe mi
-  => Handle
-  -> Env
-  -> Consumer ByteString mi ()
-runInputHandle inp ev = do
-  (PC.Output toStdinMbox, fromStdinMbox, seal) <- newMailboxToProcess
-  runReaderT (backgroundSendToProcess inp fromStdinMbox) ev
-  processPump toStdinMbox seal
-
-runOutputHandle
-  :: MonadSafe mo
-  => HandleDesc
-  -> Handle
-  -> Env
-  -> Producer ByteString mo ()
-runOutputHandle desc out ev = do
-  (toStdoutMbox, PC.Input fromStdoutMbox, seal) <- newMailboxFromProcess
-  runReaderT (backgroundReceiveFromProcess desc out toStdoutMbox) ev
-  processPuller fromStdoutMbox seal
 
 pipeOutput
   :: (MonadSafe m, MonadCatch (Base m))
@@ -592,52 +604,41 @@ pipeInputOutput err cp = do
     runCreateProcess Nothing Nothing (Just err) cp
   return (runInputHandle inp ev, runOutputHandle Output out ev)
 
-{-
 pipeInputError
-  :: MonadSafe m
+  :: (MonadSafe mi, MonadSafe me, MonadSafe m, MonadCatch (Base m))
   => NonPipe
+  -- ^ Standard output
   -> CreateProcess
-  -> Pipe ByteString ByteString m ()
-pipeInputError = undefined
-
-pipeOutputErrorC
-  :: MonadSafe m
-  => NonPipe
-  -> CreateProcess
-  -> Producer (Either ByteString ByteString) m ()
-pipeOutputErrorC = undefined
+  -> m (Consumer ByteString mi (), Producer ByteString me ())
+pipeInputError out cp = do
+  (Just inp, _, Just err, ev) <-
+    runCreateProcess Nothing (Just out) Nothing cp
+  return (runInputHandle inp ev, runOutputHandle Error err ev)
 
 pipeOutputError
-  :: MonadSafe m
+  :: (MonadSafe mo, MonadSafe me, MonadSafe m, MonadCatch (Base m))
   => NonPipe
+  -- ^ Standard input
   -> CreateProcess
-  -> m (Producer ByteString m (), Producer ByteString m ())
-pipeOutputError = undefined
+  -> m (Producer ByteString mo (), Producer ByteString me ())
+pipeOutputError inp cp = do
+  (_, Just out, Just err, ev) <-
+    runCreateProcess (Just inp) Nothing Nothing cp
+  return ( runOutputHandle Output out ev
+         , runOutputHandle Error err ev
+         )
 
-pipeInputOutputErrorC
-  :: MonadSafe m
+
+pipeInputOutputError
+  :: ( MonadSafe mi, MonadSafe mo, MonadSafe me,
+       MonadSafe m, MonadCatch (Base m))
   => CreateProcess
-  -> Pipe ByteString (Either ByteString ByteString) m ()
-pipeInputOutputErrorC = undefined
-
-pipeInputOutputErrorSplitError
-  :: MonadSafe m
-  => CreateProcess
-  -> m (Pipe ByteString ByteString m (), Producer ByteString m ())
-pipeInputOutputErrorSplitError = undefined
-
-pipeInputOutputErrorSplitOutput
-  :: MonadSafe m
-  => CreateProcess
-  -> m (Pipe ByteString ByteString m (), Producer ByteString m ())
-pipeInputOutputErrorSplitOutput = undefined
-
-pipeInputOutputErrorSplitBoth
-  :: MonadSafe m
-  => CreateProcess
-  -> m ( Consumer ByteString m ()
-       , Producer ByteString m ()
-       , Producer ByteString m ())
-pipeInputOutputErrorSplitBoth = undefined
-
--}
+  -> m ( Consumer ByteString mi (), Producer ByteString mo (),
+         Producer ByteString me ())
+pipeInputOutputError cp = do
+  (Just inp, Just out, Just err, ev) <-
+    runCreateProcess Nothing Nothing Nothing cp
+  return ( runInputHandle inp ev
+         , runOutputHandle Output out ev
+         , runOutputHandle Error err ev
+         )
