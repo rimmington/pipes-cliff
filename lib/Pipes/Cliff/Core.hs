@@ -342,7 +342,7 @@ terminateProcess han = do
 
 
 -- | Acquires a resource and ensures it will be destroyed when the
--- 'Monadsafe' computation completes.
+-- 'MonadSafe' computation completes.
 acquire
   :: MonadSafe m
   => Base m a
@@ -405,14 +405,6 @@ runCliff = runSafeT . runEffect
 messageBuffer :: PC.Buffer a
 messageBuffer = PC.bounded 1
 
--- I have wondered if the constraint on 'newMailboxToProcess' is too
--- broad; would (MonadMask m, MonadMask mo) work instead?  I'm not
--- sure such a change would be a good idea; what's conclusive though
--- is that such a change would require a direct dependency on the
--- @exceptions@ package because then I would need @bracket@ from
--- "Control.Monad.Catch"; @pipes-safe@ does not export this function.
--- It's not worth incurring a dependency for this issue alone.
-
 -- | Creates a new mailbox for sending data to a process.  Returns a
 -- 'PC.Output' which is the sink that accepts values for delivery to
 -- the process, as well as a 'Producer' that will produce what comes
@@ -423,19 +415,17 @@ messageBuffer = PC.bounded 1
 newMailboxToProcess
   :: (MonadSafe m, MonadSafe mo)
   => m (PC.Output a, Producer a mo ())
-newMailboxToProcess = bracket (liftIO $ PC.spawn' messageBuffer) rel use
-  where
-    rel (_, _, seal) = liftIO $ PC.atomically seal
-    use (sndr, PC.Input rcvr, seal) = return (sndr, prod)
-      where
-        prod = finally go (liftIO (PC.atomically seal))
-          where
-            go = do
-              mayVal <- liftIO $ PC.atomically rcvr
-              case mayVal of
-                Nothing -> return ()
-                Just val -> yield val >> go
-
+newMailboxToProcess = do
+  let destroy (_, _, seal) = liftIO $ PC.atomically seal
+  (sndr, PC.Input rcvr, seal) <-
+    acquire (liftIO $ PC.spawn' messageBuffer) destroy
+  let prod = do
+        _ <- register (liftIO $ PC.atomically seal)
+        go
+      go = do
+        mayVal <- liftIO $ PC.atomically rcvr
+        maybe (return ()) (\v -> yield v >> go) mayVal
+  return (sndr, prod)
 
 -- | Creates a new mailbox for receiving data from a process.  Returns
 -- a 'PC.Input' which is an exhaustible source of values from the
@@ -447,17 +437,18 @@ newMailboxToProcess = bracket (liftIO $ PC.spawn' messageBuffer) rel use
 newMailboxFromProcess
   :: (MonadSafe m, MonadSafe mi)
   => m (Consumer a mi (), PC.Input a)
-newMailboxFromProcess = bracket (liftIO $ PC.spawn' messageBuffer) rel use
-  where
-    rel (_, _, seal) = liftIO $ PC.atomically seal
-    use (PC.Output sndr, rcvr, seal) = return (csmr, rcvr)
-      where
-        csmr = finally go (liftIO (PC.atomically seal))
-          where
-            go = do
-              val <- await
-              rslt <- liftIO $ PC.atomically (sndr val)
-              if rslt then go else return ()
+newMailboxFromProcess = do
+  let destroy (_, _, seal) = liftIO $ PC.atomically seal
+  (PC.Output sndr, rcvr, seal) <-
+    acquire (liftIO $ PC.spawn' messageBuffer) destroy
+  let csmr = do
+        _ <- register (liftIO $ PC.atomically seal)
+        go
+      go = do
+        val <- await
+        rslt <- liftIO $ PC.atomically (sndr val)
+        if rslt then go else return ()
+  return (csmr, rcvr)
 
 
 -- * Production from and consumption to 'Handle's
