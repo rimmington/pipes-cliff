@@ -374,7 +374,7 @@ background act = acquire (liftIO $ async act) (liftIO . cancel)
 -- data from one process to another.  For examples of its usage, see
 -- "Pipes.Cliff.Examples".  The associated thread is killed when the
 -- 'SafeT' computation completes.
-conveyor :: Effect (Pipes.Safe.SafeT IO) () -> Pipes.Safe.SafeT IO ()
+conveyor :: Effect (SafeT IO) () -> SafeT IO ()
 conveyor efct
   = (background . liftIO . runSafeT . runEffect $ efct) >> return ()
 
