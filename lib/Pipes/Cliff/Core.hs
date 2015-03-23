@@ -147,9 +147,11 @@ convertNonPipe a = case a of
 data CreateProcess = CreateProcess
   { cmdspec :: CmdSpec
     -- ^ Executable and arguments, or shell command
+
   , cwd :: Maybe FilePath
   -- ^ A new current working directory for the subprocess; if
   -- 'Nothing', use the calling process's working directory.
+
   , env :: Maybe [(String, String)]
   -- ^ The environment for the subprocess; if 'Nothing', use the
   -- calling process's working directory.
@@ -159,22 +161,13 @@ data CreateProcess = CreateProcess
   -- descriptors.  See the documentation for
   -- 'System.Process.close_fds' for details on how this works in
   -- Windows.
+
   , create_group :: Bool
   -- ^ If 'True', create a new process group.
+
   , delegate_ctlc :: Bool
   -- ^ See 'System.Process.delegate_ctlc' in the "System.Process"
   -- module for details.
-
-  , quiet :: Bool
-  -- ^ If True, does not print messages to standard error when IO
-  -- exceptions arise when closing handles or terminating processes.
-  -- Sometimes these errors arise due to broken pipes; this can be
-  -- normal, depending on the circumstances.  For example, if you
-  -- are streaming a large set of values to a pager such as @less@
-  -- and you expect that the user will often quit the pager without
-  -- viewing the whole result, a broken pipe will result, which will
-  -- print a warning message.  That can be a nuisance.  If you don't
-  -- want to see these errors, set 'quiet' to 'True'.
 
   , storeProcessHandle :: Maybe (MVar Process.ProcessHandle)
   -- ^ To get the 'ProcessHandle' that results after starting the
@@ -184,6 +177,10 @@ data CreateProcess = CreateProcess
   -- shortly after the process is created.  You can then use
   -- 'waitForProcess' on the 'ProcessHandle', or you might want to use
   -- 'terminateProcess' on it.
+  --
+  -- Be sure you don't use 'takeMVar' until you have run the 'Effect'
+  -- that creates the relevant process; otherwise your program will
+  -- deadlock.
   --
   -- If you don't care about the process handle, just leave this set
   -- at 'Nothing'.
@@ -233,9 +230,9 @@ squelch = const (return ())
 --
 -- * 'delegate_ctlc' is 'False'
 --
--- * 'quiet' is 'False'
+-- * 'storeProcessHandle' is 'Nothing'
 --
--- * 'processHandle' is 'Nothing'
+-- * 'handler' is 'defaultHandler'
 
 procSpec
   :: String
@@ -250,7 +247,6 @@ procSpec prog args = CreateProcess
   , close_fds = False
   , create_group = False
   , delegate_ctlc = False
-  , quiet = False
   , storeProcessHandle = Nothing
   , handler = defaultHandler
   }
@@ -389,6 +385,10 @@ waitForThread = liftIO . wait
 -- "System.Process".
 waitForProcess :: MonadIO m => ProcessHandle -> m ExitCode
 waitForProcess h = liftIO $ Process.waitForProcess h
+
+-- | Runs a single 'Effect' in the foreground.
+runCliff :: (MonadMask m, MonadIO m) => Effect (SafeT m) a -> m a
+runCliff = runSafeT . runEffect
 
 -- * Mailboxes
 

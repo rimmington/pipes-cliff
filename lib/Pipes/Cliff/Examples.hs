@@ -13,7 +13,6 @@
 
 module Pipes.Cliff.Examples where
 
-{-
 import Pipes.Cliff
 import qualified Pipes.Prelude as P
 import qualified Data.ByteString.Char8 as BS8
@@ -25,29 +24,24 @@ import qualified Data.ByteString.Char8 as BS8
 -- can use "Pipes.Cliff" even for non-finite 'Producer's.  Don't try
 -- to go to the end of the input in @less@, though.  When you quit
 -- @less@, you will get broken pipe warnings printed to standard
--- error.  This is normal.  To suppress them, see the 'quiet' option.
+-- error.  This is normal.  To suppress them, see the 'handler'
+-- option.
 
-numsToLess :: IO ExitCode
-numsToLess = runSafeT $ do
-  (toLess, han) <- pipeInput Inherit Inherit (procSpec "less" [])
-  conveyor $ produceNumbers >-> toLess
-  waitForProcess han
+numsToLess :: IO ()
+numsToLess = runCliff $ produceNumbers >-> toLess
+  where
+    toLess = pipeInput Inherit Inherit (procSpec "less" [])
 
--- | Streams an infinite list of numbers to @tr@ and then to @less@.
--- Perfectly useless, but shows how to build pipelines.  Notice how
--- the components of the pipeline are run in the background using
--- 'conveyor'; if you run one of them in the foreground, you might get
--- a deadlock.
-
-alphaNumbers :: IO ExitCode
-alphaNumbers = runSafeT $ do
-  (toTr, fromTr, _) <- pipeInputOutput Inherit
-    (procSpec "tr" ["[0-9]", "[a-z]"])
-  (toLess, lessHan) <- pipeInput Inherit Inherit
-    (procSpec "less" [])
-  conveyor $ produceNumbers >-> toTr
-  conveyor $ fromTr >-> toLess
-  waitForProcess lessHan
+-- | Like 'numsToLess' but also returns the exit code from the @less@
+-- process.
+numsToLessWithExitCode :: IO ExitCode
+numsToLessWithExitCode = runSafeT $ do
+  hanMVar <- liftIO newEmptyMVar
+  let spec = (procSpec "less" []) { storeProcessHandle = Just hanMVar }
+      toLess = pipeInput Inherit Inherit spec
+  runEffect (produceNumbers >-> toLess)
+  han <- liftIO $ takeMVar hanMVar
+  liftIO $ waitForProcess han
 
 
 -- | Produces a stream of 'BS8.ByteString', where each
@@ -58,6 +52,28 @@ produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
   where
     mkNumStr = flip BS8.snoc '\n' . BS8.pack . show
 
+
+-- | Streams an infinite list of numbers to @tr@ and then to @less@.
+-- Perfectly useless, but shows how to build pipelines.  Notice how
+-- only one pipeline runs in the foreground; the other one runs in the
+-- background.  You want to make sure that there is, at most, only one
+-- pipeline in the foreground; otherwise, data will not stream between
+-- the components of your pipeline.  You could put all components of
+-- the pipeline in the background, but then remember that the 'Effect'
+-- will immediately shut down and kill the child processes and threads
+-- without even allowing the processes to finish streaming, which is
+-- probably not what you want.  In such a case you could use
+-- 'waitForProcess' in conjunction with 'storeProcessHandle' to wait
+-- for a process in the pipeline to finish.
+
+alphaNumbers :: IO ()
+alphaNumbers = runSafeT $ do
+  (toTr, fromTr) <- pipeInputOutput Inherit
+    (procSpec "tr" ["[0-9]", "[a-z]"])
+  let toLess = pipeInput Inherit Inherit
+        (procSpec "less" [])
+  conveyor $ produceNumbers >-> toTr
+  runEffect $ fromTr >-> toLess
 
 -- | Produces an infinite stream of numbers, sends it to @tr@ for some
 -- mangling, and then to @sh@, which will copy each line both to
@@ -75,58 +91,44 @@ produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
 -- output the user actually viewed in @less@.
 standardOutputAndError :: IO BS8.ByteString
 standardOutputAndError = runSafeT $ do
-  (toTr, fromTr, _) <- pipeInputOutput Inherit
+  (toTr, fromTr) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  (toSh, fromShOut, fromShErr, _) <- pipeInputOutputError
+  (toSh, fromShOut, fromShErr) <- pipeInputOutputError
     (procSpec "sh" ["-c", script])
-  (toLess, _) <- pipeInput Inherit Inherit
-    (procSpec "less" [])
+  let toLess = pipeInput Inherit Inherit (procSpec "less" [])
   conveyor $ produceNumbers >-> toTr
   conveyor $ fromTr >-> toSh
   conveyor $ fromShOut >-> toLess
-  thread <- background
-    . runSafeT
-    . P.fold BS8.append BS8.empty id
-    $ fromShErr
-  waitForThread thread
+  P.fold BS8.append BS8.empty id fromShErr
   where
     script = "while read line; do echo $line; echo $line 1>&2; done"
 
 -- | Like 'alphaNumbers' but just sends a limited number
 -- of numbers to @cat@.  A useful test to make sure that pipelines
--- shut down automatically.
+-- shut down automatically.  Runs both pipelines in the background and
+-- uses 'waitForProcess' to wait until @cat@ is done.  If you ran both
+-- pipelines in the background but did not use 'waitForProcess', the
+-- pipeline would terminate immediately.
 limitedAlphaNumbers :: IO ExitCode
 limitedAlphaNumbers = runSafeT $ do
-  (toTr, fromTr, _) <- pipeInputOutput Inherit
+  (toTr, fromTr) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  (toCat, catHan) <- pipeInput Inherit Inherit
-    (procSpec "cat" [])
+  catHanMVar <- liftIO newEmptyMVar
+  let toCat = pipeInput Inherit Inherit
+              (procSpec "cat" []) { storeProcessHandle = Just catHanMVar }
   conveyor $ produceNumbers >-> P.take 300 >-> toTr
   conveyor $ fromTr >-> toCat
-  waitForProcess catHan
+  han <- liftIO $ takeMVar catHanMVar
+  liftIO $ waitForProcess han
 
 -- | Produces a finite list of numbers, sends it to @tr@ for some
 -- mangling, and then puts the results into a 'BS8.ByteString' for
--- further processing.  Unlike previous examples, there is no use of
--- 'waitForProcess' or 'conveyor'.  This is OK because the 'Effect'
--- that retrieves the results from @tr@ will pull all the data; the
--- @tr@ process will then shut down because its standard input will be
--- closed when the source 'Producer' is exhausted.  This example shows
--- how you can use this library to place the results of a pipeline
--- into a simple strict data type.
---
--- When the 'SafeT' computation completes, a
--- 'System.Process.terminateProcess' is automatically sent to the @tr@
--- process--which does nothing, as @tr@ has already died.  Only after
--- the process is waited for is it fully removed from the system
--- process table.  A 'System.Process.waitForProcess' from
--- "System.Process" is automatically done as well.  Therefore, you
--- will not get zombie processes if you use this library.
+-- further processing.  This example shows how you can use this
+-- library to place the results of a pipeline into a simple strict
+-- data type.
 alphaNumbersByteString :: IO BS8.ByteString
 alphaNumbersByteString = runSafeT $ do
-  (toTr, fromTr, _) <- pipeInputOutput Inherit
+  (toTr, fromTr) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
   conveyor $ produceNumbers >-> P.take 300 >-> toTr
   P.fold BS8.append BS8.empty id fromTr
-
--}

@@ -47,7 +47,9 @@
 -- There you will find references to other libraries that you might
 -- find more useful than this one.
 --
--- For some simple examples, consult "Pipes.Cliff.Examples".
+-- You will want to consult "Pipes.Cliff.Examples" for some examples
+-- before getting started.  There are some important notes in there
+-- about how to run pipelines.
 module Pipes.Cliff
   ( -- * Specifying a subprocess's properties
     CmdSpec(..)
@@ -79,6 +81,9 @@ module Pipes.Cliff
   , waitForProcess
   , waitForThread
 
+  -- * Running a single 'Effect'
+  , runCliff
+
   -- * Errors and warnings
 
   -- | You will only need what's in this section if you want to
@@ -90,6 +95,7 @@ module Pipes.Cliff
 
   -- * Re-exports
   -- $reexports
+  , module Control.Concurrent.MVar
   , module Pipes
   , module Pipes.Safe
   , module System.Exit
@@ -101,9 +107,10 @@ module Pipes.Cliff
 
 import Pipes.Cliff.Core
 import Pipes
-import Pipes.Safe (runSafeT)
+import Pipes.Safe
 import System.Exit
 import System.Process (ProcessHandle)
+import Control.Concurrent.MVar
 
 {- $process
 
@@ -144,9 +151,11 @@ critical process to complete.
 
 {- $reexports
 
+   * "Control.Concurrent.MVar" reexports all bindings
+
    * "Pipes" reexports all bindings
 
-   * "Pipes.Safe" reexports 'runSafeT'
+   * "Pipes.Safe" reexports all bindings
 
    * "System.Exit" reexports all bindings
 

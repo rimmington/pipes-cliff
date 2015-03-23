@@ -100,7 +100,8 @@ sections fl libMods testMods =
   [ githubHead "massysett" "pipes-cliff"
   ] ++ map (testExe fl libMods testMods)
            [ "numsToLess", "alphaNumbers", "limitedAlphaNumbers",
-             "alphaNumbersByteString", "standardOutputAndError" ]
+             "alphaNumbersByteString", "standardOutputAndError",
+             "numsToLessWithExitCode" ]
 
 -- # Packages
 
