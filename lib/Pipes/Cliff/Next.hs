@@ -1,6 +1,8 @@
 {-# LANGUAGE FlexibleContexts #-}
 module Pipes.Cliff.Next where
 
+import System.Environment
+import Data.List (intersperse)
 import Control.Exception (IOException)
 import System.IO
 import qualified System.Process as Process
@@ -13,6 +15,7 @@ import Data.ByteString (ByteString)
 import Control.Concurrent.MVar
 import Control.Concurrent.Async
 import Control.Monad.Trans.Reader
+import System.Exit
 
 -- * Data types
 
@@ -56,11 +59,62 @@ data HandleOopsie = HandleOopsie Activity HandleDesc
 -- dealing with a 'Handle', there is also a 'HandleOopsie'.  If there
 -- is no 'HandleOopsie', this means that the exception arose when
 -- running 'terminateProcess'.
+--
+-- The exceptions that are caught and placed into an 'Oopsie' may
+-- arise from reading data from or writing data to a 'Handle'.  In
+-- these errors, the associated 'Producer' or 'Consumer' will
+-- terminate (which may trigger various cleanup actions in the
+-- 'MonadSafe' computation) but the exception itself is not re-thrown;
+-- rather, it is passed to the 'handler'.  Similarly, an exception may
+-- occur while closing a handle; these exceptions are caught, not
+-- rethrown, and are passed to the 'handler'.  If an exception arises
+-- when terminating a process (I'm not sure this is possible) then it
+-- is also caught, not rethrown, and passed to the 'handler'.
+--
+-- If an exception arises when creating a process--such as a command
+-- not being found--the exception is /not/ caught, handled, or passed
+-- to the 'handler'.  Also, an 'Oopsie' is created only for an
+-- 'IOException'; no other exceptions of any kind are caught or
+-- handled.  However, exceptions of any kind will still trigger
+-- appropriate cleanup actions in the 'MonadSafe' computation.
 data Oopsie = Oopsie (Maybe HandleOopsie) CmdSpec IOException
   deriving (Eq, Show)
 
+-- | Formats an 'Oopsie' for display.
+renderOopsie
+  :: String
+  -- ^ The name of the currently runnning program
+  -> Oopsie
+  -> String
+renderOopsie pn (Oopsie mayHan cmd ioe) =
+  pn ++ ": warning: when running command "
+  ++ renderCommand cmd ++ ": " ++ renderMayHan mayHan
+  ++ ": " ++ show ioe
+  where
+    renderCommand (ShellCommand str) = show str
+    renderCommand (RawCommand fp ss)
+      = concat . intersperse " " . map show
+      $ fp : ss
+
+    renderMayHan Nothing = "when terminating process"
+    renderMayHan (Just (HandleOopsie act desc)) =
+      "when " ++ actStr ++ " " ++ descStr
+      where
+        actStr = case act of
+          Reading -> "reading from"
+          Writing -> "writing to"
+          Closing -> "closing the handle associated with"
+        descStr = "standard " ++ case desc of
+          Input -> "input"
+          Output -> "output"
+          Error -> "error"
+
+-- | The default handler when receiving an 'Oopsie'; simply uses
+-- 'renderOopsie' to format it nicely and put it on standard error.
 defaultHandler :: Oopsie -> IO ()
-defaultHandler = undefined
+defaultHandler oops = do
+  pn <- getProgName
+  hPutStrLn stderr $ renderOopsie pn oops
 
 -- ** Configuration types
 
@@ -118,8 +172,45 @@ data CreateProcess = CreateProcess
   -- want to see these errors, set 'quiet' to 'True'.
 
   , storeProcessHandle :: Maybe (MVar Process.ProcessHandle)
+  -- ^ To get the 'ProcessHandle' that results after starting the
+  -- process, put a @Just@ here, with the 'MVar' in which you would
+  -- like the 'ProcessHandle' to be stored.  The various functions
+  -- that create a subprocess will store the process handle here
+  -- shortly after the process is created.  You can then use
+  -- 'waitForProcess' on the 'ProcessHandle', or you might want to use
+  -- 'terminateProcess' on it.
+  --
+  -- If you don't care about the process handle, just leave this set
+  -- at 'Nothing'.
+
   , handler :: Oopsie -> IO ()
+  -- ^ Whenever an IO exception arises during the course of various IO
+  -- actios, the exception is caught and placed into an 'Oopsie' that
+  -- indicates why and where the exception happened.  The 'handler'
+  -- determines what happens when an 'Oopsie' comes in.  See 'Oopsie'
+  -- for details.
+  --
+  -- The default 'handler' created by 'procSpec' is 'defaultHandler',
+  -- which will simply print the exceptions to standard error.  You
+  -- may not want to see the exceptions at all.  For example, many
+  -- exceptions come from broken pipes.  A broken pipe might be
+  -- entirely normal in your circumstance.  For example, if you are
+  -- streaming a large set of values to a pager such as @less@ and you
+  -- expect that the user will often quit the pager without viewing
+  -- the whole result, a broken pipe will result, which will print a
+  -- warning message.  That can be a nuisance.
+  --
+  -- If you don't want to see the exceptions at all, just set
+  -- 'handler' to 'squelch', which simply discards the exceptions.
+  --
+  -- Conceivably you could rig up an elaborate mechanism that puts the
+  -- 'Oopsie's into a "Pipes.Concurrent" mailbox or something.
   }
+
+-- | Do not show or do anything with exceptions; useful to use as a
+-- 'handler'.
+squelch :: Oopsie -> IO ()
+squelch = const (return ())
 
 -- | Create a 'CreateProcess' record with default settings.  The
 -- default settings are:
@@ -289,6 +380,11 @@ conveyor efct
 waitForThread :: MonadIO m => Async a -> m a
 waitForThread = liftIO . wait
 
+-- | An overloaded version of the 'Process.waitForProcess' from
+-- "System.Process".
+waitForProcess :: MonadIO m => ProcessHandle -> m ExitCode
+waitForProcess h = liftIO $ Process.waitForProcess h
+
 -- * Mailboxes
 
 -- | A buffer that holds 1 message.  I have no idea if this is the
@@ -303,6 +399,14 @@ waitForThread = liftIO . wait
 -- output, which tells the whole pipeline to start shutting down.
 messageBuffer :: PC.Buffer a
 messageBuffer = PC.bounded 1
+
+-- I have wondered if the constraint on 'newMailboxToProcess' is too
+-- broad; would (MonadMask m, MonadMask mo) work instead?  I'm not
+-- sure such a change would be a good idea; what's conclusive though
+-- is that such a change would require a direct dependency on the
+-- @exceptions@ package because then I would need @bracket@ from
+-- "Control.Monad.Catch"; @pipes-safe@ does not export this function.
+-- It's not worth incurring a dependency for this issue alone.
 
 -- | Creates a new mailbox for sending data to a process.  Returns a
 -- 'PC.Output' which is the sink that accepts values for delivery to
@@ -502,6 +606,7 @@ runOutputHandle desc out ev = do
 
 -- * Creating subprocesses
 
+
 -- | Creates a subprocess.  Registers destroyers for each handle
 -- created, as well as for the ProcessHandle.
 createProcess
@@ -523,6 +628,7 @@ createProcess cp = mask $ \restore -> do
     Just hanVar -> liftIO $ putMVar hanVar han
   restore $ return (mayIn, mayOut, mayErr)
 
+
 -- | Convenience wrapper for 'createProcess'.  The subprocess is
 -- terminated and all its handles destroyed when the 'MonadSafe'
 -- computation completes.
@@ -542,13 +648,17 @@ runCreateProcess inp out err cp = do
       (createProcess (convertCreateProcess inp out err cp)) ev
   return (inp', out', err', ev)
 
--- | Creating Proxy
+-- * Creating Proxy
 
+-- | Do not create any 'Proxy' to or from the process.
 pipeNone
   :: (MonadSafe m, MonadCatch (Base m))
   => NonPipe
+  -- ^ Standard input
   -> NonPipe
+  -- ^ Standard output
   -> NonPipe
+  -- ^ Standard error
   -> CreateProcess
   -> m ()
 pipeNone inp out err cp = flip runReaderT (envFromCreateProcess cp) $ do
@@ -556,6 +666,7 @@ pipeNone inp out err cp = flip runReaderT (envFromCreateProcess cp) $ do
     (convertCreateProcess (Just inp) (Just out) (Just err) cp)
   return ()
 
+-- | Create a 'Consumer' for standard input.
 pipeInput
   :: (MonadSafe m, MonadCatch (Base m))
   => NonPipe
@@ -564,11 +675,13 @@ pipeInput
   -- ^ Standard error
   -> CreateProcess
   -> Consumer ByteString m ()
+  -- ^ A 'Consumer' for standard input
 pipeInput out err cp = do
   (Just inp, _, _, ev) <- runCreateProcess Nothing (Just out) (Just err) cp
   runInputHandle inp ev
 
 
+-- | Create a 'Producer' for standard output.
 pipeOutput
   :: (MonadSafe m, MonadCatch (Base m))
   => NonPipe
@@ -577,10 +690,12 @@ pipeOutput
   -- ^ Standard error
   -> CreateProcess
   -> Producer ByteString m ()
+  -- ^ A 'Producer' for standard output
 pipeOutput inp err cp = do
   (_, Just out, _, ev) <- runCreateProcess (Just inp) Nothing (Just err) cp
   runOutputHandle Output out ev
 
+-- | Create a 'Producer' for standard error.
 pipeError
   :: (MonadSafe m, MonadCatch (Base m))
   => NonPipe
@@ -589,38 +704,51 @@ pipeError
   -- ^ Standard output
   -> CreateProcess
   -> Producer ByteString m ()
+  -- ^ A 'Producer' for standard error
 pipeError inp out cp = do
   (_, _, Just err, ev) <- runCreateProcess (Just inp) (Just out) Nothing cp
   runOutputHandle Error err ev
 
+-- | Create a 'Consumer' for standard input and a 'Producer' for
+-- standard output.
 pipeInputOutput
   :: (MonadSafe mi, MonadSafe mo, MonadSafe m, MonadCatch (Base m))
   => NonPipe
   -- ^ Standard error
   -> CreateProcess
   -> m (Consumer ByteString mi (), Producer ByteString mo ())
+  -- ^ A 'Consumer' for standard input, a 'Producer' for standard
+  -- output
 pipeInputOutput err cp = do
   (Just inp, Just out, _, ev) <-
     runCreateProcess Nothing Nothing (Just err) cp
   return (runInputHandle inp ev, runOutputHandle Output out ev)
 
+-- | Create a 'Consumer' for standard input and a 'Producer' for
+-- standard error.
 pipeInputError
   :: (MonadSafe mi, MonadSafe me, MonadSafe m, MonadCatch (Base m))
   => NonPipe
   -- ^ Standard output
   -> CreateProcess
   -> m (Consumer ByteString mi (), Producer ByteString me ())
+  -- ^ A 'Consumer' for standard input, a 'Producer' for standard
+  -- error
 pipeInputError out cp = do
   (Just inp, _, Just err, ev) <-
     runCreateProcess Nothing (Just out) Nothing cp
   return (runInputHandle inp ev, runOutputHandle Error err ev)
 
+-- | Create a 'Producer' for standard output and a 'Producer' for
+-- standard error.
 pipeOutputError
   :: (MonadSafe mo, MonadSafe me, MonadSafe m, MonadCatch (Base m))
   => NonPipe
   -- ^ Standard input
   -> CreateProcess
   -> m (Producer ByteString mo (), Producer ByteString me ())
+  -- ^ A 'Producer' for standard output, a 'Producer' for standard
+  -- error
 pipeOutputError inp cp = do
   (_, Just out, Just err, ev) <-
     runCreateProcess (Just inp) Nothing Nothing cp
@@ -629,12 +757,16 @@ pipeOutputError inp cp = do
          )
 
 
+-- | Create a 'Consumer' for standard input, a 'Producer' for standard
+-- output, and a 'Producer' for standard error.
 pipeInputOutputError
   :: ( MonadSafe mi, MonadSafe mo, MonadSafe me,
        MonadSafe m, MonadCatch (Base m))
   => CreateProcess
   -> m ( Consumer ByteString mi (), Producer ByteString mo (),
          Producer ByteString me ())
+  -- ^ A 'Consumer' for standard input, a 'Producer' for standard
+  -- output, a 'Producer' for standard error
 pipeInputOutputError cp = do
   (Just inp, Just out, Just err, ev) <-
     runCreateProcess Nothing Nothing Nothing cp
