@@ -415,46 +415,22 @@ waitForProcess h = liftIO $ Process.waitForProcess h
 messageBuffer :: PC.Buffer a
 messageBuffer = PC.bounded 1
 
--- | Creates a new mailbox for sending data to a process.  Returns a
--- 'PC.Output' which is the sink that accepts values for delivery to
--- the process, as well as a 'Producer' that will produce what comes
--- from the mailbox; the 'Producer' should be hooked to the standard
--- input of the subprocess.  If the Producer shuts down for any
--- reason, it also seals the mailbox, so the 'PC.Output' will not
--- accept any new values.
-newMailboxToProcess
-  :: (MonadIO m, MonadSafe mo)
-  => m (PC.Output a, Producer a mo ())
-newMailboxToProcess = do
-  (sndr, PC.Input rcvr, seal) <- liftIO $ PC.spawn' messageBuffer
-  let prod = do
-        _ <- register (liftIO $ PC.atomically seal)
-        go
-      go = do
-        mayVal <- liftIO $ PC.atomically rcvr
-        maybe (return ()) (\v -> yield v >> go) mayVal
-  return (sndr, prod)
-
--- | Creates a new mailbox for receiving data from a process.  Returns
--- a 'PC.Input' which is an exhaustible source of values from the
--- process, as well as s 'Consumer' that will consume values and place
--- them into the mailbox; this 'Consumer' should be hooked to the
--- desired stream (output or error) of the process.  If the Consumer
--- shuts down for any reason, it also seals the mailbox, so the
--- 'PC.Input' will not accept any new values.
-newMailboxFromProcess
-  :: (MonadIO m, MonadSafe mi)
-  => m (Consumer a mi (), PC.Input a)
-newMailboxFromProcess = do
-  (PC.Output sndr, rcvr, seal) <- liftIO $ PC.spawn' messageBuffer
-  let csmr = do
-        _ <- register (liftIO $ PC.atomically seal)
-        go
-      go = do
-        val <- await
-        rslt <- liftIO $ PC.atomically (sndr val)
-        if rslt then go else return ()
-  return (csmr, rcvr)
+-- | Creates a new mailbox and returns 'Proxy' that stream values
+-- into and out of the mailbox.  Each 'Proxy' is equipped with a
+-- finalizer that will seal the mailbox immediately after production
+-- or consumption has completed, even if such completion is not due
+-- to an exhausted mailbox.  This will signal to the other side of
+-- the mailbox that the mailbox is sealed.
+newMailbox
+  :: (MonadIO m, MonadSafe mi, MonadSafe mo)
+  => m (Consumer a mi (), Producer a mo ())
+newMailbox = do
+  (toBox, fromBox, seal) <- liftIO $ PC.spawn' messageBuffer
+  let csmr = register (liftIO $ PC.atomically seal)
+             >> PC.toOutput toBox
+      pdcr = register (liftIO $ PC.atomically seal)
+             >> PC.fromInput fromBox
+  return (csmr, pdcr)
 
 
 -- * Production from and consumption to 'Handle's
@@ -463,6 +439,7 @@ newMailboxFromProcess = do
 -- small value and see how it works.
 bufSize :: Int
 bufSize = 1024
+
 
 -- | Create a 'Producer' that produces from a 'Handle'.  Takes
 -- ownership of the 'Handle'; closes it when the 'Producer'
@@ -475,19 +452,10 @@ produceFromHandle
   -> Handle
   -> ErrSpec
   -> Producer ByteString m ()
-produceFromHandle hDesc h ev = runProducer ev h hDesc
-
-
-runProducer
-  :: (MonadSafe m, MonadCatch (Base m))
-  => ErrSpec
-  -> Handle
-  -> HandleDesc
-  -> Producer ByteString m ()
-runProducer ev h desc = do
-  _ <- register (closeHandleNoThrow h desc ev)
+produceFromHandle hDesc h ev = do
+  _ <- register (closeHandleNoThrow h hDesc ev)
   let hndlr e = lift $ handleException (Just oops) e ev
-      oops = HandleOopsie Reading desc
+      oops = HandleOopsie Reading hDesc
       produce = liftIO (BS.hGetSome h bufSize) >>= go
       go bs
         | BS.null bs = return ()
@@ -495,28 +463,16 @@ runProducer ev h desc = do
   produce `catch` (\e -> hndlr e >> return ())
   
 
-
--- | Create a 'Consumer' that consumes from a 'Handle'.  Takes
--- ownership of the 'Handle'; closes it when the 'Consumer'
--- terminates.  If any IO errors arise either during consumption or
--- when the 'Handle' is closed, they are caught and passed to the
--- handler.
+-- | Runs a 'Consumer'; registers the handle so that it is closed
+-- when consumption finishes.  If any IO errors arise either during
+-- consumption or when the 'Handle' is closed, they are caught and
+-- passed to the handler.
 consumeToHandle
   :: (MonadSafe m, MonadCatch (Base m))
   => Handle
   -> ErrSpec
   -> Consumer ByteString m ()
-consumeToHandle h ev = runConsumer ev h
-
-
--- | Runs a 'Consumer'; registers the handle so that it is closed when
--- consumption finishes.
-runConsumer
-  :: (MonadSafe m, MonadCatch (Base m))
-  => ErrSpec
-  -> Handle
-  -> Consumer ByteString m ()
-runConsumer ev h = do
+consumeToHandle h ev = do
   _ <- register $ closeHandleNoThrow h Input ev
   let hndlr e = lift $ handleException (Just oops) e ev
       oops = HandleOopsie Writing Input
@@ -556,51 +512,21 @@ backgroundReceiveFromProcess desc han csmr ev = background act >> return ()
     prod = produceFromHandle desc han ev
     act = runSafeT . runEffect $ prod >-> csmr
 
--- | Creates a 'Consumer' that will pump what it consumes to the
--- appropriate mailbox.  Does not seal the mailbox; if the mailbox is
--- exhausted, it's already been sealed.
-processPump
-  :: (MonadCatch m, MonadIO m)
-  => (a -> PC.STM Bool)
-  -- ^ Reception mailbox
-  -> Consumer a m ()
-processPump toStdinMbox = go
-  where
-    go = do
-      bs <- await
-      res <- liftIO . PC.atomically . toStdinMbox $ bs
-      if res then go else return ()
-
 -- | Does everything necessary to run a 'Handle' that is created to a
 -- process standard input.  Creates mailbox, runs background thread
 -- that pumps data out of the mailbox and into the process standard
 -- input, and returns a Consumer that consumes and places what it
 -- consumes into the mailbox for delivery to the background process.
 runInputHandle
-  :: MonadSafe mi
+  :: (MonadSafe m, MonadSafe mi)
   => Handle
   -> ErrSpec
-  -> Consumer ByteString mi ()
+  -> m (Consumer ByteString mi ())
 runInputHandle inp ev = do
-  (PC.Output toStdinMbox, fromStdinMbox) <- liftIO newMailboxToProcess
-  backgroundSendToProcess inp fromStdinMbox ev
-  processPump toStdinMbox
+  (toMbox, fromMbox) <- liftIO newMailbox
+  backgroundSendToProcess inp fromMbox ev
+  return toMbox
 
--- | Creates a 'Producer' that will pump from the given input source.
--- Does not seal the mailbox; if the source fails, it has already been
--- sealed.
-processPuller
-  :: (MonadCatch m, MonadIO m)
-  => PC.STM (Maybe a)
-  -- ^ Where the process delivers new ByteStrings
-  -> Producer a m ()
-processPuller fromOutMbox = go
-  where
-    go = do
-      mayBs <- liftIO $ PC.atomically fromOutMbox
-      case mayBs of
-        Just bs -> yield bs >> go
-        Nothing -> return ()
 
 -- | Does everything necessary to run a 'Handle' that is created to a
 -- process standard output or standard error.  Creates mailbox, runs
@@ -608,15 +534,15 @@ processPuller fromOutMbox = go
 -- into the mailbox, and returns a Producer that produces what comes
 -- into the mailbox.
 runOutputHandle
-  :: MonadSafe mo
+  :: (MonadSafe m, MonadSafe mo)
   => HandleDesc
   -> Handle
   -> ErrSpec
-  -> Producer ByteString mo ()
+  -> m (Producer ByteString mo ())
 runOutputHandle desc out ev = do
-  (toStdoutMbox, PC.Input fromStdoutMbox) <- liftIO newMailboxFromProcess
-  backgroundReceiveFromProcess desc out toStdoutMbox ev
-  processPuller fromStdoutMbox
+  (toMbox, fromMbox) <- liftIO $ newMailbox
+  backgroundReceiveFromProcess desc out toMbox ev
+  return fromMbox
 
 
 -- * Creating subprocesses
@@ -692,7 +618,8 @@ pipeInput
 pipeInput out err cp = do
   (Just inp, _, _, ev, phan) <-
     runCreateProcess Nothing (Just out) (Just err) cp
-  return (runInputHandle inp ev, phan)
+  ih <- runInputHandle inp ev
+  return (ih, phan)
 
 
 
@@ -709,7 +636,8 @@ pipeOutput
 pipeOutput inp err cp = do
   (_, Just out, _, ev, phan) <- runCreateProcess (Just inp)
     Nothing (Just err) cp
-  return (runOutputHandle Output out ev, phan)
+  oh <- runOutputHandle Output out ev
+  return (oh, phan)
 
 -- | Create a 'Producer' for standard error.
 pipeError
@@ -723,7 +651,8 @@ pipeError
   -- ^ A 'Producer' for standard error
 pipeError inp out cp = do
   (_, _, Just err, ev, phan) <- runCreateProcess (Just inp) (Just out) Nothing cp
-  return (runOutputHandle Error err ev, phan)
+  eh <- runOutputHandle Error err ev
+  return (eh, phan)
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard output.
@@ -738,7 +667,9 @@ pipeInputOutput
 pipeInputOutput err cp = do
   (Just inp, Just out, _, ev, phan) <-
     runCreateProcess Nothing Nothing (Just err) cp
-  return ((runInputHandle inp ev, runOutputHandle Output out ev), phan)
+  ih <- runInputHandle inp ev
+  oh <- runOutputHandle Output out ev
+  return ((ih, oh), phan)
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard error.
@@ -754,7 +685,9 @@ pipeInputError
 pipeInputError out cp = do
   (Just inp, _, Just err, ev, phan) <-
     runCreateProcess Nothing (Just out) Nothing cp
-  return $ ((runInputHandle inp ev, runOutputHandle Error err ev), phan)
+  ih <- runInputHandle inp ev
+  eh <- runOutputHandle Error err ev
+  return $ ((ih, eh), phan)
 
 -- | Create a 'Producer' for standard output and a 'Producer' for
 -- standard error.
@@ -769,9 +702,9 @@ pipeOutputError
 pipeOutputError inp cp = do
   (_, Just out, Just err, ev, phan) <-
     runCreateProcess (Just inp) Nothing Nothing cp
-  return
-    ( ( runOutputHandle Output out ev
-      , runOutputHandle Error err ev), phan)
+  oh <- runOutputHandle Output out ev
+  eh <- runOutputHandle Error err ev
+  return ((oh, eh), phan)
 
 
 -- | Create a 'Consumer' for standard input, a 'Producer' for standard
@@ -788,7 +721,7 @@ pipeInputOutputError
 pipeInputOutputError cp = do
   (Just inp, Just out, Just err, ev, phan) <-
     runCreateProcess Nothing Nothing Nothing cp
-  return $ (( runInputHandle inp ev
-            , runOutputHandle Output out ev
-            , runOutputHandle Error err ev
-            ), phan)
+  ih <- runInputHandle inp ev
+  oh <- runOutputHandle Output out ev
+  eh <- runOutputHandle Error err ev
+  return $ ((ih, oh, eh), phan) 
