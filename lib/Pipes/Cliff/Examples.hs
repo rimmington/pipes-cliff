@@ -12,8 +12,10 @@
 -- "Pipes.Cliff" for more details.
 --
 -- Notice throughout how pipelines that move data from one process
--- to another typically are run in the background using 'conveyor'
--- or 'background'.
+-- to another typically are run in the background using 'conveyor',
+-- and that threads that produce information you need to use are run
+-- in the 'background' so you can use 'waitForThread' to retrieve
+-- their results.
 
 module Pipes.Cliff.Examples where
 
