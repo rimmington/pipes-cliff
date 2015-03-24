@@ -81,9 +81,6 @@ module Pipes.Cliff
   , waitForProcess
   , waitForThread
 
-  -- * Running a single 'Effect'
-  , runCliff
-
   -- * Errors and warnings
 
   -- | You will only need what's in this section if you want to
@@ -134,18 +131,25 @@ That 'Proxy' manages all the resources it creates; so, for example,
 when you ultimately run your 'Effect', the process is created and then
 destroyed when the 'MonadSafe' computation completes.
 
-If you are creating a 'Proxy' for more than one stream (for instance,
-you're using 'pipeInputOutput') then the multiple 'Proxy' are returned
-to you in a tuple in the 'MonadSafe' computation.  The 'MonadSafe'
-computation will make sure that the resulting process and handles are
-destroyed when you exit the 'MonadSafe' computation.  In such a case,
-you must make sure that you don't try to use the streams outside of
-the 'MonadSafe' computation, because the subprocess will already be
-destroyed.  To make sure you are done using the streams before leaving
-the 'MonadSafe' computation, you can run the 'Effect' you're
-interested in the the main thread, or perhaps you may want to use
-'storeProcessHandle' and then use 'waitForProcess' to wait for any
-critical process to complete.
+If you are creating a 'Proxy' for more than one stream (for
+instance, you're using 'pipeInputOutput') then the multiple 'Proxy'
+are returned to you in a tuple in the 'MonadSafe' computation.  The
+'MonadSafe' computation will make sure that the resulting process
+and handles are destroyed when you exit the 'MonadSafe' computation.
+In such a case, you must make sure that you don't try to use the
+streams outside of the 'MonadSafe' computation, because the
+subprocess will already be destroyed.  To make sure you are done
+using the streams before leaving the 'MonadSafe' computation, you
+will want to use 'waitForProcess' for one or more processes that you
+are most interested in.
+
+Every function in this section (except for the 'pipesNone' function)
+returns a value of type @(a, h)@, where @a@ is the set of 'Proxy',
+and @h@ is the 'ProcessHandle'; that means the functions that return
+multiple 'Proxy' have a nested return type.  That allows you to use
+'fst' and 'snd' to pull out the part you are interested in.  It
+would have been more consistent for 'pipeNone' to return
+@((), ProcessHandle)@ but that just seemed silly.
 
 -}
 

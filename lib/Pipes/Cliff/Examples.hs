@@ -7,9 +7,13 @@
 --
 -- <https://github.com/massysett/pipes-cliff/blob/master/lib/Pipes/Cliff/Examples.hs>
 --
--- __Be sure to use the @-threaded@ option__ when compiling code that
--- uses "Pipes.Cliff", including this code; see the warning in
+-- __Be sure to use the @-threaded@ option__ when compiling code
+-- that uses "Pipes.Cliff", including this code; see the warning in
 -- "Pipes.Cliff" for more details.
+--
+-- Notice throughout how pipelines that move data from one process
+-- to another typically are run in the background using 'conveyor'
+-- or 'background'.
 
 module Pipes.Cliff.Examples where
 
@@ -27,53 +31,26 @@ import qualified Data.ByteString.Char8 as BS8
 -- error.  This is normal.  To suppress them, see the 'handler'
 -- option.
 
-numsToLess :: IO ()
-numsToLess = runCliff $ produceNumbers >-> toLess
-  where
-    toLess = pipeInput Inherit Inherit (procSpec "less" [])
-
--- | Like 'numsToLess' but also returns the exit code from the @less@
--- process.
-numsToLessWithExitCode :: IO ExitCode
-numsToLessWithExitCode = runSafeT $ do
-  hanMVar <- liftIO newEmptyMVar
-  let spec = (procSpec "less" []) { storeProcessHandle = Just hanMVar }
-      toLess = pipeInput Inherit Inherit spec
-  runEffect (produceNumbers >-> toLess)
-  han <- liftIO $ takeMVar hanMVar
-  liftIO $ waitForProcess han
-
-
--- | Produces a stream of 'BS8.ByteString', where each
--- 'BS8.ByteString' is a shown integer.
-
-produceNumbers :: Monad m => Producer BS8.ByteString m ()
-produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
-  where
-    mkNumStr = flip BS8.snoc '\n' . BS8.pack . show
+numsToLess :: IO ExitCode
+numsToLess = runSafeT $ do
+  (toLess, han) <- pipeInput Inherit Inherit (procSpec "less" [])
+  conveyor $ produceNumbers >-> toLess
+  waitForProcess han
 
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
--- Perfectly useless, but shows how to build pipelines.  Notice how
--- only one pipeline runs in the foreground; the other one runs in the
--- background.  You want to make sure that there is, at most, only one
--- pipeline in the foreground; otherwise, data will not stream between
--- the components of your pipeline.  You could put all components of
--- the pipeline in the background, but then remember that the 'Effect'
--- will immediately shut down and kill the child processes and threads
--- without even allowing the processes to finish streaming, which is
--- probably not what you want.  In such a case you could use
--- 'waitForProcess' in conjunction with 'storeProcessHandle' to wait
--- for a process in the pipeline to finish.
+-- Perfectly useless, but shows how to build pipelines.
 
-alphaNumbers :: IO ()
+alphaNumbers :: IO ExitCode
 alphaNumbers = runSafeT $ do
-  (toTr, fromTr) <- pipeInputOutput Inherit
+  ((toTr, fromTr), _) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  let toLess = pipeInput Inherit Inherit
-        (procSpec "less" [])
+  (toLess, lessHan) <- pipeInput Inherit Inherit
+    (procSpec "less" [])
   conveyor $ produceNumbers >-> toTr
-  runEffect $ fromTr >-> toLess
+  conveyor $ fromTr >-> toLess
+  waitForProcess lessHan
+
 
 -- | Produces an infinite stream of numbers, sends it to @tr@ for some
 -- mangling, and then to @sh@, which will copy each line both to
@@ -91,33 +68,36 @@ alphaNumbers = runSafeT $ do
 -- output the user actually viewed in @less@.
 standardOutputAndError :: IO BS8.ByteString
 standardOutputAndError = runSafeT $ do
-  (toTr, fromTr) <- pipeInputOutput Inherit
+  ((toTr, fromTr), _) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  (toSh, fromShOut, fromShErr) <- pipeInputOutputError
+  ((toSh, fromShOut, fromShErr), _) <- pipeInputOutputError
     (procSpec "sh" ["-c", script])
-  let toLess = pipeInput Inherit Inherit (procSpec "less" [])
+  (toLess, lessHan) <- pipeInput Inherit Inherit (procSpec "less" [])
   conveyor $ produceNumbers >-> toTr
   conveyor $ fromTr >-> toSh
   conveyor $ fromShOut >-> toLess
-  P.fold BS8.append BS8.empty id fromShErr
+  foldHan <-
+    background
+    . runSafeT
+    $ P.fold BS8.append BS8.empty id fromShErr
+  _ <- waitForProcess lessHan
+  waitForThread foldHan
   where
     script = "while read line; do echo $line; echo $line 1>&2; done"
 
 -- | Like 'alphaNumbers' but just sends a limited number
 -- of numbers to @cat@.  A useful test to make sure that pipelines
 -- shut down automatically.  Runs both pipelines in the background and
--- uses 'waitForProcess' to wait until @cat@ is done.  If you ran both
--- pipelines in the background but did not use 'waitForProcess', the
--- pipeline would terminate immediately.
-limitedAlphaNumbers :: IO ()
+-- uses 'waitForProcess' to wait until @cat@ is done.
+limitedAlphaNumbers :: IO ExitCode
 limitedAlphaNumbers = runSafeT $ do
-  (toTr, fromTr) <- pipeInputOutput Inherit
+  ((toTr, fromTr), _) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  let toCat = pipeInput Inherit Inherit
-              (procSpec "cat" [])
+  (toCat, catHan) <- pipeInput Inherit Inherit
+    (procSpec "cat" [])
   conveyor $ produceNumbers >-> P.take 300 >-> toTr
-  runEffect $ fromTr >-> toCat
-  -- liftIO $ waitForProcess han
+  conveyor $ fromTr >-> toCat
+  waitForProcess catHan
 
 -- | Produces a finite list of numbers, sends it to @tr@ for some
 -- mangling, and then puts the results into a 'BS8.ByteString' for
@@ -126,7 +106,22 @@ limitedAlphaNumbers = runSafeT $ do
 -- data type.
 alphaNumbersByteString :: IO BS8.ByteString
 alphaNumbersByteString = runSafeT $ do
-  (toTr, fromTr) <- pipeInputOutput Inherit
+  ((toTr, fromTr), _) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
   conveyor $ produceNumbers >-> P.take 300 >-> toTr
-  P.fold BS8.append BS8.empty id fromTr
+  threadHan <-
+    background
+    . runSafeT
+    $ P.fold BS8.append BS8.empty id fromTr
+  waitForThread threadHan
+
+
+-- | Produces a stream of 'BS8.ByteString', where each
+-- 'BS8.ByteString' is a shown integer.
+
+produceNumbers :: Monad m => Producer BS8.ByteString m ()
+produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
+  where
+    mkNumStr = flip BS8.snoc '\n' . BS8.pack . show
+
+

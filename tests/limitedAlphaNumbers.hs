@@ -4,5 +4,4 @@ import Pipes.Cliff.Examples
 import System.Exit
 
 main :: IO ()
-main = limitedAlphaNumbers
---main = limitedAlphaNumbers >>= exitWith
+main = limitedAlphaNumbers >>= exitWith

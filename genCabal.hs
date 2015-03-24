@@ -100,8 +100,7 @@ sections fl libMods testMods =
   [ githubHead "massysett" "pipes-cliff"
   ] ++ map (testExe fl libMods testMods)
            [ "numsToLess", "alphaNumbers", "limitedAlphaNumbers",
-             "alphaNumbersByteString", "standardOutputAndError",
-             "numsToLessWithExitCode" ]
+             "alphaNumbersByteString", "standardOutputAndError" ]
 
 -- # Packages
 
@@ -115,7 +114,7 @@ pipesSafe :: Package
 pipesSafe = closedOpen "pipes-safe" [2,2] [2,3]
 
 pipesConcurrency :: Package
-pipesConcurrency = closedOpen "pipes-concurrency" [2,0] [2,1]
+pipesConcurrency = closedOpen "pipes-concurrency" [2,0,3] [2,1]
 
 bytestring :: Package
 bytestring = closedOpen "bytestring" [0,10,4] [0,11]

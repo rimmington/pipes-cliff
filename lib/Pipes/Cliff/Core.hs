@@ -284,7 +284,6 @@ envFromCreateProcess
   -> Env
 envFromCreateProcess cp = Env
   { envErrorHandler = handler cp
-  , envProcessHandle = storeProcessHandle cp
   , envCmdSpec = cmdspec cp
   }
 
@@ -391,9 +390,6 @@ waitForThread = liftIO . wait
 waitForProcess :: MonadIO m => ProcessHandle -> m ExitCode
 waitForProcess h = liftIO $ Process.waitForProcess h
 
--- | Runs a single 'Effect' in the foreground.
-runCliff :: (MonadMask m, MonadIO m) => Effect (SafeT m) a -> m a
-runCliff = runSafeT . runEffect
 
 -- * Mailboxes
 
@@ -656,6 +652,7 @@ runCreateProcess inp out err cp = do
 
 -- * Creating Proxy
 
+
 -- | Do not create any 'Proxy' to or from the process.
 pipeNone
   :: (MonadSafe m, MonadCatch (Base m))
@@ -681,26 +678,29 @@ pipeInput
   -> NonPipe
   -- ^ Standard error
   -> CreateProcess
-  -> m (Consumer ByteString m (), ProcessHandle)
-  -- ^ A 'Consumer' for standard input, and the 'ProcessHandle'
+  -> m (Consumer ByteString mi (), ProcessHandle)
+  -- ^ A 'Consumer' for standard input
 pipeInput out err cp = do
-  (Just inp, _, _, ev, phan) <- runCreateProcess Nothing (Just out) (Just err) cp
+  (Just inp, _, _, ev, phan) <-
+    runCreateProcess Nothing (Just out) (Just err) cp
   return (runInputHandle inp ev, phan)
+
 
 
 -- | Create a 'Producer' for standard output.
 pipeOutput
-  :: (MonadSafe m, MonadCatch (Base m))
+  :: (MonadSafe mo, MonadSafe m, MonadCatch (Base m))
   => NonPipe
   -- ^ Standard input
   -> NonPipe
   -- ^ Standard error
   -> CreateProcess
-  -> Producer ByteString m ()
+  -> m (Producer ByteString mo (), ProcessHandle)
   -- ^ A 'Producer' for standard output
 pipeOutput inp err cp = do
-  (_, Just out, _, ev) <- runCreateProcess (Just inp) Nothing (Just err) cp
-  runOutputHandle Output out ev
+  (_, Just out, _, ev, phan) <- runCreateProcess (Just inp)
+    Nothing (Just err) cp
+  return (runOutputHandle Output out ev, phan)
 
 -- | Create a 'Producer' for standard error.
 pipeError
@@ -710,11 +710,11 @@ pipeError
   -> NonPipe
   -- ^ Standard output
   -> CreateProcess
-  -> Producer ByteString m ()
+  -> m (Producer ByteString m (), ProcessHandle)
   -- ^ A 'Producer' for standard error
 pipeError inp out cp = do
-  (_, _, Just err, ev) <- runCreateProcess (Just inp) (Just out) Nothing cp
-  runOutputHandle Error err ev
+  (_, _, Just err, ev, phan) <- runCreateProcess (Just inp) (Just out) Nothing cp
+  return (runOutputHandle Error err ev, phan)
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard output.
@@ -723,13 +723,13 @@ pipeInputOutput
   => NonPipe
   -- ^ Standard error
   -> CreateProcess
-  -> m (Consumer ByteString mi (), Producer ByteString mo ())
+  -> m ((Consumer ByteString mi (), Producer ByteString mo ()), ProcessHandle)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
 pipeInputOutput err cp = do
-  (Just inp, Just out, _, ev) <-
+  (Just inp, Just out, _, ev, phan) <-
     runCreateProcess Nothing Nothing (Just err) cp
-  return (runInputHandle inp ev, runOutputHandle Output out ev)
+  return ((runInputHandle inp ev, runOutputHandle Output out ev), phan)
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard error.
@@ -738,13 +738,14 @@ pipeInputError
   => NonPipe
   -- ^ Standard output
   -> CreateProcess
-  -> m (Consumer ByteString mi (), Producer ByteString me ())
+  -> m ( (Consumer ByteString mi (), Producer ByteString me ())
+       , ProcessHandle)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
 pipeInputError out cp = do
-  (Just inp, _, Just err, ev) <-
+  (Just inp, _, Just err, ev, phan) <-
     runCreateProcess Nothing (Just out) Nothing cp
-  return (runInputHandle inp ev, runOutputHandle Error err ev)
+  return $ ((runInputHandle inp ev, runOutputHandle Error err ev), phan)
 
 -- | Create a 'Producer' for standard output and a 'Producer' for
 -- standard error.
@@ -753,15 +754,15 @@ pipeOutputError
   => NonPipe
   -- ^ Standard input
   -> CreateProcess
-  -> m (Producer ByteString mo (), Producer ByteString me ())
+  -> m ((Producer ByteString mo (), Producer ByteString me ()), ProcessHandle)
   -- ^ A 'Producer' for standard output, a 'Producer' for standard
   -- error
 pipeOutputError inp cp = do
-  (_, Just out, Just err, ev) <-
+  (_, Just out, Just err, ev, phan) <-
     runCreateProcess (Just inp) Nothing Nothing cp
-  return ( runOutputHandle Output out ev
-         , runOutputHandle Error err ev
-         )
+  return
+    ( ( runOutputHandle Output out ev
+      , runOutputHandle Error err ev), phan)
 
 
 -- | Create a 'Consumer' for standard input, a 'Producer' for standard
@@ -770,14 +771,15 @@ pipeInputOutputError
   :: ( MonadSafe mi, MonadSafe mo, MonadSafe me,
        MonadSafe m, MonadCatch (Base m))
   => CreateProcess
-  -> m ( Consumer ByteString mi (), Producer ByteString mo (),
-         Producer ByteString me ())
+  -> m (( Consumer ByteString mi ()
+        , Producer ByteString mo ()
+        , Producer ByteString me ()), ProcessHandle)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output, a 'Producer' for standard error
 pipeInputOutputError cp = do
-  (Just inp, Just out, Just err, ev) <-
+  (Just inp, Just out, Just err, ev, phan) <-
     runCreateProcess Nothing Nothing Nothing cp
-  return ( runInputHandle inp ev
-         , runOutputHandle Output out ev
-         , runOutputHandle Error err ev
-         )
+  return $ (( runInputHandle inp ev
+            , runOutputHandle Output out ev
+            , runOutputHandle Error err ev
+            ), phan)
