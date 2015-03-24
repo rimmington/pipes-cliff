@@ -185,27 +185,37 @@ data CreateProcess = CreateProcess
   -- at 'Nothing'.
 
   , handler :: Oopsie -> IO ()
-  -- ^ Whenever an IO exception arises during the course of various IO
-  -- actios, the exception is caught and placed into an 'Oopsie' that
-  -- indicates why and where the exception happened.  The 'handler'
-  -- determines what happens when an 'Oopsie' comes in.  See 'Oopsie'
-  -- for details.
+  -- ^ Whenever an IO exception arises during the course of various
+  -- IO actios, the exception is caught and placed into an 'Oopsie'
+  -- that indicates why and where the exception happened.  The
+  -- 'handler' determines what happens when an 'Oopsie' comes in.
+  -- See 'Oopsie' for details.
   --
-  -- The default 'handler' created by 'procSpec' is 'defaultHandler',
-  -- which will simply print the exceptions to standard error.  You
-  -- may not want to see the exceptions at all.  For example, many
-  -- exceptions come from broken pipes.  A broken pipe might be
-  -- entirely normal in your circumstance.  For example, if you are
-  -- streaming a large set of values to a pager such as @less@ and you
-  -- expect that the user will often quit the pager without viewing
-  -- the whole result, a broken pipe will result, which will print a
-  -- warning message.  That can be a nuisance.
+  -- The default 'handler' created by 'procSpec' is
+  -- 'defaultHandler', which will simply print the exceptions to
+  -- standard error.  You may not want to see the exceptions at all.
+  -- For example, many exceptions come from broken pipes.  A broken
+  -- pipe might be entirely normal in your circumstance.  For
+  -- example, if you are streaming a large set of values to a pager
+  -- such as @less@ and you expect that the user will often quit the
+  -- pager without viewing the whole result, a broken pipe will
+  -- result, which will print a warning message.  That can be a
+  -- nuisance.
   --
   -- If you don't want to see the exceptions at all, just set
   -- 'handler' to 'squelch', which simply discards the exceptions.
   --
-  -- Conceivably you could rig up an elaborate mechanism that puts the
-  -- 'Oopsie's into a "Pipes.Concurrent" mailbox or something.
+  -- Conceivably you could rig up an elaborate mechanism that puts
+  -- the 'Oopsie's into a "Pipes.Concurrent" mailbox or something.
+  -- Indeed, when using 'defaultHandler' each thread will print its
+  -- warnings to standard error at any time.  If you are using
+  -- multiple processes and each prints warnings at the same time,
+  -- total gibberish can result as the text gets mixed in.  You
+  -- could solve this by putting the errors into a
+  -- "Pipes.Concurrent" mailbox and having a single thread print the
+  -- errors; building this sort of functionality directly in to the
+  -- library would clutter up the API somewhat so I have been
+  -- reluctant to do it.
   }
 
 -- | Do not show or do anything with exceptions; useful to use as a
@@ -270,38 +280,37 @@ convertCreateProcess inp out err a = Process.CreateProcess
   where
     conv = convertNonPipe
 
--- * Environment
+-- * ErrSpec
 
--- | A common environment for many functions.  Contains just the
--- necessary subset from 'CreateProcess'.
-data Env = Env
-  { envErrorHandler :: Oopsie -> IO ()
-  , envCmdSpec :: CmdSpec
+-- | Contains data necessary to deal with exceptions.
+data ErrSpec = ErrSpec
+  { esErrorHandler :: Oopsie -> IO ()
+  , esCmdSpec :: CmdSpec
   }
 
-envFromCreateProcess
+makeErrSpec
   :: CreateProcess
-  -> Env
-envFromCreateProcess cp = Env
-  { envErrorHandler = handler cp
-  , envCmdSpec = cmdspec cp
+  -> ErrSpec
+makeErrSpec cp = ErrSpec
+  { esErrorHandler = handler cp
+  , esCmdSpec = cmdspec cp
   }
 
 
 -- * Exception handling
 
 -- | Sends an exception using the exception handler specified in the
--- 'Env'.
+-- 'ErrSpec'.
 handleException
   :: MonadIO m
   => Maybe HandleOopsie
   -> IOException
-  -> Env
+  -> ErrSpec
   -> m ()
 handleException mayOops exc ev = liftIO $ sender oops
   where
-    spec = envCmdSpec ev
-    sender = envErrorHandler ev
+    spec = esCmdSpec ev
+    sender = esErrorHandler ev
     oops = Oopsie mayOops spec exc
 
 
@@ -309,15 +318,15 @@ handleException mayOops exc ev = liftIO $ sender oops
 handleErrors
   :: (MonadCatch m, MonadIO m)
   => Maybe HandleOopsie
-  -> Env
+  -> ErrSpec
   -> m ()
   -> m ()
 handleErrors mayHandleOops ev act = catch act catcher
   where
     catcher e = liftIO $ hndlr oops
       where
-        spec = envCmdSpec ev
-        hndlr = envErrorHandler ev
+        spec = esCmdSpec ev
+        hndlr = esErrorHandler ev
         oops = Oopsie mayHandleOops spec e
 
 
@@ -326,7 +335,7 @@ closeHandleNoThrow
   :: (MonadCatch m, MonadIO m)
   => Handle
   -> HandleDesc
-  -> Env
+  -> ErrSpec
   -> m ()
 closeHandleNoThrow hand desc ev = handleErrors (Just (HandleOopsie Closing desc))
   ev (liftIO $ hClose hand)
@@ -335,7 +344,7 @@ closeHandleNoThrow hand desc ev = handleErrors (Just (HandleOopsie Closing desc)
 terminateProcess
   :: (MonadCatch m, MonadIO m)
   => Process.ProcessHandle
-  -> Env
+  -> ErrSpec
   -> m ()
 terminateProcess han ev = do
   _ <- handleErrors Nothing ev (liftIO (Process.terminateProcess han))
@@ -464,14 +473,14 @@ produceFromHandle
   :: (MonadSafe m, MonadCatch (Base m))
   => HandleDesc
   -> Handle
-  -> Env
+  -> ErrSpec
   -> Producer ByteString m ()
 produceFromHandle hDesc h ev = runProducer ev h hDesc
 
 
 runProducer
   :: (MonadSafe m, MonadCatch (Base m))
-  => Env
+  => ErrSpec
   -> Handle
   -> HandleDesc
   -> Producer ByteString m ()
@@ -495,7 +504,7 @@ runProducer ev h desc = do
 consumeToHandle
   :: (MonadSafe m, MonadCatch (Base m))
   => Handle
-  -> Env
+  -> ErrSpec
   -> Consumer ByteString m ()
 consumeToHandle h ev = runConsumer ev h
 
@@ -504,7 +513,7 @@ consumeToHandle h ev = runConsumer ev h
 -- consumption finishes.
 runConsumer
   :: (MonadSafe m, MonadCatch (Base m))
-  => Env
+  => ErrSpec
   -> Handle
   -> Consumer ByteString m ()
 runConsumer ev h = do
@@ -525,7 +534,7 @@ backgroundSendToProcess
   :: MonadSafe m
   => Handle
   -> Producer ByteString (SafeT IO) ()
-  -> Env
+  -> ErrSpec
   -> m ()
 backgroundSendToProcess han prod ev = background act >> return ()
   where
@@ -540,7 +549,7 @@ backgroundReceiveFromProcess
   => HandleDesc
   -> Handle
   -> Consumer ByteString (SafeT IO) ()
-  -> Env
+  -> ErrSpec
   -> m ()
 backgroundReceiveFromProcess desc han csmr ev = background act >> return ()
   where
@@ -570,7 +579,7 @@ processPump toStdinMbox = go
 runInputHandle
   :: MonadSafe mi
   => Handle
-  -> Env
+  -> ErrSpec
   -> Consumer ByteString mi ()
 runInputHandle inp ev = do
   (PC.Output toStdinMbox, fromStdinMbox) <- liftIO newMailboxToProcess
@@ -602,7 +611,7 @@ runOutputHandle
   :: MonadSafe mo
   => HandleDesc
   -> Handle
-  -> Env
+  -> ErrSpec
   -> Producer ByteString mo ()
 runOutputHandle desc out ev = do
   (toStdoutMbox, PC.Input fromStdoutMbox) <- liftIO newMailboxFromProcess
@@ -618,7 +627,7 @@ runOutputHandle desc out ev = do
 createProcess
   :: (MonadSafe m, MonadCatch (Base m))
   => Process.CreateProcess
-  -> Env
+  -> ErrSpec
   -> m (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
 createProcess cp ev = mask $ \restore -> do
   (mayIn, mayOut, mayErr, han) <- liftIO $ Process.createProcess cp
@@ -643,9 +652,9 @@ runCreateProcess
   -> Maybe NonPipe
   -- ^ Standard error
   -> CreateProcess
-  -> m (Maybe Handle, Maybe Handle, Maybe Handle, Env, ProcessHandle)
+  -> m (Maybe Handle, Maybe Handle, Maybe Handle, ErrSpec, ProcessHandle)
 runCreateProcess inp out err cp = do
-  let ev = envFromCreateProcess cp
+  let ev = makeErrSpec cp
   (inp', out', err', phan) <-
       createProcess (convertCreateProcess inp out err cp) ev
   return (inp', out', err', ev, phan)

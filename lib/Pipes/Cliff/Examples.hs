@@ -39,14 +39,15 @@ numsToLess = runSafeT $ do
 
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
--- Perfectly useless, but shows how to build pipelines.
+-- Perfectly useless, but shows how to build pipelines.  Also
+-- squlches warning messages using the 'handler' option.
 
 alphaNumbers :: IO ExitCode
 alphaNumbers = runSafeT $ do
   ((toTr, fromTr), _) <- pipeInputOutput Inherit
-    (procSpec "tr" ["[0-9]", "[a-z]"])
+    (procSpec "tr" ["[0-9]", "[a-z]"]) { handler = squelch }
   (toLess, lessHan) <- pipeInput Inherit Inherit
-    (procSpec "less" [])
+    (procSpec "less" []) { handler = squelch }
   conveyor $ produceNumbers >-> toTr
   conveyor $ fromTr >-> toLess
   waitForProcess lessHan

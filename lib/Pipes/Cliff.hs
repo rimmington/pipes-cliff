@@ -11,7 +11,7 @@
 -- 'pipeInput' or 'pipeInputOutput' to specify what streams you want
 -- to use a 'Proxy' for and what streams you wish to be 'Inherit'ed
 -- or if you want to 'UseHandle'.  You then send or receive
--- information using the returned 'Proxy'.
+-- information using one or more 'Proxy'.
 --
 -- __Use the @-threaded@ GHC option__ when compiling your programs or
 -- when using GHCi.  Internally, this module uses
