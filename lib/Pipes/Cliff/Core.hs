@@ -19,7 +19,6 @@ import qualified Pipes.Concurrent as PC
 import Data.ByteString (ByteString)
 import Control.Concurrent.MVar
 import Control.Concurrent.Async
-import Control.Monad.Trans.Reader
 import System.Exit
 
 -- * Data types
@@ -299,44 +298,50 @@ handleException
   :: MonadIO m
   => Maybe HandleOopsie
   -> IOException
-  -> ReaderT Env m ()
-handleException mayOops exc = do
-  spec <- asks envCmdSpec
-  sender <- asks envErrorHandler
-  let oops = Oopsie mayOops spec exc
-  liftIO $ sender oops
+  -> Env
+  -> m ()
+handleException mayOops exc ev = liftIO $ sender oops
+  where
+    spec = envCmdSpec ev
+    sender = envErrorHandler ev
+    oops = Oopsie mayOops spec exc
+
 
 -- | Run an action, taking all IO errors and sending them to the handler.
 handleErrors
   :: (MonadCatch m, MonadIO m)
   => Maybe HandleOopsie
+  -> Env
   -> m ()
-  -> ReaderT Env m ()
-handleErrors mayHandleOops act = catch act' catcher
+  -> m ()
+handleErrors mayHandleOops ev act = catch act catcher
   where
-    act' = lift act
-    catcher e = do
-      spec <- asks envCmdSpec
-      hndlr <- asks envErrorHandler
-      let oops = Oopsie mayHandleOops spec e
-      liftIO $ hndlr oops
-      return ()
+    catcher e = liftIO $ hndlr oops
+      where
+        spec = envCmdSpec ev
+        hndlr = envErrorHandler ev
+        oops = Oopsie mayHandleOops spec e
 
+
+-- | Close a handle.  Catches any exceptions and passes them to the handler.
 closeHandleNoThrow
   :: (MonadCatch m, MonadIO m)
   => Handle
   -> HandleDesc
-  -> ReaderT Env m ()
-closeHandleNoThrow hand desc = handleErrors (Just (HandleOopsie Closing desc))
-  (liftIO $ hClose hand)
+  -> Env
+  -> m ()
+closeHandleNoThrow hand desc ev = handleErrors (Just (HandleOopsie Closing desc))
+  ev (liftIO $ hClose hand)
 
+-- | Terminates a process; sends any IO errors to the handler.
 terminateProcess
   :: (MonadCatch m, MonadIO m)
   => Process.ProcessHandle
-  -> ReaderT Env m ()
-terminateProcess han = do
-  _ <- handleErrors Nothing (liftIO (Process.terminateProcess han))
-  handleErrors Nothing . liftIO $ do
+  -> Env
+  -> m ()
+terminateProcess han ev = do
+  _ <- handleErrors Nothing ev (liftIO (Process.terminateProcess han))
+  handleErrors Nothing ev . liftIO $ do
     _ <- Process.waitForProcess han
     return ()
 
@@ -464,10 +469,9 @@ produceFromHandle
   :: (MonadSafe m, MonadCatch (Base m))
   => HandleDesc
   -> Handle
-  -> Reader Env (Producer ByteString m ())
-produceFromHandle hDesc h = fmap f ask
-  where
-    f ev = runProducer ev h hDesc
+  -> Env
+  -> Producer ByteString m ()
+produceFromHandle hDesc h ev = runProducer ev h hDesc
 
 
 runProducer
@@ -477,8 +481,8 @@ runProducer
   -> HandleDesc
   -> Producer ByteString m ()
 runProducer ev h desc = do
-  _ <- register (runReaderT (closeHandleNoThrow h desc) ev)
-  let hndlr e = lift (runReaderT (handleException (Just oops) e) ev)
+  _ <- register (closeHandleNoThrow h desc ev)
+  let hndlr e = lift $ handleException (Just oops) e ev
       oops = HandleOopsie Reading desc
       produce = liftIO (BS.hGetSome h bufSize) >>= go
       go bs
@@ -496,10 +500,9 @@ runProducer ev h desc = do
 consumeToHandle
   :: (MonadSafe m, MonadCatch (Base m))
   => Handle
-  -> Reader Env (Consumer ByteString m ())
-consumeToHandle h = fmap f ask
-  where
-    f ev = runConsumer ev h
+  -> Env
+  -> Consumer ByteString m ()
+consumeToHandle h ev = runConsumer ev h
 
 
 -- | Runs a 'Consumer'; registers the handle so that it is closed when
@@ -510,8 +513,8 @@ runConsumer
   -> Handle
   -> Consumer ByteString m ()
 runConsumer ev h = do
-  _ <- register (runReaderT (closeHandleNoThrow h Input) ev)
-  let hndlr e = lift (runReaderT (handleException (Just oops) e) ev)
+  _ <- register $ closeHandleNoThrow h Input ev
+  let hndlr e = lift $ handleException (Just oops) e ev
       oops = HandleOopsie Writing Input
       go = do
         bs <- await
@@ -527,13 +530,12 @@ backgroundSendToProcess
   :: MonadSafe m
   => Handle
   -> Producer ByteString (SafeT IO) ()
-  -> ReaderT Env m ()
-backgroundSendToProcess han prod = do
-  ev <- ask
-  let csmr = runReader (consumeToHandle han) ev
-      act = runSafeT . runEffect $ prod >-> csmr
-  _ <- lift $ background act
-  return ()
+  -> Env
+  -> m ()
+backgroundSendToProcess han prod ev = background act >> return ()
+  where
+    csmr = consumeToHandle han ev
+    act = runSafeT . runEffect $ prod >-> csmr
 
 -- | Creates a background thread that will produce from the given
 -- Handle into the given Consumer.  Takes possession of the Handle and
@@ -543,13 +545,12 @@ backgroundReceiveFromProcess
   => HandleDesc
   -> Handle
   -> Consumer ByteString (SafeT IO) ()
-  -> ReaderT Env m ()
-backgroundReceiveFromProcess desc han csmr = do
-  ev <- ask
-  let prod = runReader (produceFromHandle desc han) ev
-      act = runSafeT . runEffect $ prod >-> csmr
-  _ <- lift $ background act
-  return ()
+  -> Env
+  -> m ()
+backgroundReceiveFromProcess desc han csmr ev = background act >> return ()
+  where
+    prod = produceFromHandle desc han ev
+    act = runSafeT . runEffect $ prod >-> csmr
 
 -- | Creates a 'Consumer' that will pump what it consumes to the
 -- appropriate mailbox.  Does not seal the mailbox; if the mailbox is
@@ -578,7 +579,7 @@ runInputHandle
   -> Consumer ByteString mi ()
 runInputHandle inp ev = do
   (PC.Output toStdinMbox, fromStdinMbox) <- liftIO newMailboxToProcess
-  runReaderT (backgroundSendToProcess inp fromStdinMbox) ev
+  backgroundSendToProcess inp fromStdinMbox ev
   processPump toStdinMbox
 
 -- | Creates a 'Producer' that will pump from the given input source.
@@ -610,7 +611,7 @@ runOutputHandle
   -> Producer ByteString mo ()
 runOutputHandle desc out ev = do
   (toStdoutMbox, PC.Input fromStdoutMbox) <- liftIO newMailboxFromProcess
-  runReaderT (backgroundReceiveFromProcess desc out toStdoutMbox) ev
+  backgroundReceiveFromProcess desc out toStdoutMbox ev
   processPuller fromStdoutMbox
 
 
@@ -622,18 +623,17 @@ runOutputHandle desc out ev = do
 createProcess
   :: (MonadSafe m, MonadCatch (Base m))
   => Process.CreateProcess
-  -> ReaderT Env m (Maybe Handle, Maybe Handle, Maybe Handle)
-createProcess cp = mask $ \restore -> do
+  -> Env
+  -> m (Maybe Handle, Maybe Handle, Maybe Handle)
+createProcess cp ev = mask $ \restore -> do
   (mayIn, mayOut, mayErr, han) <- liftIO $ Process.createProcess cp
-  ev <- ask
   let close mayHan desc = maybe (return ())
-        (\h -> runReaderT (closeHandleNoThrow h desc) ev) mayHan
+        (\h -> closeHandleNoThrow h desc ev) mayHan
   _ <- register (close mayIn Input)
   _ <- register (close mayOut Output)
   _ <- register (close mayErr Error)
-  _ <- register (runReaderT (terminateProcess han) ev)
-  mayHanVar <- asks envProcessHandle
-  case mayHanVar of
+  _ <- register (terminateProcess han ev)
+  case envProcessHandle ev of
     Nothing -> return ()
     Just hanVar -> liftIO $ putMVar hanVar han
   restore $ return (mayIn, mayOut, mayErr)
@@ -654,8 +654,8 @@ runCreateProcess
   -> m (Maybe Handle, Maybe Handle, Maybe Handle, Env)
 runCreateProcess inp out err cp = do
   let ev = envFromCreateProcess cp
-  (inp', out', err') <- runReaderT
-      (createProcess (convertCreateProcess inp out err cp)) ev
+  (inp', out', err') <-
+      createProcess (convertCreateProcess inp out err cp) ev
   return (inp', out', err', ev)
 
 -- * Creating Proxy
@@ -671,11 +671,10 @@ pipeNone
   -- ^ Standard error
   -> CreateProcess
   -> m ()
-pipeNone inp out err cp = flip runReaderT (envFromCreateProcess cp) $ do
-  _ <- createProcess
-    (convertCreateProcess (Just inp) (Just out) (Just err) cp)
-  return ()
-
+pipeNone inp out err cp =
+  runCreateProcess (Just inp) (Just out) (Just err) cp
+  >> return ()
+  
 -- | Create a 'Consumer' for standard input.
 pipeInput
   :: (MonadSafe m, MonadCatch (Base m))
