@@ -276,7 +276,6 @@ convertCreateProcess inp out err a = Process.CreateProcess
 -- necessary subset from 'CreateProcess'.
 data Env = Env
   { envErrorHandler :: Oopsie -> IO ()
-  , envProcessHandle :: Maybe (MVar ProcessHandle)
   , envCmdSpec :: CmdSpec
   }
 
@@ -624,7 +623,7 @@ createProcess
   :: (MonadSafe m, MonadCatch (Base m))
   => Process.CreateProcess
   -> Env
-  -> m (Maybe Handle, Maybe Handle, Maybe Handle)
+  -> m (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
 createProcess cp ev = mask $ \restore -> do
   (mayIn, mayOut, mayErr, han) <- liftIO $ Process.createProcess cp
   let close mayHan desc = maybe (return ())
@@ -633,10 +632,7 @@ createProcess cp ev = mask $ \restore -> do
   _ <- register (close mayOut Output)
   _ <- register (close mayErr Error)
   _ <- register (terminateProcess han ev)
-  case envProcessHandle ev of
-    Nothing -> return ()
-    Just hanVar -> liftIO $ putMVar hanVar han
-  restore $ return (mayIn, mayOut, mayErr)
+  restore $ return (mayIn, mayOut, mayErr, han)
 
 
 -- | Convenience wrapper for 'createProcess'.  The subprocess is
@@ -651,12 +647,12 @@ runCreateProcess
   -> Maybe NonPipe
   -- ^ Standard error
   -> CreateProcess
-  -> m (Maybe Handle, Maybe Handle, Maybe Handle, Env)
+  -> m (Maybe Handle, Maybe Handle, Maybe Handle, Env, ProcessHandle)
 runCreateProcess inp out err cp = do
   let ev = envFromCreateProcess cp
-  (inp', out', err') <-
+  (inp', out', err', phan) <-
       createProcess (convertCreateProcess inp out err cp) ev
-  return (inp', out', err', ev)
+  return (inp', out', err', ev, phan)
 
 -- * Creating Proxy
 
@@ -670,24 +666,26 @@ pipeNone
   -> NonPipe
   -- ^ Standard error
   -> CreateProcess
-  -> m ()
-pipeNone inp out err cp =
-  runCreateProcess (Just inp) (Just out) (Just err) cp
-  >> return ()
-  
+  -> m ProcessHandle
+pipeNone inp out err cp = do
+  (_, _, _, _, phan) <-
+    runCreateProcess (Just inp) (Just out) (Just err) cp
+  return phan
+
+
 -- | Create a 'Consumer' for standard input.
 pipeInput
-  :: (MonadSafe m, MonadCatch (Base m))
+  :: (MonadSafe mi, MonadSafe m, MonadCatch (Base m))
   => NonPipe
   -- ^ Standard output
   -> NonPipe
   -- ^ Standard error
   -> CreateProcess
-  -> Consumer ByteString m ()
-  -- ^ A 'Consumer' for standard input
+  -> m (Consumer ByteString m (), ProcessHandle)
+  -- ^ A 'Consumer' for standard input, and the 'ProcessHandle'
 pipeInput out err cp = do
-  (Just inp, _, _, ev) <- runCreateProcess Nothing (Just out) (Just err) cp
-  runInputHandle inp ev
+  (Just inp, _, _, ev, phan) <- runCreateProcess Nothing (Just out) (Just err) cp
+  return (runInputHandle inp ev, phan)
 
 
 -- | Create a 'Producer' for standard output.
