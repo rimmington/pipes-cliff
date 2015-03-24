@@ -381,8 +381,8 @@ background act = acquire (liftIO $ async act) (liftIO . cancel)
 -- | Runs in the background an effect, typically one that is moving
 -- data from one process to another.  For examples of its usage, see
 -- "Pipes.Cliff.Examples".  The associated thread is killed when the
--- 'SafeT' computation completes.
-conveyor :: Effect (SafeT IO) () -> SafeT IO ()
+-- 'MonadSafe' computation completes.
+conveyor :: MonadSafe m => Effect (SafeT IO) () -> m ()
 conveyor efct
   = (background . liftIO . runSafeT . runEffect $ efct) >> return ()
 
@@ -460,7 +460,7 @@ produceFromHandle hDesc h ev = do
       go bs
         | BS.null bs = return ()
         | otherwise = yield bs >> produce
-  produce `catch` (\e -> hndlr e >> return ())
+  produce `catch` hndlr
   
 
 -- | Runs a 'Consumer'; registers the handle so that it is closed
@@ -480,7 +480,7 @@ consumeToHandle h ev = do
         bs <- await
         liftIO $ BS.hPut h bs
         go
-  go `catch` (\e -> hndlr e >> return ())
+  go `catch` hndlr
 
 
 -- | Creates a background thread that will consume to the given Handle

@@ -143,7 +143,7 @@ using the streams before leaving the 'MonadSafe' computation, you
 will want to use 'waitForProcess' for one or more processes that you
 are most interested in.
 
-Every function in this section (except for the 'pipesNone' function)
+Every function in this section (except for the 'pipeNone' function)
 returns a value of type @(a, h)@, where @a@ is the set of 'Proxy',
 and @h@ is the 'ProcessHandle'; that means the functions that return
 multiple 'Proxy' have a nested return type.  That allows you to use
