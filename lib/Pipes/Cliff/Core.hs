@@ -17,7 +17,6 @@ import Pipes.Safe
 import qualified Data.ByteString as BS
 import qualified Pipes.Concurrent as PC
 import Data.ByteString (ByteString)
-import Control.Concurrent.MVar
 import Control.Concurrent.Async
 import System.Exit
 
@@ -168,22 +167,6 @@ data CreateProcess = CreateProcess
   -- ^ See 'System.Process.delegate_ctlc' in the "System.Process"
   -- module for details.
 
-  , storeProcessHandle :: Maybe (MVar Process.ProcessHandle)
-  -- ^ To get the 'ProcessHandle' that results after starting the
-  -- process, put a @Just@ here, with the 'MVar' in which you would
-  -- like the 'ProcessHandle' to be stored.  The various functions
-  -- that create a subprocess will store the process handle here
-  -- shortly after the process is created.  You can then use
-  -- 'waitForProcess' on the 'ProcessHandle', or you might want to use
-  -- 'terminateProcess' on it.
-  --
-  -- Be sure you don't use 'takeMVar' until you have run the 'Effect'
-  -- that creates the relevant process; otherwise your program will
-  -- deadlock.
-  --
-  -- If you don't care about the process handle, just leave this set
-  -- at 'Nothing'.
-
   , handler :: Oopsie -> IO ()
   -- ^ Whenever an IO exception arises during the course of various
   -- IO actios, the exception is caught and placed into an 'Oopsie'
@@ -256,7 +239,6 @@ procSpec prog args = CreateProcess
   , close_fds = False
   , create_group = False
   , delegate_ctlc = False
-  , storeProcessHandle = Nothing
   , handler = defaultHandler
   }
 
