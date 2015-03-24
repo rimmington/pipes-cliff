@@ -109,17 +109,15 @@ standardOutputAndError = runSafeT $ do
 -- uses 'waitForProcess' to wait until @cat@ is done.  If you ran both
 -- pipelines in the background but did not use 'waitForProcess', the
 -- pipeline would terminate immediately.
-limitedAlphaNumbers :: IO ExitCode
+limitedAlphaNumbers :: IO ()
 limitedAlphaNumbers = runSafeT $ do
   (toTr, fromTr) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  catHanMVar <- liftIO newEmptyMVar
   let toCat = pipeInput Inherit Inherit
-              (procSpec "cat" []) { storeProcessHandle = Just catHanMVar }
-  conveyor $ ((produceNumbers >-> P.take 300 >-> toTr) >> liftIO (putStrLn "done conveying"))
-  conveyor $ ((fromTr >-> toCat) >> liftIO (putStrLn "done conveying again"))
-  han <- liftIO $ takeMVar catHanMVar
-  liftIO $ waitForProcess han
+              (procSpec "cat" [])
+  conveyor $ produceNumbers >-> P.take 300 >-> toTr
+  runEffect $ fromTr >-> toCat
+  -- liftIO $ waitForProcess han
 
 -- | Produces a finite list of numbers, sends it to @tr@ for some
 -- mangling, and then puts the results into a 'BS8.ByteString' for

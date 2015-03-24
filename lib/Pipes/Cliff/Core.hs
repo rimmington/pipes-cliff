@@ -414,12 +414,10 @@ messageBuffer = PC.bounded 1
 -- reason, it also seals the mailbox, so the 'PC.Output' will not
 -- accept any new values.
 newMailboxToProcess
-  :: (MonadSafe m, MonadSafe mo)
+  :: (MonadIO m, MonadSafe mo)
   => m (PC.Output a, Producer a mo ())
 newMailboxToProcess = do
-  let destroy (_, _, seal) = liftIO $ PC.atomically seal
-  (sndr, PC.Input rcvr, seal) <-
-    acquire (liftIO $ PC.spawn' messageBuffer) destroy
+  (sndr, PC.Input rcvr, seal) <- liftIO $ PC.spawn' messageBuffer
   let prod = do
         _ <- register (liftIO $ PC.atomically seal)
         go
@@ -436,12 +434,10 @@ newMailboxToProcess = do
 -- shuts down for any reason, it also seals the mailbox, so the
 -- 'PC.Input' will not accept any new values.
 newMailboxFromProcess
-  :: (MonadSafe m, MonadSafe mi)
+  :: (MonadIO m, MonadSafe mi)
   => m (Consumer a mi (), PC.Input a)
 newMailboxFromProcess = do
-  let destroy (_, _, seal) = liftIO $ PC.atomically seal
-  (PC.Output sndr, rcvr, seal) <-
-    acquire (liftIO $ PC.spawn' messageBuffer) destroy
+  (PC.Output sndr, rcvr, seal) <- liftIO $ PC.spawn' messageBuffer
   let csmr = do
         _ <- register (liftIO $ PC.atomically seal)
         go
@@ -465,23 +461,31 @@ bufSize = 1024
 -- when the 'Handle' is closed, they are caught and passed to the
 -- handler.
 produceFromHandle
-  :: MonadSafe m
+  :: (MonadSafe m, MonadCatch (Base m))
   => HandleDesc
   -> Handle
   -> Reader Env (Producer ByteString m ())
 produceFromHandle hDesc h = fmap f ask
   where
-    f ev = catch produce hndlr
-      where
-        closeHan = runReaderT (closeHandleNoThrow h hDesc) ev
-        produce = liftIO (BS.hGetSome h bufSize) >>= go
-        go bs
-            | BS.null bs = closeHan
-            | otherwise = yield bs >> produce
-        hndlr e = do
-          closeHan
-          lift (runReaderT (handleException oops e) ev)
-    oops = Just (HandleOopsie Reading hDesc)
+    f ev = runProducer ev h hDesc
+
+
+runProducer
+  :: (MonadSafe m, MonadCatch (Base m))
+  => Env
+  -> Handle
+  -> HandleDesc
+  -> Producer ByteString m ()
+runProducer ev h desc = do
+  _ <- register (runReaderT (closeHandleNoThrow h desc) ev)
+  let hndlr e = lift (runReaderT (handleException (Just oops) e) ev)
+      oops = HandleOopsie Reading desc
+      produce = liftIO (BS.hGetSome h bufSize) >>= go
+      go bs
+        | BS.null bs = return ()
+        | otherwise = yield bs >> produce
+  produce `catch` (\e -> hndlr e >> return ())
+  
 
 
 -- | Create a 'Consumer' that consumes from a 'Handle'.  Takes
@@ -489,38 +493,33 @@ produceFromHandle hDesc h = fmap f ask
 -- terminates.  If any IO errors arise either during consumption or
 -- when the 'Handle' is closed, they are caught and passed to the
 -- handler.
---
--- BROKEN will not close immediately; replace catch with finally?
 consumeToHandle
   :: (MonadSafe m, MonadCatch (Base m))
   => Handle
   -> Reader Env (Consumer ByteString m ())
 consumeToHandle h = fmap f ask
   where
-    f ev = runConsumer `catch` hndlr
-      where
-        hndlr e = do
-          closeHan
-          lift (runReaderT (handleException oops e) ev)
-        oops = Just (HandleOopsie Writing Input)
-        closeHan = runReaderT (closeHandleNoThrow h Input) ev
-        runConsumer = do
-          _ <- register closeHan
-          let consume = do
-                bs <- await
-                liftIO $ BS.hPut h bs
-                consume
-          consume
-      
-        
+    f ev = runConsumer ev h
 
-{-
-        closeHan = 
-        consume = do
-          bs <- await
-          liftIO $ BS.hPut h bs
-          consume
--}
+
+-- | Runs a 'Consumer'; registers the handle so that it is closed when
+-- consumption finishes.
+runConsumer
+  :: (MonadSafe m, MonadCatch (Base m))
+  => Env
+  -> Handle
+  -> Consumer ByteString m ()
+runConsumer ev h = do
+  _ <- register (runReaderT (closeHandleNoThrow h Input) ev)
+  let hndlr e = lift (runReaderT (handleException (Just oops) e) ev)
+      oops = HandleOopsie Writing Input
+      go = do
+        bs <- await
+        liftIO $ BS.hPut h bs
+        go
+  go `catch` (\e -> hndlr e >> return ())
+
+
 -- | Creates a background thread that will consume to the given Handle
 -- from the given Producer.  Takes ownership of the 'Handle' and
 -- closes it when done.
@@ -578,7 +577,7 @@ runInputHandle
   -> Env
   -> Consumer ByteString mi ()
 runInputHandle inp ev = do
-  (PC.Output toStdinMbox, fromStdinMbox) <- newMailboxToProcess
+  (PC.Output toStdinMbox, fromStdinMbox) <- liftIO newMailboxToProcess
   runReaderT (backgroundSendToProcess inp fromStdinMbox) ev
   processPump toStdinMbox
 
@@ -610,7 +609,7 @@ runOutputHandle
   -> Env
   -> Producer ByteString mo ()
 runOutputHandle desc out ev = do
-  (toStdoutMbox, PC.Input fromStdoutMbox) <- newMailboxFromProcess
+  (toStdoutMbox, PC.Input fromStdoutMbox) <- liftIO newMailboxFromProcess
   runReaderT (backgroundReceiveFromProcess desc out toStdoutMbox) ev
   processPuller fromStdoutMbox
 
