@@ -5,7 +5,7 @@ import Cartel
 props :: Properties
 props = blank
   { name = "pipes-cliff"
-  , version = [0,4,0,0]
+  , version = [0,6,0,0]
   , cabalVersion = Just (1, 16)
   , buildType = Just simple
   , license = Just bsd3
@@ -114,7 +114,7 @@ pipesSafe :: Package
 pipesSafe = closedOpen "pipes-safe" [2,2] [2,3]
 
 pipesConcurrency :: Package
-pipesConcurrency = closedOpen "pipes-concurrency" [2,0] [2,1]
+pipesConcurrency = closedOpen "pipes-concurrency" [2,0,3] [2,1]
 
 bytestring :: Package
 bytestring = closedOpen "bytestring" [0,10,4] [0,11]
@@ -124,6 +124,10 @@ process = closedOpen "process" [1,2,0,0] [1,3]
 
 async :: Package
 async = closedOpen "async" [2,0] [2,1]
+
+-- | Currently unused
+transformers :: Package
+transformers = closedOpen "transformers" [0,3] [0,5]
 
 libDeps :: HasBuildInfo a => a
 libDeps = buildDepends
