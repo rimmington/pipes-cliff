@@ -141,7 +141,7 @@ convertNonPipe a = case a of
 -- this gives the necessary information to create a subprocess.  All
 -- but one of these fields is also present in
 -- 'System.Process.CreateProcess', and they all have the same meaning;
--- the only field that is different is the 'quiet' field.
+-- the only field that is different is the 'handler' field.
 data CreateProcess = CreateProcess
   { cmdspec :: CmdSpec
     -- ^ Executable and arguments, or shell command
