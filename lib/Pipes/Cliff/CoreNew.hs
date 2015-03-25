@@ -524,21 +524,23 @@ decrementUsers :: MonadIO m => MVar (Either a ProcSpec) -> m ProcSpec
 decrementUsers mv = do
   ei <- liftIO $ takeMVar mv
   case ei of
-    Left _ -> error "decrementUsers: MVar empty"
+    Left _ -> error "decrementUsers: MVar not properly initialized"
     Right ps -> do
       let ps' = ps { psUsers = pred (psUsers ps) }
       liftIO $ putMVar mv (Right ps')
       return ps'
 
-decrementAndDestroy
+-- | Decrements the number of users.  If there are no users left,
+-- also waits on the process.
+decrementAndWaitIfLast
   :: (MonadCatch m, MonadIO m)
   => MVar (Either a ProcSpec)
   -> m ()
-decrementAndDestroy mv = decrementUsers mv >>= f
+decrementAndWaitIfLast mv = decrementUsers mv >>= f
   where
     f ps'
       | users == 0 = handleErrors Nothing (psErrSpec ps')
-          (terminateProcess (psHandle ps') (psErrSpec ps'))
+          (Process.waitForProcess (psHandle ps') >> return ())
       | otherwise = return ()
       where
         users = psUsers ps'
@@ -555,7 +557,6 @@ runInputHandle
   -> Consumer ByteString m Done
 runInputHandle mvar = mask $ \restore -> do
   ps <- getProcSpec mvar
-  _ <- register (decrementAndDestroy mvar)
   let han = case psIn ps of
         Just h -> h
         Nothing -> error "runInputHandle: handle not found"
