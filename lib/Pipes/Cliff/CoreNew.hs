@@ -285,6 +285,38 @@ makeErrSpec cp = ErrSpec
   , esCmdSpec = cmdspec cp
   }
 
+-- * ProcSpec
+
+data ProcSpec = ProcSpec
+  { psIn :: Maybe Handle
+  , psOut :: Maybe Handle
+  , psErr :: Maybe Handle
+  , psErrSpec :: ErrSpec
+  , psHandle :: ProcessHandle
+  , psUsers :: Int
+  }
+
+-- | Decrements the number of users.  If there are no users left,
+-- also waits on the process.
+decrementAndWaitIfLast
+  :: (MonadCatch m, MonadIO m)
+  => MVar (Either a ProcSpec)
+  -> m ()
+decrementAndWaitIfLast mv = decrement >>= f
+  where
+    decrement = do
+      ei <- liftIO $ takeMVar mv
+      let ps' = case ei of
+            Left _ -> error "decrementAndWaitIfLast: MVar not initialized"
+            Right g -> g { psUsers = psUsers g - 1 }
+      liftIO $ putMVar mv (Right ps')
+      return ps'
+    f ps'
+      | psUsers ps' == 0 = handleErrors Nothing (psErrSpec ps')
+          (liftIO $ Process.waitForProcess (psHandle ps') >> return ())
+      | otherwise = return ()
+
+
 
 -- * Exception handling
 
@@ -475,6 +507,11 @@ getProcSpec mvAct mvSpec = mask_ $ do
           liftIO $ putMVar mvSpec (Right g)
           return g
 
+-- The finalizers in consumeToHandle are 'register'ed in a
+-- particular order.  Currently SafeT will call these finalizers on
+-- a LIFO basis; this implementation depends on that behavior.  That
+-- way the handle is closed before the process is waited on.
+
 consumeToHandle
   :: (MonadSafe m, MonadCatch (Base m))
   => MVar (IO ProcSpec)
@@ -521,36 +558,6 @@ backgroundReceiveFromProcess desc han csmr ev = background act >> return ()
   where
     prod = produceFromHandle desc han ev
     act = runSafeT . runEffect $ prod >-> csmr
-
-data ProcSpec = ProcSpec
-  { psIn :: Maybe Handle
-  , psOut :: Maybe Handle
-  , psErr :: Maybe Handle
-  , psErrSpec :: ErrSpec
-  , psHandle :: ProcessHandle
-  , psUsers :: Int
-  }
-
--- | Decrements the number of users.  If there are no users left,
--- also waits on the process.
-decrementAndWaitIfLast
-  :: (MonadCatch m, MonadIO m)
-  => MVar (Either a ProcSpec)
-  -> m ()
-decrementAndWaitIfLast mv = decrement >>= f
-  where
-    decrement = do
-      ei <- liftIO $ takeMVar mv
-      let ps' = case ei of
-            Left _ -> error "decrementAndWaitIfLast: MVar not initialized"
-            Right g -> g { psUsers = psUsers g - 1 }
-      liftIO $ putMVar mv (Right ps')
-      return ps'
-    f ps'
-      | psUsers ps' == 0 = handleErrors Nothing (psErrSpec ps')
-          (liftIO $ Process.waitForProcess (psHandle ps') >> return ())
-      | otherwise = return ()
-
 
 -- | Does everything necessary to run a 'Handle' that is created to a
 -- process standard input.  Creates mailbox, runs background thread
@@ -612,43 +619,6 @@ runOutputHandle desc mvar = mask $ \restore -> do
 -}
 
 -- * Creating subprocesses
-
-
--- | Creates a subprocess.  Registers destroyers for each handle
--- created, as well as for the ProcessHandle.
-createProcess
-  :: (MonadSafe m, MonadCatch (Base m))
-  => Process.CreateProcess
-  -> ErrSpec
-  -> m (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
-createProcess cp ev = mask $ \restore -> do
-  (mayIn, mayOut, mayErr, han) <- liftIO $ Process.createProcess cp
-  let close mayHan desc = maybe (return ())
-        (\h -> closeHandleNoThrow h desc ev) mayHan
-  _ <- register (close mayIn Input)
-  _ <- register (close mayOut (Outbound Output))
-  _ <- register (close mayErr (Outbound Error))
-  _ <- register (terminateProcess han ev)
-  restore $ return (mayIn, mayOut, mayErr, han)
-
-
--- | Convenience wrapper for 'createProcess'.  The subprocess is
--- terminated and all its handles destroyed when the 'MonadSafe'
--- computation completes.
-runCreateProcess
-  :: Maybe NonPipe
-  -- ^ Standard input
-  -> Maybe NonPipe
-  -- ^ Standard output
-  -> Maybe NonPipe
-  -- ^ Standard error
-  -> CreateProcess
-  -> IO (Maybe Handle, Maybe Handle, Maybe Handle, ErrSpec, ProcessHandle)
-runCreateProcess inp out err cp = do
-  let ev = makeErrSpec cp
-  (inp', out', err', phan) <- Process.createProcess
-    (convertCreateProcess inp out err cp)
-  return (inp', out', err', ev, phan)
 
 createProcSpecMVar
   :: MonadIO m
