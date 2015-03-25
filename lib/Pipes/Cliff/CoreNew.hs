@@ -20,6 +20,7 @@ import Data.ByteString (ByteString)
 import Control.Concurrent.Async
 import Control.Concurrent.MVar
 import System.Exit
+import qualified Control.Exception
 
 -- * Data types
 
@@ -87,7 +88,7 @@ data HandleOopsie = HandleOopsie Activity HandleDesc
 -- 'IOException'; no other exceptions of any kind are caught or
 -- handled.  However, exceptions of any kind will still trigger
 -- appropriate cleanup actions in the 'MonadSafe' computation.
-data Oopsie = Oopsie (Maybe HandleOopsie) CmdSpec IOException
+data Oopsie = Oopsie Activity HandleDesc CmdSpec IOException
   deriving (Eq, Show)
 
 -- | Formats an 'Oopsie' for display.
@@ -96,9 +97,9 @@ renderOopsie
   -- ^ The name of the currently runnning program
   -> Oopsie
   -> String
-renderOopsie pn (Oopsie mayHan cmd ioe) =
+renderOopsie pn (Oopsie act desc cmd ioe) =
   pn ++ ": warning: when running command "
-  ++ renderCommand cmd ++ ": " ++ renderMayHan mayHan
+  ++ renderCommand cmd ++ ": " ++ renderHan
   ++ ": " ++ show ioe
   where
     renderCommand (ShellCommand str) = show str
@@ -106,8 +107,7 @@ renderOopsie pn (Oopsie mayHan cmd ioe) =
       = concat . intersperse " " . map show
       $ fp : ss
 
-    renderMayHan Nothing = "when terminating process"
-    renderMayHan (Just (HandleOopsie act desc)) =
+    renderHan =
       "when " ++ actStr ++ " " ++ descStr
       where
         actStr = case act of
@@ -287,14 +287,38 @@ makeErrSpec cp = ErrSpec
 
 -- * ProcSpec
 
+-- 'psExitCode' is here because you don't want to use
+-- 'Process.waitForProcess' when there is more than one thread that
+-- wants to do the waiting.  There is a comment about this in the
+-- "System.Process" module.  See also
+--
+-- http://ghc.haskell.org/trac/ghc/ticket/9292
 data ProcSpec = ProcSpec
   { psIn :: Maybe Handle
   , psOut :: Maybe Handle
   , psErr :: Maybe Handle
   , psErrSpec :: ErrSpec
   , psHandle :: ProcessHandle
+  , psHandleLock :: MVar ()
+  , psExitCode :: MVar ExitCode
   , psUsers :: Int
   }
+
+waitOnHandle
+  :: (MonadCatch m, MonadIO m)
+  => ProcSpec
+  -> m ExitCode
+waitOnHandle ps = do
+  newLock <- liftIO $ tryPutMVar (psHandleLock ps) ()
+  if newLock
+    then do
+      code <- liftIO
+        ( (Process.waitForProcess (psHandle ps))
+          `Control.Exception.onException` (takeMVar (psHandleLock ps)))
+      liftIO $ putMVar (psExitCode ps) code
+      return code
+    else (liftIO . takeMVar . psExitCode $ ps)
+
 
 -- | Decrements the number of users.  If there are no users left,
 -- also waits on the process.
@@ -312,8 +336,7 @@ decrementAndWaitIfLast mv = decrement >>= f
       liftIO $ putMVar mv (Right ps')
       return ps'
     f ps'
-      | psUsers ps' == 0 = handleErrors Nothing (psErrSpec ps')
-          (liftIO $ Process.waitForProcess (psHandle ps') >> return ())
+      | psUsers ps' == 0 = waitOnHandle ps' >> return ()
       | otherwise = return ()
 
 
@@ -324,31 +347,33 @@ decrementAndWaitIfLast mv = decrement >>= f
 -- 'ErrSpec'.
 handleException
   :: MonadIO m
-  => Maybe HandleOopsie
+  => Activity
+  -> HandleDesc
   -> IOException
   -> ErrSpec
   -> m ()
-handleException mayOops exc ev = liftIO $ sender oops
+handleException act desc exc ev = liftIO $ sender oops
   where
     spec = esCmdSpec ev
     sender = esErrorHandler ev
-    oops = Oopsie mayOops spec exc
+    oops = Oopsie act desc spec exc
 
 
 -- | Run an action, taking all IO errors and sending them to the handler.
 handleErrors
   :: (MonadCatch m, MonadIO m)
-  => Maybe HandleOopsie
+  => Activity
+  -> HandleDesc
   -> ErrSpec
   -> m ()
   -> m ()
-handleErrors mayHandleOops ev act = catch act catcher
+handleErrors activ desc ev act = catch act catcher
   where
     catcher e = liftIO $ hndlr oops
       where
         spec = esCmdSpec ev
         hndlr = esErrorHandler ev
-        oops = Oopsie mayHandleOops spec e
+        oops = Oopsie activ desc spec e
 
 
 -- | Close a handle.  Catches any exceptions and passes them to the handler.
@@ -358,20 +383,8 @@ closeHandleNoThrow
   -> HandleDesc
   -> ErrSpec
   -> m ()
-closeHandleNoThrow hand desc ev = handleErrors (Just (HandleOopsie Closing desc))
+closeHandleNoThrow hand desc ev = handleErrors Closing desc
   ev (liftIO $ hClose hand)
-
--- | Terminates a process; sends any IO errors to the handler.
-terminateProcess
-  :: (MonadCatch m, MonadIO m)
-  => Process.ProcessHandle
-  -> ErrSpec
-  -> m ()
-terminateProcess han ev = do
-  _ <- handleErrors Nothing ev (liftIO (Process.terminateProcess han))
-  handleErrors Nothing ev . liftIO $ do
-    _ <- Process.waitForProcess han
-    return ()
 
 
 -- | Acquires a resource and ensures it will be destroyed when the
@@ -414,11 +427,6 @@ conveyor efct
 -- exception, 'waitForThread' will throw that same exception.
 waitForThread :: MonadIO m => Async a -> m a
 waitForThread = liftIO . wait
-
--- | An overloaded version of the 'Process.waitForProcess' from
--- "System.Process".
-waitForProcess :: MonadIO m => ProcessHandle -> m ExitCode
-waitForProcess h = liftIO $ Process.waitForProcess h
 
 
 -- * Mailboxes
@@ -475,8 +483,7 @@ produceFromHandle
   -> Producer ByteString m ()
 produceFromHandle hDesc h ev = do
   _ <- register (closeHandleNoThrow h hDesc ev)
-  let hndlr e = lift $ handleException (Just oops) e ev
-      oops = HandleOopsie Reading hDesc
+  let hndlr e = lift $ handleException Reading hDesc e ev
       produce = liftIO (BS.hGetSome h bufSize) >>= go
       go bs
         | BS.null bs = return ()
@@ -524,8 +531,7 @@ consumeToHandle mvAct mvSpec = mask $ \restore -> do
         Nothing -> error "consumeToHandle: handle not initialized"
         Just h -> h
   _ <- register (closeHandleNoThrow han Input (psErrSpec spec))
-  let oops = HandleOopsie Writing Input
-      hndlr e = handleException (Just oops) e (psErrSpec spec)
+  let hndlr e = handleException Writing Input e (psErrSpec spec)
       go = do
         bs <- await
         liftIO $ BS.hPut han bs
@@ -635,7 +641,9 @@ createProcSpecMVar nUsers inp out err cp = liftIO $ newMVar act
       let cp' = convertCreateProcess inp out err cp
           es = ErrSpec (handler cp) (cmdspec cp)
       (inp', out', err', ph) <- Process.createProcess cp'
-      return $ ProcSpec inp' out' err' es ph nUsers
+      mvarLock <- liftIO newEmptyMVar
+      mvarEc <- liftIO newEmptyMVar
+      return $ ProcSpec inp' out' err' es ph mvarLock mvarEc nUsers
 
 -- * Creating Proxy
 
