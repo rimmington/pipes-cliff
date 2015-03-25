@@ -486,27 +486,6 @@ bufSize :: Int
 bufSize = 1024
 
 
--- | Create a 'Producer' that produces from a 'Handle'.  Takes
--- ownership of the 'Handle'; closes it when the 'Producer'
--- terminates.  If any IO errors arise either during production or
--- when the 'Handle' is closed, they are caught and passed to the
--- handler.
-produceFromHandle
-  :: (MonadSafe m, MonadCatch (Base m))
-  => HandleDesc
-  -> Handle
-  -> ErrSpec
-  -> Producer ByteString m ()
-produceFromHandle hDesc h ev = do
-  _ <- register (closeHandleNoThrow h hDesc ev)
-  let hndlr e = lift $ handleException Reading hDesc e ev
-      produce = liftIO (BS.hGetSome h bufSize) >>= go
-      go bs
-        | BS.null bs = return ()
-        | otherwise = yield bs >> produce
-  produce `catch` hndlr
-  
-
 getProcSpec
   :: (MonadMask m, MonadIO m)
   => MVar (IO (ProcSpec a))
@@ -554,7 +533,6 @@ consumeToHandle mvAct mvSpec = mask $ \restore -> do
         go
   restore $ go `catch` hndlr
 
-
 asyncSendToProcess
   :: (MonadIO m, MonadCatch (Base m))
   => MVar (IO (ProcSpec a))
@@ -565,20 +543,6 @@ asyncSendToProcess mvAct mvSpec pdcr = do
   let effect = pdcr >-> consumeToHandle mvAct mvSpec
   liftIO . async . runSafeT . runEffect $ effect
 
--- | Creates a background thread that will produce from the given
--- Handle into the given Consumer.  Takes possession of the Handle and
--- closes it when done.
-backgroundReceiveFromProcess
-  :: MonadIO m
-  => HandleDesc
-  -> Handle
-  -> Consumer ByteString (SafeT IO) ()
-  -> ErrSpec
-  -> m (Async ())
-backgroundReceiveFromProcess desc han csmr ev = liftIO $ async act
-  where
-    prod = produceFromHandle desc han ev
-    act = runSafeT . runEffect $ prod >-> csmr
 
 -- | Does everything necessary to run a 'Handle' that is created to a
 -- process standard input.  Creates mailbox, runs background thread
@@ -596,29 +560,63 @@ runInputHandle mvAct mvSpec = mask $ \restore -> do
   _ <- register (liftIO $ cancel sendThread)
   restore $ do
     toMbox
-    eiExcSpec <- liftIO $ readMVar mvSpec
-    ps <- case eiExcSpec of
-      Left e -> throwM e
-      Right spec -> return spec
-    _ <- liftIO $ wait sendThread
-    code <- waitOnHandle ps
-    return $ Done (psIdentifier ps) code
+    finishProxy mvSpec sendThread
 
+finishProxy
+  :: (MonadIO m, MonadThrow m, MonadCatch m)
+  => MVar (Either IOException (ProcSpec a))
+  -> Async ()
+  -> m (Done a)
+finishProxy mvSpec thread = do
+  eiExcSpec <- liftIO $ readMVar mvSpec
+  ps <- case eiExcSpec of
+    Left e -> throwM e
+    Right spec -> return spec
+  _ <- liftIO $ wait thread
+  code <- waitOnHandle ps
+  return $ Done (psIdentifier ps) code
 
-{-
-runInputHandle mvar = mask $ \restore -> do
-  ps <- getProcSpec mvar
-  let han = case psIn ps of
-        Just h -> h
-        Nothing -> error "runInputHandle: handle not found"
-  restore $ do
-    (toMbox, fromMbox) <- newMailbox
-    backgroundSendToProcess mvar han fromMbox (psErrSpec ps)
-    toMbox
-  code <- liftIO . Process.waitForProcess . psHandle $ ps
-  _ <- decrementUsers mvar
-  restore . return $ Done (esCmdSpec . psErrSpec $ ps) code
--}
+-- | Create a 'Producer' that produces from a 'Handle'.  Takes
+-- ownership of the 'Handle'; closes it when the 'Producer'
+-- terminates.  If any IO errors arise either during production or
+-- when the 'Handle' is closed, they are caught and passed to the
+-- handler.
+
+produceFromHandle
+  :: (MonadSafe m, MonadCatch (Base m))
+  => Outbound
+  -> MVar (IO (ProcSpec a))
+  -> MVar (Either IOException (ProcSpec a))
+  -> Producer ByteString m ()
+produceFromHandle outb mvAct mvSpec = mask $ \restore -> do
+  spec <- getProcSpec mvAct mvSpec
+  _ <- register (decrementAndWaitIfLast mvSpec)
+  let han = case outb of
+        Output -> case psOut spec of
+          Nothing -> error "produceFromHandle: stdout not initialized"
+          Just h -> h
+        Error -> case psErr spec of
+          Nothing -> error "produceFromHandle: stderr not initialized"
+          Just h -> h
+  _ <- register (closeHandleNoThrow han (Outbound outb) (psErrSpec spec))
+  let hndlr e = handleException Writing (Outbound outb) e (psErrSpec spec)
+      go bs
+        | BS.null bs = return ()
+        | otherwise = yield bs >> produce
+      produce = liftIO (BS.hGetSome han bufSize) >>= go
+  restore $ produce `catch` hndlr
+
+asyncReceiveFromProcess
+  :: (MonadIO m, MonadCatch (Base m))
+  => Outbound
+  -> MVar (IO (ProcSpec a))
+  -> MVar (Either IOException (ProcSpec a))
+  -> Consumer ByteString (SafeT IO) ()
+  -> m (Async ())
+asyncReceiveFromProcess outb mvAct mvSpec csmr = do
+  let effect = produceFromHandle outb mvAct mvSpec >-> csmr
+  liftIO . async . runSafeT . runEffect $ effect
+
 
 -- | Does everything necessary to run a 'Handle' that is created to a
 -- process standard output or standard error.  Creates mailbox, runs
@@ -631,26 +629,13 @@ runOutputHandle
   -> MVar (IO (ProcSpec a))
   -> MVar (Either IOException (ProcSpec a))
   -> Producer ByteString m (Done a)
-runOutputHandle = undefined
-{-
-runOutputHandle desc mvar = mask $ \restore -> do
-  ps <- getProcSpec mvar
-  let han = case desc of
-        Output -> case psOut ps of
-          Nothing -> error "runOutputHandle: no standard output found"
-          Just h -> h
-        Error -> case psErr ps of
-          Nothing -> error "runOutputHandle: no standard error found"
-          Just h -> h
-        Input -> error "runOutputHandle: bad parameter"
+runOutputHandle outb mvAct mvSpec = mask $ \restore -> do
+  (toMbox, fromMbox) <- newMailbox
+  recvThread <- restore (asyncReceiveFromProcess outb mvAct mvSpec toMbox)
+  _ <- register (liftIO $ cancel recvThread)
   restore $ do
-    (toMbox, fromMbox) <- newMailbox
-    backgroundReceiveFromProcess desc han toMbox (psErrSpec ps)
     fromMbox
-  code <- liftIO . Process.waitForProcess . psHandle $ ps
-  _ <- decrementUsers mvar
-  restore . return $ Done (esCmdSpec . psErrSpec $ ps) code
--}
+    finishProxy mvSpec recvThread
 
 -- * Creating subprocesses
 
