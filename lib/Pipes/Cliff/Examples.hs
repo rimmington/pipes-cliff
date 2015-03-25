@@ -23,6 +23,8 @@ import Pipes.Cliff
 import qualified Pipes.Prelude as P
 import qualified Data.ByteString.Char8 as BS8
 
+{-
+
 -- | Streams an infinite list of numbers to @less@.
 -- The 'Effect' that streams values to the process is run in the
 -- background by using 'conveyor', even though there is only one
@@ -127,4 +129,4 @@ produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
   where
     mkNumStr = flip BS8.snoc '\n' . BS8.pack . show
 
-
+-}
