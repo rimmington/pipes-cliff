@@ -23,7 +23,17 @@ import Pipes.Cliff
 import qualified Pipes.Prelude as P
 import qualified Data.ByteString.Char8 as BS8
 
-{-
+-- | Produces a stream of 'BS8.ByteString', where each
+-- 'BS8.ByteString' is a shown integer.  This is an infinite stream.
+-- In the examples below we'll send this infinite stream off into a
+-- Unix pipeline, a feat that would be very difficult and clumsy
+-- without a framework like @pipes@.
+
+produceNumbers :: Monad m => Producer BS8.ByteString m r
+produceNumbers = go (0 :: Int)
+  where
+    go i = yield ((BS8.pack . show $ i) `BS8.snoc` '\n')
+      >> go (succ i)
 
 -- | Streams an infinite list of numbers to @less@.
 -- The 'Effect' that streams values to the process is run in the
@@ -36,11 +46,11 @@ import qualified Data.ByteString.Char8 as BS8
 -- option.
 
 numsToLess :: IO ExitCode
-numsToLess = runSafeT $ do
-  (toLess, han) <- pipeInput Inherit Inherit (procSpec "less" [])
-  conveyor $ produceNumbers >-> toLess
-  waitForProcess han
+numsToLess = do
+  toLess <- pipeInput Inherit Inherit (procSpec "less" [])
+  tidyEffect $ produceNumbers >-> toLess
 
+{-
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
 -- Perfectly useless, but shows how to build pipelines.  Also
@@ -120,13 +130,5 @@ alphaNumbersByteString = runSafeT $ do
     $ P.fold BS8.append BS8.empty id fromTr
   waitForThread threadHan
 
-
--- | Produces a stream of 'BS8.ByteString', where each
--- 'BS8.ByteString' is a shown integer.
-
-produceNumbers :: Monad m => Producer BS8.ByteString m ()
-produceNumbers = each . fmap mkNumStr $ [(0 :: Int) ..]
-  where
-    mkNumStr = flip BS8.snoc '\n' . BS8.pack . show
 
 -}

@@ -60,7 +60,6 @@ module Pipes.Cliff
 
   -- * Creating processes
   -- $process
-  , pipeNone
   , pipeInput
   , pipeOutput
   , pipeError
@@ -78,21 +77,23 @@ module Pipes.Cliff
 
   , conveyor
   , background
-  , waitForProcess
   , waitForThread
+
+  -- * Running an 'Effect' in 'SafeT'
+
+  , tidyEffect
 
   -- * Errors and warnings
 
   -- | You will only need what's in this section if you want to
   -- examine errors more closely.
   , Activity(..)
+  , Outbound(..)
   , HandleDesc(..)
-  , HandleOopsie(..)
   , Oopsie(..)
 
   -- * Re-exports
   -- $reexports
-  , module Control.Concurrent.MVar
   , module Pipes
   , module Pipes.Safe
   , module System.Exit
@@ -107,7 +108,6 @@ import Pipes
 import Pipes.Safe
 import System.Exit
 import System.Process (ProcessHandle)
-import Control.Concurrent.MVar
 
 {- $process
 
@@ -143,19 +143,13 @@ using the streams before leaving the 'MonadSafe' computation, you
 will want to use 'waitForProcess' for one or more processes that you
 are most interested in.
 
-Every function in this section (except for the 'pipeNone' function)
-returns a value of type @(a, h)@, where @a@ is the set of 'Proxy',
-and @h@ is the 'ProcessHandle'; that means the functions that return
-multiple 'Proxy' have a nested return type.  That allows you to use
-'fst' and 'snd' to pull out the part you are interested in.  It
-would have been more consistent for 'pipeNone' to return
-@((), ProcessHandle)@ but that just seemed silly.
+There is no function that will create a process that has no 'Proxy'
+at all.  For that, just use 'System.Process.createProcess' in
+"System.Process".
 
 -}
 
 {- $reexports
-
-   * "Control.Concurrent.MVar" reexports all bindings
 
    * "Pipes" reexports all bindings
 
