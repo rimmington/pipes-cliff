@@ -44,13 +44,19 @@ data Activity
   | Closing
   deriving (Eq, Ord, Show)
 
+-- | The two kinds of outbound handles.
+data Outbound
+  = Output
+  | Error
+  deriving (Eq, Ord, Show)
+
 -- | Describes a handle.  From the perspective of the subprocess; for
 -- example, 'Input' means that this handle is connected to the
 -- process's standard input.
+
 data HandleDesc
   = Input
-  | Output
-  | Error
+  | Outbound Outbound
   deriving (Eq, Ord, Show)
 
 -- | Describes IO errors tha occur when dealing with a 'Handle'.
@@ -110,8 +116,8 @@ renderOopsie pn (Oopsie mayHan cmd ioe) =
           Closing -> "closing the handle associated with"
         descStr = "standard " ++ case desc of
           Input -> "input"
-          Output -> "output"
-          Error -> "error"
+          Outbound Output -> "output"
+          Outbound Error -> "error"
 
 -- | The default handler when receiving an 'Oopsie'; simply uses
 -- 'renderOopsie' to format it nicely and put it on standard error.
@@ -446,31 +452,12 @@ produceFromHandle hDesc h ev = do
   produce `catch` hndlr
   
 
--- | Runs a 'Consumer'; registers the handle so that it is closed
--- when consumption finishes.  If any IO errors arise either during
--- consumption or when the 'Handle' is closed, they are caught and
--- passed to the handler.
-consumeToHandle
-  :: (MonadSafe m, MonadCatch (Base m))
-  => Handle
-  -> ErrSpec
-  -> Consumer ByteString m ()
-consumeToHandle h ev = do
-  _ <- register $ closeHandleNoThrow h Input ev
-  let hndlr e = lift $ handleException (Just oops) e ev
-      oops = HandleOopsie Writing Input
-      go = do
-        bs <- await
-        liftIO $ BS.hPut h bs
-        go
-  go `catch` hndlr
-
-getProcSpec'
+getProcSpec
   :: (MonadMask m, MonadIO m)
   => MVar (IO ProcSpec)
   -> MVar (Either IOException ProcSpec)
   -> m ProcSpec
-getProcSpec' mvAct mvSpec = mask_ $ do
+getProcSpec mvAct mvSpec = mask_ $ do
   mayAct <- liftIO $ tryTakeMVar mvAct
   case mayAct of
     Nothing -> do
@@ -488,33 +475,37 @@ getProcSpec' mvAct mvSpec = mask_ $ do
           liftIO $ putMVar mvSpec (Right g)
           return g
 
-consumeToHandle'
+consumeToHandle
   :: (MonadSafe m, MonadCatch (Base m))
   => MVar (IO ProcSpec)
   -> MVar (Either IOException ProcSpec)
-  -> (ProcSpec -> Handle)
   -> Consumer ByteString m ()
-consumeToHandle' mvAct mvSpec get = mask $ \restore -> do
-  spec <- getProcSpec' mvAct mvSpec
-  undefined
+consumeToHandle mvAct mvSpec = mask $ \restore -> do
+  spec <- getProcSpec mvAct mvSpec
+  _ <- register (decrementAndWaitIfLast mvSpec)
+  let han = case psIn spec of
+        Nothing -> error "consumeToHandle: handle not initialized"
+        Just h -> h
+  _ <- register (closeHandleNoThrow han Input (psErrSpec spec))
+  let oops = HandleOopsie Writing Input
+      hndlr e = handleException (Just oops) e (psErrSpec spec)
+      go = do
+        bs <- await
+        liftIO $ BS.hPut han bs
+        go
+  restore $ go `catch` hndlr
 
 
-
--- | Creates a background thread that will consume to the given Handle
--- from the given Producer.  Takes ownership of the 'Handle' and
--- closes it when done.
 backgroundSendToProcess
-  :: MonadSafe m
-  => MVar (Either a ProcSpec)
-  -- ^ Decrement this when done sending to the process
-  -> Handle
+  :: (MonadSafe m, MonadCatch (Base m))
+  => MVar (IO ProcSpec)
+  -> MVar (Either IOException ProcSpec)
   -> Producer ByteString (SafeT IO) ()
-  -> ErrSpec
   -> m ()
-backgroundSendToProcess mvar han prod ev = background act >> return ()
-  where
-    csmr = register (decrementAndWaitIfLast mvar) >> consumeToHandle han ev
-    act = runSafeT . runEffect $ prod >-> csmr
+backgroundSendToProcess mvAct mvSpec pdcr = do
+  let effect = pdcr >-> consumeToHandle mvAct mvSpec
+  _ <- background . runSafeT . runEffect $ effect
+  return ()
 
 -- | Creates a background thread that will produce from the given
 -- Handle into the given Consumer.  Takes possession of the Handle and
@@ -540,46 +531,25 @@ data ProcSpec = ProcSpec
   , psUsers :: Int
   }
 
-getProcSpec
-  :: MonadIO m
-  => MVar (Either (IO ProcSpec) ProcSpec)
-  -> m ProcSpec
-getProcSpec mv = do
-  ei <- liftIO $ takeMVar mv
-  case ei of
-    Left act -> do
-      ps <- liftIO act
-      liftIO $ putMVar mv (Right ps)
-      return ps
-    Right ps -> do
-      liftIO $ putMVar mv (Right ps)
-      return ps
-
--- | Decrements the number of users.  Returns the new ProcSpec.
-decrementUsers :: MonadIO m => MVar (Either a ProcSpec) -> m ProcSpec
-decrementUsers mv = do
-  ei <- liftIO $ takeMVar mv
-  case ei of
-    Left _ -> error "decrementUsers: MVar not properly initialized"
-    Right ps -> do
-      let ps' = ps { psUsers = pred (psUsers ps) }
-      liftIO $ putMVar mv (Right ps')
-      return ps'
-
 -- | Decrements the number of users.  If there are no users left,
 -- also waits on the process.
 decrementAndWaitIfLast
   :: (MonadCatch m, MonadIO m)
   => MVar (Either a ProcSpec)
   -> m ()
-decrementAndWaitIfLast mv = decrementUsers mv >>= f
+decrementAndWaitIfLast mv = decrement >>= f
   where
+    decrement = do
+      ei <- liftIO $ takeMVar mv
+      let ps' = case ei of
+            Left _ -> error "decrementAndWaitIfLast: MVar not initialized"
+            Right g -> g { psUsers = psUsers g - 1 }
+      liftIO $ putMVar mv (Right ps')
+      return ps'
     f ps'
-      | users == 0 = handleErrors Nothing (psErrSpec ps')
+      | psUsers ps' == 0 = handleErrors Nothing (psErrSpec ps')
           (liftIO $ Process.waitForProcess (psHandle ps') >> return ())
       | otherwise = return ()
-      where
-        users = psUsers ps'
 
 
 -- | Does everything necessary to run a 'Handle' that is created to a
@@ -589,8 +559,12 @@ decrementAndWaitIfLast mv = decrementUsers mv >>= f
 -- consumes into the mailbox for delivery to the background process.
 runInputHandle
   :: (MonadSafe m, MonadCatch (Base m))
-  => MVar (Either (IO ProcSpec) ProcSpec)
+  => MVar (IO ProcSpec)
+  -> MVar (Either IOException ProcSpec)
   -> Consumer ByteString m Done
+runInputHandle = undefined
+
+{-
 runInputHandle mvar = mask $ \restore -> do
   ps <- getProcSpec mvar
   let han = case psIn ps of
@@ -603,6 +577,7 @@ runInputHandle mvar = mask $ \restore -> do
   code <- liftIO . Process.waitForProcess . psHandle $ ps
   _ <- decrementUsers mvar
   restore . return $ Done (esCmdSpec . psErrSpec $ ps) code
+-}
 
 -- | Does everything necessary to run a 'Handle' that is created to a
 -- process standard output or standard error.  Creates mailbox, runs
@@ -611,9 +586,12 @@ runInputHandle mvar = mask $ \restore -> do
 -- into the mailbox.
 runOutputHandle
   :: (MonadSafe m, MonadCatch (Base m))
-  => HandleDesc
-  -> MVar (Either (IO ProcSpec) ProcSpec)
+  => Outbound
+  -> MVar (IO ProcSpec)
+  -> MVar (Either IOException ProcSpec)
   -> Producer ByteString m Done
+runOutputHandle = undefined
+{-
 runOutputHandle desc mvar = mask $ \restore -> do
   ps <- getProcSpec mvar
   let han = case desc of
@@ -631,7 +609,7 @@ runOutputHandle desc mvar = mask $ \restore -> do
   code <- liftIO . Process.waitForProcess . psHandle $ ps
   _ <- decrementUsers mvar
   restore . return $ Done (esCmdSpec . psErrSpec $ ps) code
-
+-}
 
 -- * Creating subprocesses
 
@@ -648,8 +626,8 @@ createProcess cp ev = mask $ \restore -> do
   let close mayHan desc = maybe (return ())
         (\h -> closeHandleNoThrow h desc ev) mayHan
   _ <- register (close mayIn Input)
-  _ <- register (close mayOut Output)
-  _ <- register (close mayErr Error)
+  _ <- register (close mayOut (Outbound Output))
+  _ <- register (close mayErr (Outbound Error))
   _ <- register (terminateProcess han ev)
   restore $ return (mayIn, mayOut, mayErr, han)
 
@@ -680,8 +658,8 @@ createProcSpecMVar
   -> Maybe NonPipe
   -> Maybe NonPipe
   -> CreateProcess
-  -> m (MVar (Either (IO ProcSpec) a))
-createProcSpecMVar nUsers inp out err cp = liftIO $ newMVar (Left act)
+  -> m (MVar (IO ProcSpec))
+createProcSpecMVar nUsers inp out err cp = liftIO $ newMVar act
   where
     act = do
       let cp' = convertCreateProcess inp out err cp
@@ -707,8 +685,9 @@ pipeInput
   -> m (Consumer ByteString mi Done)
   -- ^ A 'Consumer' for standard input
 pipeInput out err cp = do
-  mvar <- createProcSpecMVar 1 Nothing (Just out) (Just err) cp
-  return $ runInputHandle mvar
+  mvAct <- createProcSpecMVar 1 Nothing (Just out) (Just err) cp
+  mvSpec <- liftIO newEmptyMVar
+  return $ runInputHandle mvAct mvSpec
 
 -- | Create a 'Producer' for standard output.
 pipeOutput
@@ -721,8 +700,9 @@ pipeOutput
   -> m (Producer ByteString mo Done)
   -- ^ A 'Producer' for standard output
 pipeOutput inp err cp = do
-  mvar <- createProcSpecMVar 1 (Just inp) Nothing (Just err) cp
-  return $ runOutputHandle Output mvar
+  mvAct <- createProcSpecMVar 1 (Just inp) Nothing (Just err) cp
+  mvSpec <- liftIO newEmptyMVar
+  return $ runOutputHandle Output mvAct mvSpec
 
 -- | Create a 'Producer' for standard error.
 pipeError
@@ -735,8 +715,9 @@ pipeError
   -> m (Producer ByteString me Done)
   -- ^ A 'Producer' for standard error
 pipeError inp out cp = do
-  mvar <- createProcSpecMVar 1 (Just inp) (Just out) Nothing cp
-  return $ runOutputHandle Error mvar
+  mvAct <- createProcSpecMVar 1 (Just inp) (Just out) Nothing cp
+  mvSpec <- liftIO newEmptyMVar
+  return $ runOutputHandle Error mvAct mvSpec
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard output.
@@ -751,8 +732,10 @@ pipeInputOutput
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
 pipeInputOutput err cp = do
-  mvar <- createProcSpecMVar 2 Nothing Nothing (Just err) cp
-  return $ ( runInputHandle mvar, runOutputHandle Output mvar )
+  mvAct <- createProcSpecMVar 2 Nothing Nothing (Just err) cp
+  mvSpec <- liftIO newEmptyMVar
+  return $ ( runInputHandle mvAct mvSpec
+           , runOutputHandle Output mvAct mvSpec )
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard error.
@@ -767,8 +750,10 @@ pipeInputError
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
 pipeInputError out cp = do
-  mvar <- createProcSpecMVar 2 Nothing Nothing (Just out) cp
-  return $ ( runInputHandle mvar, runOutputHandle Error mvar )
+  mvAct <- createProcSpecMVar 2 Nothing Nothing (Just out) cp
+  mvSpec <- liftIO newEmptyMVar
+  return $ ( runInputHandle mvAct mvSpec
+           , runOutputHandle Error mvAct mvSpec )
 
 -- | Create a 'Producer' for standard output and a 'Producer' for
 -- standard error.
@@ -783,8 +768,10 @@ pipeOutputError
   -- ^ A 'Producer' for standard input, a 'Producer' for standard
   -- error
 pipeOutputError inp cp = do
-  mvar <- createProcSpecMVar 2 (Just inp) Nothing Nothing cp
-  return $ ( runOutputHandle Output mvar, runOutputHandle Error mvar )
+  mvAct <- createProcSpecMVar 2 (Just inp) Nothing Nothing cp
+  mvSpec <- liftIO newEmptyMVar
+  return $ ( runOutputHandle Output mvAct mvSpec
+           , runOutputHandle Error mvAct mvSpec )
 
 -- | Create a 'Consumer' for standard input, a 'Producer' for standard
 -- output, and a 'Producer' for standard error.
@@ -798,7 +785,8 @@ pipeInputOutputError
          Producer ByteString mo Done,
          Producer ByteString me Done )
 pipeInputOutputError cp = do
-  mvar <- createProcSpecMVar 3 Nothing Nothing Nothing cp
-  return $ ( runInputHandle mvar,
-             runOutputHandle Output mvar,
-             runOutputHandle Error mvar)
+  mvAct <- createProcSpecMVar 3 Nothing Nothing Nothing cp
+  mvSpec <- liftIO newEmptyMVar
+  return $ ( runInputHandle mvAct mvSpec,
+             runOutputHandle Output mvAct mvSpec,
+             runOutputHandle Error mvAct mvSpec)
