@@ -471,13 +471,15 @@ consumeToHandle h ev = do
 -- closes it when done.
 backgroundSendToProcess
   :: MonadSafe m
-  => Handle
+  => MVar (Either a ProcSpec)
+  -- ^ Decrement this when done sending to the process
+  -> Handle
   -> Producer ByteString (SafeT IO) ()
   -> ErrSpec
   -> m ()
-backgroundSendToProcess han prod ev = background act >> return ()
+backgroundSendToProcess mvar han prod ev = background act >> return ()
   where
-    csmr = consumeToHandle han ev
+    csmr = register (decrementAndWaitIfLast mvar) >> consumeToHandle han ev
     act = runSafeT . runEffect $ prod >-> csmr
 
 -- | Creates a background thread that will produce from the given
@@ -540,7 +542,7 @@ decrementAndWaitIfLast mv = decrementUsers mv >>= f
   where
     f ps'
       | users == 0 = handleErrors Nothing (psErrSpec ps')
-          (Process.waitForProcess (psHandle ps') >> return ())
+          (liftIO $ Process.waitForProcess (psHandle ps') >> return ())
       | otherwise = return ()
       where
         users = psUsers ps'
@@ -562,7 +564,7 @@ runInputHandle mvar = mask $ \restore -> do
         Nothing -> error "runInputHandle: handle not found"
   restore $ do
     (toMbox, fromMbox) <- newMailbox
-    backgroundSendToProcess han fromMbox (psErrSpec ps)
+    backgroundSendToProcess mvar han fromMbox (psErrSpec ps)
     toMbox
   code <- liftIO . Process.waitForProcess . psHandle $ ps
   _ <- decrementUsers mvar
