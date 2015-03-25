@@ -149,7 +149,7 @@ convertNonPipe a = case a of
 -- but one of these fields is also present in
 -- 'System.Process.CreateProcess', and they all have the same meaning;
 -- the only field that is different is the 'handler' field.
-data CreateProcess = CreateProcess
+data CreateProcess a = CreateProcess
   { cmdspec :: CmdSpec
     -- ^ Executable and arguments, or shell command
 
@@ -203,9 +203,15 @@ data CreateProcess = CreateProcess
   -- total gibberish can result as the text gets mixed in.  You
   -- could solve this by putting the errors into a
   -- "Pipes.Concurrent" mailbox and having a single thread print the
-  -- errors; building this sort of functionality directly in to the
-  -- library would clutter up the API somewhat so I have been
-  -- reluctant to do it.
+  -- errors; this sort of thing could be built into the library but
+  -- so far I haven't been motivated to do it.
+
+  , identifier :: a
+  -- ^ When the process completes, this identifier will be included
+  -- in the 'Done' value.  This allows you to figure out which
+  -- process finished first if you have two processes connected into
+  -- a single 'Effect'.  You can use whatever type you want here.
+  -- If you don't care about this, use '()'.
   }
 
 -- | Do not show or do anything with exceptions; useful to use as a
@@ -232,13 +238,15 @@ squelch = const (return ())
 -- * 'storeProcessHandle' is 'Nothing'
 --
 -- * 'handler' is 'defaultHandler'
+--
+-- * 'identifier' is '()'
 
 procSpec
   :: String
   -- ^ The name of the program to run, such as @less@.
   -> [String]
   -- ^ Command-line arguments
-  -> CreateProcess
+  -> CreateProcess ()
 procSpec prog args = CreateProcess
   { cmdspec = RawCommand prog args
   , cwd = Nothing
@@ -247,13 +255,14 @@ procSpec prog args = CreateProcess
   , create_group = False
   , delegate_ctlc = False
   , handler = defaultHandler
+  , identifier = ()
   }
 
 convertCreateProcess
   :: Maybe NonPipe
   -> Maybe NonPipe
   -> Maybe NonPipe
-  -> CreateProcess
+  -> CreateProcess a
   -> Process.CreateProcess
 convertCreateProcess inp out err a = Process.CreateProcess
   { Process.cmdspec = convertCmdSpec $ cmdspec a
@@ -278,7 +287,7 @@ data ErrSpec = ErrSpec
   }
 
 makeErrSpec
-  :: CreateProcess
+  :: CreateProcess a
   -> ErrSpec
 makeErrSpec cp = ErrSpec
   { esErrorHandler = handler cp
@@ -293,7 +302,7 @@ makeErrSpec cp = ErrSpec
 -- "System.Process" module.  See also
 --
 -- http://ghc.haskell.org/trac/ghc/ticket/9292
-data ProcSpec = ProcSpec
+data ProcSpec a = ProcSpec
   { psIn :: Maybe Handle
   , psOut :: Maybe Handle
   , psErr :: Maybe Handle
@@ -302,11 +311,12 @@ data ProcSpec = ProcSpec
   , psHandleLock :: MVar ()
   , psExitCode :: MVar ExitCode
   , psUsers :: Int
+  , psIdentifier :: a
   }
 
 waitOnHandle
   :: (MonadCatch m, MonadIO m)
-  => ProcSpec
+  => ProcSpec a
   -> m ExitCode
 waitOnHandle ps = do
   newLock <- liftIO $ tryPutMVar (psHandleLock ps) ()
@@ -324,7 +334,7 @@ waitOnHandle ps = do
 -- also waits on the process.
 decrementAndWaitIfLast
   :: (MonadCatch m, MonadIO m)
-  => MVar (Either a ProcSpec)
+  => MVar (Either a (ProcSpec b))
   -> m ()
 decrementAndWaitIfLast mv = decrement >>= f
   where
@@ -339,7 +349,13 @@ decrementAndWaitIfLast mv = decrement >>= f
       | psUsers ps' == 0 = waitOnHandle ps' >> return ()
       | otherwise = return ()
 
+-- * Done
 
+data Done a = Done a ExitCode
+  deriving (Eq, Ord, Show)
+
+instance Functor Done where
+  fmap f (Done a c) = Done (f a) c
 
 -- * Exception handling
 
@@ -493,9 +509,9 @@ produceFromHandle hDesc h ev = do
 
 getProcSpec
   :: (MonadMask m, MonadIO m)
-  => MVar (IO ProcSpec)
-  -> MVar (Either IOException ProcSpec)
-  -> m ProcSpec
+  => MVar (IO (ProcSpec a))
+  -> MVar (Either IOException (ProcSpec a))
+  -> m (ProcSpec a)
 getProcSpec mvAct mvSpec = mask_ $ do
   mayAct <- liftIO $ tryTakeMVar mvAct
   case mayAct of
@@ -521,8 +537,8 @@ getProcSpec mvAct mvSpec = mask_ $ do
 
 consumeToHandle
   :: (MonadSafe m, MonadCatch (Base m))
-  => MVar (IO ProcSpec)
-  -> MVar (Either IOException ProcSpec)
+  => MVar (IO (ProcSpec a))
+  -> MVar (Either IOException (ProcSpec a))
   -> Consumer ByteString m ()
 consumeToHandle mvAct mvSpec = mask $ \restore -> do
   spec <- getProcSpec mvAct mvSpec
@@ -539,28 +555,27 @@ consumeToHandle mvAct mvSpec = mask $ \restore -> do
   restore $ go `catch` hndlr
 
 
-backgroundSendToProcess
-  :: (MonadSafe m, MonadCatch (Base m))
-  => MVar (IO ProcSpec)
-  -> MVar (Either IOException ProcSpec)
+asyncSendToProcess
+  :: (MonadIO m, MonadCatch (Base m))
+  => MVar (IO (ProcSpec a))
+  -> MVar (Either IOException (ProcSpec a))
   -> Producer ByteString (SafeT IO) ()
-  -> m ()
-backgroundSendToProcess mvAct mvSpec pdcr = do
+  -> m (Async ())
+asyncSendToProcess mvAct mvSpec pdcr = do
   let effect = pdcr >-> consumeToHandle mvAct mvSpec
-  _ <- background . runSafeT . runEffect $ effect
-  return ()
+  liftIO . async . runSafeT . runEffect $ effect
 
 -- | Creates a background thread that will produce from the given
 -- Handle into the given Consumer.  Takes possession of the Handle and
 -- closes it when done.
 backgroundReceiveFromProcess
-  :: MonadSafe m
+  :: MonadIO m
   => HandleDesc
   -> Handle
   -> Consumer ByteString (SafeT IO) ()
   -> ErrSpec
-  -> m ()
-backgroundReceiveFromProcess desc han csmr ev = background act >> return ()
+  -> m (Async ())
+backgroundReceiveFromProcess desc han csmr ev = liftIO $ async act
   where
     prod = produceFromHandle desc han ev
     act = runSafeT . runEffect $ prod >-> csmr
@@ -572,10 +587,23 @@ backgroundReceiveFromProcess desc han csmr ev = background act >> return ()
 -- consumes into the mailbox for delivery to the background process.
 runInputHandle
   :: (MonadSafe m, MonadCatch (Base m))
-  => MVar (IO ProcSpec)
-  -> MVar (Either IOException ProcSpec)
-  -> Consumer ByteString m Done
-runInputHandle = undefined
+  => MVar (IO (ProcSpec a))
+  -> MVar (Either IOException (ProcSpec a))
+  -> Consumer ByteString m (Done a)
+runInputHandle mvAct mvSpec = mask $ \restore -> do
+  (toMbox, fromMbox) <- newMailbox
+  sendThread <- restore (asyncSendToProcess mvAct mvSpec fromMbox)
+  _ <- register (liftIO $ cancel sendThread)
+  restore $ do
+    toMbox
+    eiExcSpec <- liftIO $ readMVar mvSpec
+    ps <- case eiExcSpec of
+      Left e -> throwM e
+      Right spec -> return spec
+    _ <- liftIO $ wait sendThread
+    code <- waitOnHandle ps
+    return $ Done (psIdentifier ps) code
+
 
 {-
 runInputHandle mvar = mask $ \restore -> do
@@ -600,9 +628,9 @@ runInputHandle mvar = mask $ \restore -> do
 runOutputHandle
   :: (MonadSafe m, MonadCatch (Base m))
   => Outbound
-  -> MVar (IO ProcSpec)
-  -> MVar (Either IOException ProcSpec)
-  -> Producer ByteString m Done
+  -> MVar (IO (ProcSpec a))
+  -> MVar (Either IOException (ProcSpec a))
+  -> Producer ByteString m (Done a)
 runOutputHandle = undefined
 {-
 runOutputHandle desc mvar = mask $ \restore -> do
@@ -633,8 +661,8 @@ createProcSpecMVar
   -> Maybe NonPipe
   -> Maybe NonPipe
   -> Maybe NonPipe
-  -> CreateProcess
-  -> m (MVar (IO ProcSpec))
+  -> CreateProcess a
+  -> m (MVar (IO (ProcSpec a)))
 createProcSpecMVar nUsers inp out err cp = liftIO $ newMVar act
   where
     act = do
@@ -644,13 +672,9 @@ createProcSpecMVar nUsers inp out err cp = liftIO $ newMVar act
       mvarLock <- liftIO newEmptyMVar
       mvarEc <- liftIO newEmptyMVar
       return $ ProcSpec inp' out' err' es ph mvarLock mvarEc nUsers
+        (identifier cp)
 
 -- * Creating Proxy
-
--- TODO change this to take the whole CreateProcess.  Also, add an
--- identifier to CreateProcess.
-data Done = Done CmdSpec ExitCode
-  deriving (Eq, Ord, Show)
 
 -- | Create a 'Consumer' for standard input.
 pipeInput
@@ -659,8 +683,8 @@ pipeInput
   -- ^ Standard output
   -> NonPipe
   -- ^ Standard error
-  -> CreateProcess
-  -> m (Consumer ByteString mi Done)
+  -> CreateProcess a
+  -> m (Consumer ByteString mi (Done a))
   -- ^ A 'Consumer' for standard input
 pipeInput out err cp = do
   mvAct <- createProcSpecMVar 1 Nothing (Just out) (Just err) cp
@@ -674,8 +698,8 @@ pipeOutput
   -- ^ Standard input
   -> NonPipe
   -- ^ Standard error
-  -> CreateProcess
-  -> m (Producer ByteString mo Done)
+  -> CreateProcess a
+  -> m (Producer ByteString mo (Done a))
   -- ^ A 'Producer' for standard output
 pipeOutput inp err cp = do
   mvAct <- createProcSpecMVar 1 (Just inp) Nothing (Just err) cp
@@ -689,8 +713,8 @@ pipeError
   -- ^ Standard input
   -> NonPipe
   -- ^ Standard output
-  -> CreateProcess
-  -> m (Producer ByteString me Done)
+  -> CreateProcess a
+  -> m (Producer ByteString me (Done a))
   -- ^ A 'Producer' for standard error
 pipeError inp out cp = do
   mvAct <- createProcSpecMVar 1 (Just inp) (Just out) Nothing cp
@@ -705,8 +729,8 @@ pipeInputOutput
        MonadSafe mo, MonadCatch (Base mo))
   => NonPipe
   -- ^ Standard error
-  -> CreateProcess
-  -> m (Consumer ByteString mi Done, Producer ByteString mo Done)
+  -> CreateProcess a
+  -> m (Consumer ByteString mi (Done a), Producer ByteString mo (Done a))
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
 pipeInputOutput err cp = do
@@ -723,8 +747,8 @@ pipeInputError
        MonadSafe me, MonadCatch (Base me))
   => NonPipe
   -- ^ Standard output
-  -> CreateProcess
-  -> m (Consumer ByteString mi Done, Producer ByteString me Done)
+  -> CreateProcess a
+  -> m (Consumer ByteString mi (Done a), Producer ByteString me (Done a))
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
 pipeInputError out cp = do
@@ -741,8 +765,8 @@ pipeOutputError
        MonadSafe me, MonadCatch (Base me))
   => NonPipe
   -- ^ Standard input
-  -> CreateProcess
-  -> m (Producer ByteString mo Done, Producer ByteString me Done)
+  -> CreateProcess a
+  -> m (Producer ByteString mo (Done a), Producer ByteString me (Done a))
   -- ^ A 'Producer' for standard input, a 'Producer' for standard
   -- error
 pipeOutputError inp cp = do
@@ -758,10 +782,10 @@ pipeInputOutputError
        MonadSafe mi, MonadCatch (Base mi),
        MonadSafe mo, MonadCatch (Base mo),
        MonadSafe me, MonadCatch (Base me))
-  => CreateProcess
-  -> m ( Consumer ByteString mi Done,
-         Producer ByteString mo Done,
-         Producer ByteString me Done )
+  => CreateProcess a
+  -> m ( Consumer ByteString mi (Done a),
+         Producer ByteString mo (Done a),
+         Producer ByteString me (Done a) )
 pipeInputOutputError cp = do
   mvAct <- createProcSpecMVar 3 Nothing Nothing Nothing cp
   mvSpec <- liftIO newEmptyMVar
