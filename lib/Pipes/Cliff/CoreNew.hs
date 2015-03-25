@@ -60,34 +60,32 @@ data HandleDesc
   | Outbound Outbound
   deriving (Eq, Ord, Show)
 
--- | Describes IO errors tha occur when dealing with a 'Handle'.
-data HandleOopsie = HandleOopsie Activity HandleDesc
-  deriving (Eq,Show)
-
 -- | Describes all IO exceptions.  The 'Oopsie' contains the
 -- 'IOException' itself, along with the 'CmdSpec' that was running
--- when the exception occurred.  If the exception occurred while
--- dealing with a 'Handle', there is also a 'HandleOopsie'.  If there
--- is no 'HandleOopsie', this means that the exception arose when
--- running 'terminateProcess'.
+-- when the exception occurred.
 --
 -- The exceptions that are caught and placed into an 'Oopsie' may
 -- arise from reading data from or writing data to a 'Handle'.  In
 -- these errors, the associated 'Producer' or 'Consumer' will
 -- terminate (which may trigger various cleanup actions in the
--- 'MonadSafe' computation) but the exception itself is not re-thrown;
--- rather, it is passed to the 'handler'.  Similarly, an exception may
--- occur while closing a handle; these exceptions are caught, not
--- rethrown, and are passed to the 'handler'.  If an exception arises
--- when terminating a process (I'm not sure this is possible) then it
--- is also caught, not rethrown, and passed to the 'handler'.
+-- 'MonadSafe' computation) but the exception itself is not
+-- re-thrown; rather, it is passed to the 'handler'.  Similarly, an
+-- exception may occur while closing a handle; these exceptions are
+-- caught, not rethrown, and are passed to the 'handler'.  If an
+-- exception arises when terminating a process (I'm not sure this is
+-- possible) then it is also caught, not rethrown, and passed to the
+-- 'handler'.
 --
 -- If an exception arises when creating a process--such as a command
--- not being found--the exception is /not/ caught, handled, or passed
--- to the 'handler'.  Also, an 'Oopsie' is created only for an
--- 'IOException'; no other exceptions of any kind are caught or
--- handled.  However, exceptions of any kind will still trigger
--- appropriate cleanup actions in the 'MonadSafe' computation.
+-- not being found--the exception is /not/ caught, handled, or
+-- passed to the 'handler'.  In addition, no exceptions are caught
+-- if they originated during a 'Process.waitForProcess'.  (I can't
+-- conceive of how any synchronous exceptions could arise from
+-- 'Process.waitForProcess', but if they do, Cliff does not handle
+-- them.)  Also, an 'Oopsie' is created only for an 'IOException';
+-- no other exceptions of any kind are caught or handled.  However,
+-- exceptions of any kind will still trigger appropriate cleanup
+-- actions in the 'MonadSafe' computation.
 data Oopsie = Oopsie Activity HandleDesc CmdSpec IOException
   deriving (Eq, Show)
 
@@ -664,13 +662,18 @@ createProcSpecMVar nUsers inp out err cp = liftIO $ newMVar act
 -- | Create a 'Consumer' for standard input.
 pipeInput
   :: (MonadIO m, MonadSafe mi, MonadCatch (Base mi))
+
   => NonPipe
   -- ^ Standard output
+
   -> NonPipe
   -- ^ Standard error
+
   -> CreateProcess a
+
   -> m (Consumer ByteString mi (Done a))
   -- ^ A 'Consumer' for standard input
+
 pipeInput out err cp = do
   mvAct <- createProcSpecMVar 1 Nothing (Just out) (Just err) cp
   mvSpec <- liftIO newEmptyMVar
@@ -679,13 +682,18 @@ pipeInput out err cp = do
 -- | Create a 'Producer' for standard output.
 pipeOutput
   :: (MonadIO m, MonadSafe mo, MonadCatch (Base mo))
+
   => NonPipe
   -- ^ Standard input
+
   -> NonPipe
   -- ^ Standard error
+
   -> CreateProcess a
+
   -> m (Producer ByteString mo (Done a))
   -- ^ A 'Producer' for standard output
+
 pipeOutput inp err cp = do
   mvAct <- createProcSpecMVar 1 (Just inp) Nothing (Just err) cp
   mvSpec <- liftIO newEmptyMVar
@@ -694,13 +702,18 @@ pipeOutput inp err cp = do
 -- | Create a 'Producer' for standard error.
 pipeError
   :: (MonadIO m, MonadSafe me, MonadCatch (Base me))
+
   => NonPipe
   -- ^ Standard input
+
   -> NonPipe
   -- ^ Standard output
+
   -> CreateProcess a
+
   -> m (Producer ByteString me (Done a))
   -- ^ A 'Producer' for standard error
+
 pipeError inp out cp = do
   mvAct <- createProcSpecMVar 1 (Just inp) (Just out) Nothing cp
   mvSpec <- liftIO newEmptyMVar
@@ -712,12 +725,16 @@ pipeInputOutput
   :: ( MonadIO m,
        MonadSafe mi, MonadCatch (Base mi),
        MonadSafe mo, MonadCatch (Base mo))
+
   => NonPipe
   -- ^ Standard error
+
   -> CreateProcess a
+
   -> m (Consumer ByteString mi (Done a), Producer ByteString mo (Done a))
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
+
 pipeInputOutput err cp = do
   mvAct <- createProcSpecMVar 2 Nothing Nothing (Just err) cp
   mvSpec <- liftIO newEmptyMVar
@@ -730,9 +747,12 @@ pipeInputError
   :: ( MonadIO m,
        MonadSafe mi, MonadCatch (Base mi),
        MonadSafe me, MonadCatch (Base me))
+
   => NonPipe
+
   -- ^ Standard output
   -> CreateProcess a
+
   -> m (Consumer ByteString mi (Done a), Producer ByteString me (Done a))
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
@@ -748,12 +768,16 @@ pipeOutputError
   :: ( MonadIO m,
        MonadSafe mo, MonadCatch (Base mo),
        MonadSafe me, MonadCatch (Base me))
+
   => NonPipe
   -- ^ Standard input
+
   -> CreateProcess a
+
   -> m (Producer ByteString mo (Done a), Producer ByteString me (Done a))
-  -- ^ A 'Producer' for standard input, a 'Producer' for standard
+  -- ^ A 'Producer' for standard output and a 'Producer' for standard
   -- error
+  --
 pipeOutputError inp cp = do
   mvAct <- createProcSpecMVar 2 (Just inp) Nothing Nothing cp
   mvSpec <- liftIO newEmptyMVar
@@ -767,10 +791,15 @@ pipeInputOutputError
        MonadSafe mi, MonadCatch (Base mi),
        MonadSafe mo, MonadCatch (Base mo),
        MonadSafe me, MonadCatch (Base me))
+
   => CreateProcess a
+
   -> m ( Consumer ByteString mi (Done a),
          Producer ByteString mo (Done a),
          Producer ByteString me (Done a) )
+  -- ^ A 'Consumer' for standard input, a 'Producer' for standard
+  -- output, and a 'Producer' for standard error
+
 pipeInputOutputError cp = do
   mvAct <- createProcSpecMVar 3 Nothing Nothing Nothing cp
   mvSpec <- liftIO newEmptyMVar
