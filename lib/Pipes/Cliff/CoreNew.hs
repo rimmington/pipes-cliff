@@ -465,6 +465,40 @@ consumeToHandle h ev = do
         go
   go `catch` hndlr
 
+getProcSpec'
+  :: (MonadMask m, MonadIO m)
+  => MVar (IO ProcSpec)
+  -> MVar (Either IOException ProcSpec)
+  -> m ProcSpec
+getProcSpec' mvAct mvSpec = mask_ $ do
+  mayAct <- liftIO $ tryTakeMVar mvAct
+  case mayAct of
+    Nothing -> do
+      ei <- liftIO $ readMVar mvSpec
+      case ei of
+        Left e -> throwM e
+        Right g -> return g
+    Just act -> do
+      ei <- try . liftIO $ act
+      case ei of
+        Left e -> do
+          liftIO $ putMVar mvSpec (Left e)
+          throwM e
+        Right g -> do
+          liftIO $ putMVar mvSpec (Right g)
+          return g
+
+consumeToHandle'
+  :: (MonadSafe m, MonadCatch (Base m))
+  => MVar (IO ProcSpec)
+  -> MVar (Either IOException ProcSpec)
+  -> (ProcSpec -> Handle)
+  -> Consumer ByteString m ()
+consumeToHandle' mvAct mvSpec get = mask $ \restore -> do
+  spec <- getProcSpec' mvAct mvSpec
+  undefined
+
+
 
 -- | Creates a background thread that will consume to the given Handle
 -- from the given Producer.  Takes ownership of the 'Handle' and
