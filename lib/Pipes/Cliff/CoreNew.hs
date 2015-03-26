@@ -19,7 +19,8 @@ import qualified Data.ByteString as BS
 import qualified Pipes.Concurrent as PC
 import Data.ByteString (ByteString)
 import Control.Concurrent.Async
-import Control.Concurrent.MVar
+import qualified Control.Concurrent.MVar as MV
+import Control.Concurrent.MVar (MVar)
 import System.Exit
 import qualified Control.Exception
 import Control.Monad.Reader
@@ -285,6 +286,142 @@ makeErrSpec cp = ErrSpec
   { esErrorHandler = handler cp
   , esCmdSpec = cmdspec cp
   }
+
+-- * MVar types
+--
+
+-- ** Overloaded MVar operations
+
+newMVar :: MonadIO m => a -> m (MVar a)
+newMVar a = liftIO (MV.newMVar a)
+
+takeMVar :: MonadIO m => MVar a -> m a
+takeMVar mv = liftIO (MV.takeMVar mv)
+
+putMVar :: MonadIO m => MVar a -> a -> m ()
+putMVar mv a = liftIO (MV.putMVar mv a)
+
+readMVar :: MonadIO m => MVar a -> m a
+readMVar mv = liftIO (MV.readMVar mv)
+
+evaluate :: MonadIO m => a -> m a
+evaluate v = liftIO (Control.Exception.evaluate v)
+
+modifyMVar :: MonadSafe m => MVar a -> (a -> m (a, b)) -> m b
+modifyMVar m io = mask $ \restore -> do
+  a <- takeMVar m
+  (a', b) <- restore (io a >>= evaluate) `onException` putMVar m a
+  putMVar m a'
+  return b
+
+modifyMVar_ :: MonadSafe m => MVar a -> (a -> m a) -> m ()
+modifyMVar_ m io = mask $ \restore -> do
+  a <- takeMVar m
+  a' <- restore (io a) `onException` putMVar m a
+  putMVar m a'
+
+withMVar :: MonadSafe m => MVar a -> (a -> m b) -> m b
+withMVar m io = mask $ \restore -> do
+  a <- liftIO $ MV.takeMVar m
+  b <- restore (io a) `onException` liftIO (MV.putMVar m a)
+  liftIO $ MV.putMVar m a
+  return b
+
+newEmptyMVar :: MonadIO m => m (MVar a)
+newEmptyMVar = liftIO MV.newEmptyMVar
+
+-- ** Lock
+
+-- | Guarantees single-thread access
+--
+-- All MVar idioms thanks to Neil Mitchell:
+-- <http://neilmitchell.blogspot.com/2012/06/flavours-of-mvar_04.html>
+type Lock = MVar ()
+
+newLock :: MonadIO m => m Lock
+newLock = newMVar ()
+
+withLock :: MonadSafe m => Lock -> m a -> m a
+withLock x = withMVar x . const
+
+-- ** Var
+
+-- | Operates on mutable variables in thread-safe way.
+
+type Var a = MVar a
+
+newVar :: MonadIO m => a -> m (Var a)
+newVar = newMVar
+
+modifyVar :: MonadSafe m => Var a -> (a -> m (a, b)) -> m b
+modifyVar = modifyMVar
+
+modifyVar_ :: MonadSafe m => Var a -> (a -> m a) -> m ()
+modifyVar_ = modifyMVar_
+
+readVar :: MonadIO m => Var a -> m a
+readVar = readMVar
+
+-- ** Barrier
+
+-- | Starts with no value, is written to once, and is read one or
+-- more times.
+type Barrier a = MVar a
+
+newBarrier :: MonadIO m => m (Barrier a)
+newBarrier = newEmptyMVar
+
+signalBarrier :: MonadIO m => Barrier a -> a -> m ()
+signalBarrier = putMVar
+
+waitBarrier :: MonadIO m => Barrier a -> m a
+waitBarrier = readMVar
+
+-- ** MVar abstractions
+
+-- | A Shrine contains a value.  That value is computed only once,
+-- after which point it does not change.
+type Shrine m a = m (m a)
+
+-- | Takes an action and returns a new action.  If the action is
+-- never called the argument action will never be executed, but if
+-- it is called more than once, it will only be executed once.
+enshrine :: MonadSafe m => m a -> Shrine m a
+enshrine act = do
+  var <- newVar Nothing
+  return $ join $ modifyVar var $ \v -> case v of
+    Nothing -> do
+      b <- newBarrier
+      let r = do
+            x <- act
+            signalBarrier b x
+            return x
+      return (Just b, r)
+    Just b -> return (Just b, waitBarrier b)
+
+-- | Views the value in the Shrine.  This operation will block if
+-- the value in the Shrine either has not been computed or is being
+-- computed by another thread.
+viewShrine :: MonadSafe m => Shrine m a -> m a
+viewShrine = join
+
+-- | Data that is computed once, after the process has been created.
+-- After computation, this data does not change.
+data Console m = Console
+  { csIn :: Maybe Handle
+  , csOut :: Maybe Handle
+  , csErr :: Maybe Handle
+  , csExitCode :: Shrine m ExitCode
+  }
+
+
+-- | All the shared properties of a set of Proxy.
+data Panel m = Panel
+  { pnlCreateProcess :: CreateProcess
+  , pnlConsole :: Shrine (Console m)
+  }
+
+{-
 
 -- * Console
 
@@ -807,3 +944,4 @@ pipeInputOutputError cp = do
   return $ ( runInputHandle mvAct mvSpec,
              runOutputHandle Output mvAct mvSpec,
              runOutputHandle Error mvAct mvSpec)
+-}
