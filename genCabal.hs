@@ -136,6 +136,9 @@ stm = closedOpen "stm" [2,4,4] [2,5]
 mtl :: Package
 mtl = closedOpen "mtl" [2,2] [2,3]
 
+exceptions :: Package
+exceptions = closedOpen "exceptions" [0,8] [0,9]
+
 libDeps :: HasBuildInfo a => a
 libDeps = buildDepends
   [ base
@@ -146,6 +149,7 @@ libDeps = buildDepends
   , async
   , pipesConcurrency
   , mtl
+  , exceptions
   ]
 
 main :: IO ()
