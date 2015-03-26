@@ -60,13 +60,29 @@ module Pipes.Cliff
 
   -- * Creating processes
   -- $process
+
+  -- ** Single 'Proxy'
+  -- $singles
   , pipeInput
   , pipeOutput
   , pipeError
+
+  -- ** Automatic resource management
+  -- $automatic
   , pipeInputOutput
   , pipeInputError
   , pipeOutputError
   , pipeInputOutputError
+
+  -- ** Deterministic resource management
+  -- $deterministic
+  , pipeInputSafe
+  , pipeOutputSafe
+  , pipeErrorSafe
+  , pipeInputOutputSafe
+  , pipeInputErrorSafe
+  , pipeOutputErrorSafe
+  , pipeInputOutputErrorSafe
 
   -- * Background operations
 
@@ -83,6 +99,12 @@ module Pipes.Cliff
 
   , tidyEffect
 
+  -- * Retrieving subprocess properties
+  , ProcessHandle
+  , ProcInfo(..)
+  , isStillRunning
+  , terminateProcess
+
   -- * Errors and warnings
 
   -- | You will only need what's in this section if you want to
@@ -97,7 +119,6 @@ module Pipes.Cliff
   , module Pipes
   , module Pipes.Safe
   , module System.Exit
-  , module System.Process
 
   -- * Some design notes
   -- $designNotes
@@ -107,7 +128,6 @@ import Pipes.Cliff.Core
 import Pipes
 import Pipes.Safe
 import System.Exit
-import System.Process (ProcessHandle)
 
 {- $process
 
@@ -157,7 +177,77 @@ at all.  For that, just use 'System.Process.createProcess' in
 
    * "System.Exit" reexports all bindings
 
-   * "System.Process" reexports 'ProcessHandle'
+-}
+
+{- $singles
+
+These functions create a single 'Proxy'.  The 'Proxy' itself
+performs all resource management.  After the 'Proxy' terminates, all
+background threads associated with pushing and pulling data to and
+from the process will be terminated.  This occurs whether the 'Proxy' terminates
+normally, \"prematurely\" in the @pipes@ sense, or due to an
+exception.
+
+Upon 'Proxy' termination, the process itself is @not@ terminated.
+Typically it will have died anyway, but Cliff does not kill it.
+Cliff performs a @wait@ in a background thread for all processes,
+and that thread is not terminated when the 'Proxy' terminates.
+
+The 'Proxy' does not actually start the process until it starts
+streaming through a 'runEffect' or similar function; that's
+reflected in the return types of these functions, all of which are
+pure.
+-}
+
+{- $automatic
+
+Unlike the functions that create a single 'Proxy', such as
+'pipeInput', 'pipeOutput', and 'pipeError', these functions create
+more than one 'Proxy', with one 'Proxy' for each standard stream.
+These functions must run in the IO monad because shared resources
+must be initialized for the multiple 'Proxy' to share.  However, the
+subprocess will not start running until one of the 'Proxy' starts
+using it.
+
+These functions are a little loosey-goosey when it comes to resource
+management.  Two or three 'Proxy' share the same process, so it's
+difficult to ensure that all the resources related to the process
+(such as the process itself, and threads used to push and pull data
+in and out of it) get cleaned up in the face of exceptions.  None of
+these functions will ever terminate your process on their own; they
+merely wait for it to finish.  That makes them easier to use, but
+less deterministic in their resource management.
+
+In normal use, all resources will be cleaned up--for instance, when
+a process dies, all resources should be cleaned up shortly
+thereafter.  This is done deterministically and does not depend on
+the garbage collector.  But in the face of exceptions, things get
+tricky.
+
+-}
+
+{- $deterministic
+
+These functions, like the so-called \"automatic\" ones, also create
+multiple 'Proxy'.  Unlike the \"automatic\" ones, they create the
+resources in a 'MonadSafe' computation.  All process resources will
+be destroyed when you leave the 'MonadSafe' computation, even if an
+exception was the reason the 'MonadSafe' computation is terminating.
+To be more precise, the associated processes are sent a
+'terminateProcess'; on UNIX, this is a SIGTERM, which means the
+process does not /have/ to exit.
+
+The advantage of this is that you don't have to think about when
+resources will be released.  The disadvantage is that you must make
+sure you use everything related to the process inside of the
+'MonadSafe' computation, or the process will be snatched out from
+under you.
+
+Even if an exception is thrown, there might still be a single thread
+left, which is performing a @wait@ on the process.  This is
+necessary to avoid zombie processes.  That thread won't be around if
+your processes are good citizens and they exited after getting the
+@SIGTERM@.
 
 -}
 
