@@ -817,8 +817,7 @@ pipeError inp out cp = mask $ \restore -> do
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard output.
 pipeInputOutput
-  :: ( MonadIO m, MonadMask m,
-       MonadSafe mi, MonadCatch (Base mi),
+  :: ( MonadSafe mi, MonadCatch (Base mi),
        MonadSafe mo, MonadCatch (Base mo))
 
   => NonPipe
@@ -826,7 +825,7 @@ pipeInputOutput
 
   -> CreateProcess
 
-  -> m (Consumer ByteString mi ExitCode, Producer ByteString mo ExitCode)
+  -> IO (Consumer ByteString mi ExitCode, Producer ByteString mo ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
 
@@ -841,8 +840,7 @@ pipeInputOutput err cp = mask_ $ do
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard error.
 pipeInputError
-  :: ( MonadIO m, MonadMask m,
-       MonadSafe mi, MonadCatch (Base mi),
+  :: ( MonadSafe mi, MonadCatch (Base mi),
        MonadSafe me, MonadCatch (Base me))
 
   => NonPipe
@@ -850,7 +848,7 @@ pipeInputError
   -- ^ Standard output
   -> CreateProcess
 
-  -> m (Consumer ByteString mi ExitCode, Producer ByteString me ExitCode)
+  -> IO (Consumer ByteString mi ExitCode, Producer ByteString me ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
 pipeInputError out cp = do
@@ -864,8 +862,7 @@ pipeInputError out cp = do
 -- | Create a 'Producer' for standard output and a 'Producer' for
 -- standard error.
 pipeOutputError
-  :: ( MonadIO m, MonadMask m,
-       MonadSafe mo, MonadCatch (Base mo),
+  :: ( MonadSafe mo, MonadCatch (Base mo),
        MonadSafe me, MonadCatch (Base me))
 
   => NonPipe
@@ -873,7 +870,7 @@ pipeOutputError
 
   -> CreateProcess
 
-  -> m (Producer ByteString mo ExitCode, Producer ByteString me ExitCode)
+  -> IO (Producer ByteString mo ExitCode, Producer ByteString me ExitCode)
   -- ^ A 'Producer' for standard output and a 'Producer' for standard
   -- error
   --
@@ -889,16 +886,15 @@ pipeOutputError inp cp = do
 -- | Create a 'Consumer' for standard input, a 'Producer' for standard
 -- output, and a 'Producer' for standard error.
 pipeInputOutputError
-  :: ( MonadIO m, MonadMask m,
-       MonadSafe mi, MonadCatch (Base mi),
+  :: ( MonadSafe mi, MonadCatch (Base mi),
        MonadSafe mo, MonadCatch (Base mo),
        MonadSafe me, MonadCatch (Base me))
 
   => CreateProcess
 
-  -> m ( Consumer ByteString mi ExitCode,
-         Producer ByteString mo ExitCode,
-         Producer ByteString me ExitCode )
+  -> IO ( Consumer ByteString mi ExitCode,
+          Producer ByteString mo ExitCode,
+          Producer ByteString me ExitCode )
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output, and a 'Producer' for standard error
 
@@ -912,7 +908,3 @@ pipeInputOutputError cp = do
     , join $ runOutputHandle pnl pdcrOut
     , join $ runOutputHandle pnl pdcrErr
     )
-
-
-
-
