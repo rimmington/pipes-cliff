@@ -46,9 +46,9 @@ produceNumbers = go (0 :: Int)
 -- option.
 
 numsToLess :: IO ExitCode
-numsToLess = do
-  toLess <- pipeInput Inherit Inherit (procSpec "less" [])
-  tidyEffect $ produceNumbers >-> toLess
+numsToLess = tidyEffect $ produceNumbers >-> toLess
+  where
+    toLess = pipeInput Inherit Inherit (procSpec "less" [])
 
 {-
 

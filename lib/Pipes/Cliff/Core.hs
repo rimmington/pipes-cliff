@@ -650,7 +650,7 @@ createProcSpecMVar nUsers inp out err cp = liftIO $ newMVar act
 
 -- | Create a 'Consumer' for standard input.
 pipeInput
-  :: (MonadIO m, MonadSafe mi, MonadCatch (Base mi))
+  :: (MonadSafe m, MonadCatch (Base m))
 
   => NonPipe
   -- ^ Standard output
@@ -660,17 +660,17 @@ pipeInput
 
   -> CreateProcess
 
-  -> m (Consumer ByteString mi ExitCode)
+  -> Consumer ByteString m ExitCode
   -- ^ A 'Consumer' for standard input
 
 pipeInput out err cp = do
   mvAct <- createProcSpecMVar 1 Nothing (Just out) (Just err) cp
   mvSpec <- liftIO newEmptyMVar
-  return $ runInputHandle mvAct mvSpec
+  runInputHandle mvAct mvSpec
 
 -- | Create a 'Producer' for standard output.
 pipeOutput
-  :: (MonadIO m, MonadSafe mo, MonadCatch (Base mo))
+  :: (MonadSafe m, MonadCatch (Base m))
 
   => NonPipe
   -- ^ Standard input
@@ -680,17 +680,17 @@ pipeOutput
 
   -> CreateProcess
 
-  -> m (Producer ByteString mo ExitCode)
+  -> Producer ByteString m ExitCode
   -- ^ A 'Producer' for standard output
 
 pipeOutput inp err cp = do
   mvAct <- createProcSpecMVar 1 (Just inp) Nothing (Just err) cp
   mvSpec <- liftIO newEmptyMVar
-  return $ runOutputHandle Output mvAct mvSpec
+  runOutputHandle Output mvAct mvSpec
 
 -- | Create a 'Producer' for standard error.
 pipeError
-  :: (MonadIO m, MonadSafe me, MonadCatch (Base me))
+  :: (MonadSafe m, MonadCatch (Base m))
 
   => NonPipe
   -- ^ Standard input
@@ -700,13 +700,13 @@ pipeError
 
   -> CreateProcess
 
-  -> m (Producer ByteString me ExitCode)
+  -> Producer ByteString m ExitCode
   -- ^ A 'Producer' for standard error
 
 pipeError inp out cp = do
   mvAct <- createProcSpecMVar 1 (Just inp) (Just out) Nothing cp
   mvSpec <- liftIO newEmptyMVar
-  return $ runOutputHandle Error mvAct mvSpec
+  runOutputHandle Error mvAct mvSpec
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard output.
