@@ -23,6 +23,8 @@ import Pipes.Cliff
 import qualified Pipes.Prelude as P
 import qualified Data.ByteString.Char8 as BS8
 
+
+
 -- | Produces a stream of 'BS8.ByteString', where each
 -- 'BS8.ByteString' is a shown integer.  This is an infinite stream.
 -- In the examples below we'll send this infinite stream off into a

@@ -133,6 +133,9 @@ transformers = closedOpen "transformers" [0,3] [0,5]
 stm :: Package
 stm = closedOpen "stm" [2,4,4] [2,5]
 
+mtl :: Package
+mtl = closedOpen "mtl" [2,2] [2,3]
+
 libDeps :: HasBuildInfo a => a
 libDeps = buildDepends
   [ base
@@ -142,6 +145,7 @@ libDeps = buildDepends
   , process
   , async
   , pipesConcurrency
+  , mtl
   ]
 
 main :: IO ()
