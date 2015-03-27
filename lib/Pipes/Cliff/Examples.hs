@@ -51,12 +51,22 @@ numsToLess :: IO ExitCode
 numsToLess = tidyEffect $ produceNumbers >-> toLess
   where
     toLess = pipeInput Inherit Inherit (procSpec "less" [])
-
-{-
+    
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
 -- Perfectly useless, but shows how to build pipelines.  Also
 -- squlches warning messages using the 'handler' option.
+alphaNumbers :: IO ExitCode
+alphaNumbers = runSafeT $ do
+  (toTr, fromTr) <- liftIO $ pipeInputOutput Inherit
+    (procSpec "tr" ["[0-9]", "[a-z]"]) { handler = squelch }
+  let toLess = pipeInput Inherit Inherit
+        (procSpec "less" []) { handler = squelch }
+  _ <- conveyor $ produceNumbers >-> toTr
+  lastPipeline <- conveyor $ fromTr >-> toLess
+  waitForThread lastPipeline
+
+{-
 
 alphaNumbers :: IO ExitCode
 alphaNumbers = runSafeT $ do

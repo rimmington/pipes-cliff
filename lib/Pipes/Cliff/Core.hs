@@ -648,9 +648,9 @@ waitForThread = liftIO . wait
 
 -- * Effects
 
--- | Runs an effect in the 'SafeT' monad.  Called \"tidy\" because
--- the use of the 'SafeT' monad ensures that the effect will not
--- leave any stray processes or threads laying around.
+-- | Runs in the foreground an effect in the 'SafeT' monad.  Called \"tidy\" because
+-- the use of the 'SafeT' monad ensures that the effect will not leave
+-- any stray processes or threads laying around.
 tidyEffect :: (MonadIO m, MonadMask m) => Effect (SafeT m) a -> m a
 tidyEffect = runSafeT . runEffect
 
