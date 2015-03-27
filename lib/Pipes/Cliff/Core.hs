@@ -121,6 +121,9 @@ renderOopsie pn (Oopsie act desc cmd ioe) =
 
 -- | The default handler when receiving an 'Oopsie'; simply uses
 -- 'renderOopsie' to format it nicely and put it on standard error.
+--
+-- Side effects: gets the program name from the environment, and
+-- prints the Oopsie to standard error.
 defaultHandler :: Oopsie -> IO ()
 defaultHandler oops = do
   pn <- getProgName
@@ -217,6 +220,8 @@ data CreateProcess = CreateProcess
 
 -- | Do not show or do anything with exceptions; useful to use as a
 -- 'handler'.
+--
+-- Side effects: None.
 squelch :: Monad m => a -> m ()
 squelch = const (return ())
 
@@ -402,6 +407,9 @@ type Shrine m a = m (m a)
 -- | Takes an action and returns a new action.  If the action is
 -- never called the argument action will never be executed, but if
 -- it is called more than once, it will only be executed once.
+--
+-- Side effects: creates a 'Var'.  Returns an IO action that modifies
+-- the contents of that 'Var'.
 enshrine :: (MonadMask m, MonadIO m, MonadCatch m) => m a -> Shrine m a
 enshrine act = do
   var <- newVar Nothing
@@ -418,6 +426,9 @@ enshrine act = do
 -- | Views the value in the Shrine.  This operation will block if
 -- the value in the Shrine either has not been computed or is being
 -- computed by another thread.
+--
+-- Side effects: the Shrine will either compute the given value or
+-- block and wait until another thread computes it.
 viewShrine :: Monad m => Shrine m a -> m a
 viewShrine = join
 
@@ -473,12 +484,17 @@ data ProcInfo = ProcInfo ProcessHandle (IO ExitCode)
 
 
 -- | Is this process still running?
+--
+-- Side effects: examines the process handle to see if it has yet
+-- returned a value.  Does not block; should return immediately.
 isStillRunning :: ProcessHandle -> IO Bool
 isStillRunning (ProcessHandle h) = fmap (maybe True (const False))
   (Process.getProcessExitCode h)
 
 -- | Terminates a process.  A process might not respond to this; use
 -- 'isStillRunning' to see if the process responded.
+--
+-- Side effects: hopefully terminates the given process.  Should not block.
 terminateProcess :: ProcessHandle -> IO ()
 terminateProcess (ProcessHandle h) = Process.terminateProcess h
 
@@ -490,11 +506,33 @@ data Panel = Panel
   , pnlId :: MVar ()
   }
 
+-- | Gets the exit code of the process that belongs to the 'Panel'.
+-- Side effects: may block if process has not yet exited.
 getExitCode :: Panel -> IO ExitCode
 getExitCode pnl = do
   cnsl <- viewShrine . pnlConsole $ pnl
   viewShrine . csExitCode $ cnsl
 
+-- | Creates a new Panel.
+--
+-- Side effects: creates an MVar; this MVar acts as a unique
+-- identifier which allows weak references to work more effectively
+-- (see the documentation in "System.Mem.Weak" for the 'Weak' type for
+-- more details on this.)  Does not create the process right away;
+-- instead, creates a 'Shrine' that, when viewed, will create the
+-- process.  This Shrine will contain another Shrine that, when
+-- viewed, will return the process exit code.
+--
+-- In addition, the 'Shrine' will, when viewed, fork a simple thread
+-- that will immediately view the 'Shrine' containing the exit code.
+-- In effect, this means there is immediately a thread that will wait
+-- for the process to exit.  Because this is a 'Shrine', that means
+-- only one thread ever does the @wait@, which avoids a bug in
+-- "System.Process".
+--
+-- Also, examine the 'procInfo' field of the 'CreateProcess' to
+-- determine whether the user requested that an MVar be filled with a
+-- 'ProcInfo'; if so, writes the 'ProcInfo' to the given MVar.
 newPanel
   :: MonadIO m
   => Maybe NonPipe
@@ -520,7 +558,9 @@ newPanel inp out err cp = liftM3 Panel (return cp) (return cnsl) newEmptyMVar
 -- * Exception handling
 
 -- | Sends an exception using the exception handler specified in the
--- 'ErrSpec'.
+-- 'ErrSpec'.  Side effects: transmits the 'Oopsie' to the right
+-- place; the recipient of the 'Oopsie' might have additional side
+-- effects.
 handleException
   :: MonadIO m
   => Activity
@@ -535,6 +575,9 @@ handleException act desc exc pnl = liftIO $ sender oops
     oops = Oopsie act desc spec exc
 
 -- | Run an action, taking all IO errors and sending them to the handler.
+--
+-- Side effects: the given action has been run; if any IO exceptions
+-- occurred, they are sent to the handler.
 handleErrors
   :: (MonadCatch m, MonadIO m)
   => Activity
@@ -658,13 +701,26 @@ bufSize = 1024
 -- a LIFO basis; this implementation depends on that behavior.  That
 -- way the handle is closed before the process is waited on.
 
--- | Initialize a handle.
+-- | Initialize a handle.  Returns a computation in the MonadSafe
+-- monad.  That computation has a registered finalizer that will close
+-- a particular handle that is found in the 'Panel'.  As a side
+-- effect, the 'Shrine' containing the 'Panel' is viewed, meaning that
+-- the process will launch if it hasn't already done so.
+--
+-- Also registers a 'Weak' reference to the 'MVar' that is located in
+-- the 'Panel'.  The finalizer will close the 'Handle'; therfore, if
+-- the 'Panel' goes out of scope, the associated 'Handle' have a
+-- registered destroyer.
 initHandle
   :: (MonadIO m, MonadMask m, MonadSafe mi, MonadCatch (Base mi))
   => HandleDesc
+  -- ^ Used for error messages
   -> (Console -> Handle)
+  -- ^ Fetch the handle to close from the 'Panel'.
   -> Panel
+  -- ^ Has the 'Handle' that will be closed.
   -> (Handle -> mi a)
+  -- ^ The remainder of the computation.
   -> m (mi a)
 initHandle desc get pnl mkProxy = mask_ $ do
   cnsl <- liftIO . viewShrine . pnlConsole $ pnl
@@ -676,6 +732,12 @@ initHandle desc get pnl mkProxy = mask_ $ do
     _ <- register fnlzr'
     restore $ mkProxy han
 
+-- Returns a Consumer for process standard input.
+--
+-- Side effects: Process is started if it isn't already.  The returned
+-- computation will await values and passes them on to the process
+-- standard input mailbox.  Any IO exceptions are caught, and
+-- consumption terminates.
 consumeToHandle
   :: ( MonadIO m, MonadIO mi, MonadCatch mi, MonadSafe mi,
        MonadCatch (Base mi), MonadMask m)
@@ -694,6 +756,8 @@ consumeToHandle pnl = initHandle Input get pnl fn
             go
       go `catch` hndlr
 
+-- | Produce values from a process standard output.  Process is
+-- started if it isn't already.
 produceFromHandle
   :: ( MonadIO m, MonadIO mi, MonadCatch mi, MonadSafe mi,
        MonadCatch (Base mi), MonadMask m)
@@ -718,6 +782,8 @@ produceFromHandle outb pnl = initHandle (Outbound outb) get pnl fn
       produce `catch` hndlr
 
 
+-- | Given an 'Async', waits for that thread to finish processing
+-- values.  When it completes, wait for the process exit code.
 finishProxy
   :: MonadIO m
   => Async ()
@@ -727,6 +793,9 @@ finishProxy thread pnl = do
   _ <- liftIO $ wait thread
   liftIO $ getExitCode pnl
 
+-- | Takes all steps necessary to get a 'Consumer' for standard
+-- input.  Sets up a mailbox, runs a conveyor in the background.  Then
+-- receives streaming data, and then gets the process exit code.
 runInputHandle
   :: (MonadSafe m, MonadSafe mi, MonadCatch (Base mi))
   => Panel
@@ -739,6 +808,9 @@ runInputHandle pnl csmToHan = do
     toBox
     finishProxy asyncId pnl
 
+-- | Takes all steps necessary to get a 'Producer' for standard
+-- input.  Sets up a mailbox, runs a conveyor in the background.  Then
+-- receives streaming data, and then gets the process exit code.
 runOutputHandle
   :: (MonadSafe m, MonadSafe mi, MonadCatch (Base mi))
   => Panel
@@ -750,6 +822,24 @@ runOutputHandle pnl pdcFromHan = do
   return $ do
     fromBox
     finishProxy asyncId pnl
+    
+-- | Creates a Panel.  Also registers a finalizer that will destroy
+-- the process when the MonadSafe computation exits.  The destruction
+-- of the process should trigger all other finalizers: the destruction
+-- of each handle will trigger the finalizers on the 'Proxy' connected
+-- to each handle, which will in turn close the mailboxes, which will
+-- in turn destroy what was connected to the mailboxes.
+createAndRegisterPanel
+  :: MonadSafe m
+  => m Panel
+  -> m Panel
+createAndRegisterPanel mkr = mask_ $ do
+  let destroyer pnl = do
+        cnsl <- viewShrine . pnlConsole $ pnl
+        Process.terminateProcess (csHandle cnsl)
+  pan <- mkr
+  _ <- register (liftIO (destroyer pan))
+  return pan
 
 -- * Creating Proxy
 
@@ -775,7 +865,7 @@ pipeInput out err cp = mask $ \restore -> do
 
 -- | Create a 'Consumer' for standard input.
 pipeInputSafe
-  :: (MonadSafe m, MonadSafe mi, MonadCatch (Base mi))
+  :: (MonadSafe mi, MonadCatch (Base mi))
 
   => NonPipe
   -- ^ Standard output
@@ -785,10 +875,12 @@ pipeInputSafe
 
   -> CreateProcess
 
-  -> m (Consumer ByteString mi ExitCode)
+  -> Consumer ByteString mi ExitCode
   -- ^ A 'Consumer' for standard input
-pipeInputSafe = undefined
-
+pipeInputSafe out err cp = do
+  pnl <- createAndRegisterPanel (newPanel Nothing (Just out) (Just err) cp)
+  csmr <- consumeToHandle pnl
+  join $ runInputHandle pnl csmr
 
 -- | Create a 'Producer' for standard output.
 pipeOutput
@@ -811,7 +903,7 @@ pipeOutput inp err cp = mask $ \restore -> do
 
 -- | Create a 'Producer' for standard output.
 pipeOutputSafe
-  :: (MonadSafe m, MonadSafe mo, MonadCatch (Base mo))
+  :: (MonadSafe mo, MonadCatch (Base mo))
 
   => NonPipe
   -- ^ Standard input
@@ -821,9 +913,12 @@ pipeOutputSafe
 
   -> CreateProcess
 
-  -> m (Producer ByteString mo ExitCode)
+  -> Producer ByteString mo ExitCode
   -- ^ A 'Producer' for standard output
-pipeOutputSafe = undefined
+pipeOutputSafe inp err cp = do
+  pnl <- createAndRegisterPanel (newPanel (Just inp) Nothing (Just err) cp)
+  pdcr <- produceFromHandle Output pnl
+  join $ runOutputHandle pnl pdcr
 
 -- | Create a 'Producer' for standard error.
 pipeError
@@ -848,7 +943,7 @@ pipeError inp out cp = mask $ \restore -> do
 
 -- | Create a 'Producer' for standard error.
 pipeErrorSafe
-  :: (MonadSafe m, MonadSafe me, MonadCatch (Base me))
+  :: (MonadSafe me, MonadCatch (Base me))
 
   => NonPipe
   -- ^ Standard input
@@ -858,9 +953,13 @@ pipeErrorSafe
 
   -> CreateProcess
 
-  -> m (Producer ByteString me ExitCode)
+  -> Producer ByteString me ExitCode
   -- ^ A 'Producer' for standard error
-pipeErrorSafe = undefined
+pipeErrorSafe inp out cp = do
+  pnl <- createAndRegisterPanel (newPanel (Just inp) (Just out) Nothing cp)
+  pdcr <- produceFromHandle Error pnl
+  join $ runOutputHandle pnl pdcr
+
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard output.
@@ -877,7 +976,7 @@ pipeInputOutput
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
 
-pipeInputOutput err cp = mask_ $ do
+pipeInputOutput err cp = do
   pnl <- newPanel Nothing Nothing (Just err) cp
   csmr <- consumeToHandle pnl
   pdcr <- produceFromHandle Output pnl
@@ -898,7 +997,11 @@ pipeInputOutputSafe
   -> m (Consumer ByteString mi ExitCode, Producer ByteString mo ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
-pipeInputOutputSafe = undefined
+pipeInputOutputSafe err cp = do
+  pnl <- createAndRegisterPanel (newPanel Nothing Nothing (Just err) cp)
+  csmr <- consumeToHandle pnl
+  pdcr <- produceFromHandle Output pnl
+  return (join $ runInputHandle pnl csmr, join $ runOutputHandle pnl pdcr)
 
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
@@ -940,7 +1043,15 @@ pipeInputErrorSafe
   -> m (Consumer ByteString mi ExitCode, Producer ByteString me ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
-pipeInputErrorSafe = undefined
+pipeInputErrorSafe out cp = do
+  pnl <- createAndRegisterPanel (newPanel Nothing (Just out) Nothing cp)
+  csmr <- consumeToHandle pnl
+  pdcr <- produceFromHandle Error pnl
+  return
+    ( join $ runInputHandle pnl csmr
+    , join $ runOutputHandle pnl pdcr
+    )
+
 
 -- | Create a 'Producer' for standard output and a 'Producer' for
 -- standard error.
@@ -982,7 +1093,15 @@ pipeOutputErrorSafe
   -- ^ A 'Producer' for standard output and a 'Producer' for standard
   -- error
 
-pipeOutputErrorSafe = undefined
+pipeOutputErrorSafe inp cp = do
+  pnl <- createAndRegisterPanel (newPanel (Just inp) Nothing Nothing cp)
+  pdcrOut <- produceFromHandle Output pnl
+  pdcrErr <- produceFromHandle Error pnl
+  return
+    ( join $ runOutputHandle pnl pdcrOut
+    , join $ runOutputHandle pnl pdcrErr
+    )
+
 
 -- | Create a 'Consumer' for standard input, a 'Producer' for standard
 -- output, and a 'Producer' for standard error.
@@ -1026,4 +1145,13 @@ pipeInputOutputErrorSafe
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output, and a 'Producer' for standard error
 
-pipeInputOutputErrorSafe = undefined
+pipeInputOutputErrorSafe cp = do
+  pnl <- createAndRegisterPanel (newPanel Nothing Nothing Nothing cp)
+  csmr <- consumeToHandle pnl
+  pdcrOut <- produceFromHandle Output pnl
+  pdcrErr <- produceFromHandle Error pnl
+  return
+    ( join $ runInputHandle pnl csmr
+    , join $ runOutputHandle pnl pdcrOut
+    , join $ runOutputHandle pnl pdcrErr
+    )
