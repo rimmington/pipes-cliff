@@ -22,7 +22,7 @@ import Control.Concurrent.MVar (MVar)
 import System.Exit
 import qualified Control.Exception
 import qualified Control.Monad.Catch as MC
-import Control.Monad.Reader
+import Control.Monad
 
 -- * Data types
 

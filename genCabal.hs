@@ -5,8 +5,8 @@ import Cartel
 props :: Properties
 props = blank
   { name = "pipes-cliff"
-  , version = [0,6,0,0]
-  , cabalVersion = Just (1, 16)
+  , version = [0,8,0,0]
+  , cabalVersion = Just (1, 18)
   , buildType = Just simple
   , license = Just bsd3
   , licenseFile = "LICENSE"
@@ -37,7 +37,7 @@ props = blank
     , "<https://github.com/massysett/pipes-cliff>"
     ]
   , category = "Pipes, Concurrency"
-  , testedWith = [(ghc, eq [7,8,2])]
+  , testedWith = map (\v -> (ghc, eq v)) [[7,8,2], [7,10,1]]
   , extraSourceFiles = ["README.md"]
   }
 
@@ -105,7 +105,7 @@ sections fl libMods testMods =
 -- # Packages
 
 base :: Package
-base = closedOpen "base" [4,6,0,0] [4,8]
+base = closedOpen "base" [4,7,0,0] [4,9]
 
 pipes :: Package
 pipes = closedOpen "pipes" [4,1] [4,2]
@@ -133,6 +133,7 @@ transformers = closedOpen "transformers" [0,3] [0,5]
 stm :: Package
 stm = closedOpen "stm" [2,4,4] [2,5]
 
+-- | Currently unused
 mtl :: Package
 mtl = closedOpen "mtl" [2,2] [2,3]
 
@@ -148,7 +149,6 @@ libDeps = buildDepends
   , process
   , async
   , pipesConcurrency
-  , mtl
   , exceptions
   ]
 
