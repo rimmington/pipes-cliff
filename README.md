@@ -55,7 +55,7 @@ though neither was posted to Hackage.
 
 Take a look at these other libraries; they might meet your needs.
 
-### Subprocesses generally
+### Dealing specifically with subprocesses and streaming
 
 * process-streaming
 
@@ -64,6 +64,10 @@ http://hackage.haskell.org/package/process-streaming
 * pipes-shell
 
 https://hackage.haskell.org/package/pipes-shell
+
+* Data.Conduit.Process
+
+https://www.fpcomplete.com/user/snoyberg/library-documentation/data-conduit-process
 
 ### Larger scripting frameworks
 

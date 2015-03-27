@@ -407,8 +407,8 @@ waitBarrier = readMVar
 --
 -- Side effects: creates a 'Var'.  Returns an IO action that modifies
 -- the contents of that 'Var'.
-enshrine :: (MonadMask m, MonadIO m, MonadCatch m) => m a -> m (m a)
-enshrine act = do
+once :: (MonadMask m, MonadIO m, MonadCatch m) => m a -> m (m a)
+once act = do
   var <- newVar Nothing
   return $ join $ modifyVar var $ \v -> case v of
     Nothing -> do
@@ -512,7 +512,7 @@ getExitCode pnl = pnlConsole pnl >>= csExitCode
 -- In addition, the IO action will fork a simple thread that will
 -- immediately wait for the process.  In effect, this means there is
 -- immediately a thread that will wait for the process to exit.
--- Because this IO action was created with 'enshrine', that means only
+-- Because this IO action was created with 'once', that means only
 -- one thread ever does the @wait@, which avoids a bug in
 -- "System.Process".
 --
@@ -526,13 +526,13 @@ newPanel
   -> Maybe NonPipe
   -> CreateProcess
   -> m Panel
-newPanel inp out err cp = liftM3 Panel (return cp) (liftIO $ enshrine act)
+newPanel inp out err cp = liftM3 Panel (return cp) (liftIO $ once act)
   newEmptyMVar
   where
     act = do
       (inp', out', err', han) <- liftIO $ Process.createProcess
         (convertCreateProcess inp out err cp)
-      getCode <- enshrine $ liftIO (Process.waitForProcess han)
+      getCode <- once $ liftIO (Process.waitForProcess han)
       _ <- liftIO $ PC.forkIO (getCode >> return ())
       _ <- case procInfo cp of
         Nothing -> return ()
