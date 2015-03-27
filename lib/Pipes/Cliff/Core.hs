@@ -400,9 +400,6 @@ waitBarrier = readMVar
 
 -- ** MVar abstractions
 
--- | A Shrine contains a value.  That value is computed only once,
--- after which point it does not change.
-type Shrine m a = m (m a)
 
 -- | Takes an action and returns a new action.  If the action is
 -- never called the argument action will never be executed, but if
@@ -410,7 +407,7 @@ type Shrine m a = m (m a)
 --
 -- Side effects: creates a 'Var'.  Returns an IO action that modifies
 -- the contents of that 'Var'.
-enshrine :: (MonadMask m, MonadIO m, MonadCatch m) => m a -> Shrine m a
+enshrine :: (MonadMask m, MonadIO m, MonadCatch m) => m a -> m (m a)
 enshrine act = do
   var <- newVar Nothing
   return $ join $ modifyVar var $ \v -> case v of
@@ -422,15 +419,6 @@ enshrine act = do
             return x
       return (Just b, r)
     Just b -> return (Just b, waitBarrier b)
-
--- | Views the value in the Shrine.  This operation will block if
--- the value in the Shrine either has not been computed or is being
--- computed by another thread.
---
--- Side effects: the Shrine will either compute the given value or
--- block and wait until another thread computes it.
-viewShrine :: Monad m => Shrine m a -> m a
-viewShrine = join
 
 -- 'csExitCode' is here because you don't want to use
 -- 'Process.waitForProcess' when there is more than one thread that
@@ -445,7 +433,7 @@ data Console = Console
   , csOut :: Maybe Handle
   , csErr :: Maybe Handle
   , csHandle :: Process.ProcessHandle
-  , csExitCode :: Shrine IO ExitCode
+  , csExitCode :: IO ExitCode
   }
 
 -- | A unique process identifier.  This is a simple wrapper around
@@ -502,16 +490,14 @@ terminateProcess (ProcessHandle h) = Process.terminateProcess h
 -- | All the shared properties of a set of Proxy.
 data Panel = Panel
   { pnlCreateProcess :: CreateProcess
-  , pnlConsole :: Shrine IO Console
+  , pnlConsole :: IO Console
   , pnlId :: MVar ()
   }
 
 -- | Gets the exit code of the process that belongs to the 'Panel'.
 -- Side effects: may block if process has not yet exited.
 getExitCode :: Panel -> IO ExitCode
-getExitCode pnl = do
-  cnsl <- viewShrine . pnlConsole $ pnl
-  viewShrine . csExitCode $ cnsl
+getExitCode pnl = pnlConsole pnl >>= csExitCode
 
 -- | Creates a new Panel.
 --
@@ -519,15 +505,15 @@ getExitCode pnl = do
 -- identifier which allows weak references to work more effectively
 -- (see the documentation in "System.Mem.Weak" for the 'Weak' type for
 -- more details on this.)  Does not create the process right away;
--- instead, creates a 'Shrine' that, when viewed, will create the
--- process.  This Shrine will contain another Shrine that, when
--- viewed, will return the process exit code.
+-- instead, creates an IO action that, when run, will create the
+-- process.  This IO action contains another IO action that, when run,
+-- will return the process exit code.
 --
--- In addition, the 'Shrine' will, when viewed, fork a simple thread
--- that will immediately view the 'Shrine' containing the exit code.
--- In effect, this means there is immediately a thread that will wait
--- for the process to exit.  Because this is a 'Shrine', that means
--- only one thread ever does the @wait@, which avoids a bug in
+-- In addition, the IO action will fork a simple thread that will
+-- immediately wait for the process.  In effect, this means there is
+-- immediately a thread that will wait for the process to exit.
+-- Because this IO action was created with 'enshrine', that means only
+-- one thread ever does the @wait@, which avoids a bug in
 -- "System.Process".
 --
 -- Also, examine the 'procInfo' field of the 'CreateProcess' to
@@ -540,18 +526,17 @@ newPanel
   -> Maybe NonPipe
   -> CreateProcess
   -> m Panel
-newPanel inp out err cp = liftM3 Panel (return cp) (return cnsl) newEmptyMVar
+newPanel inp out err cp = liftM3 Panel (return cp) (liftIO $ enshrine act)
+  newEmptyMVar
   where
-    cnsl = enshrine act
     act = do
       (inp', out', err', han) <- liftIO $ Process.createProcess
         (convertCreateProcess inp out err cp)
-      let getCode = enshrine $ liftIO (Process.waitForProcess han)
-      _ <- liftIO $ PC.forkIO ((viewShrine  getCode) >> return ())
+      getCode <- enshrine $ liftIO (Process.waitForProcess han)
+      _ <- liftIO $ PC.forkIO (getCode >> return ())
       _ <- case procInfo cp of
         Nothing -> return ()
-        Just mv -> putMVar mv (ProcInfo (ProcessHandle han)
-          (viewShrine getCode))
+        Just mv -> putMVar mv (ProcInfo (ProcessHandle han) getCode)
       return $ Console inp' out' err' han getCode
       
 
@@ -622,20 +607,33 @@ acquire acq rel = mask $ \restore -> do
 
 -- * Threads
 
+-- | Runs a thread in the background.
+background
+  :: MonadIO m
+  => IO a
+  -> m (Async a)
+background = liftIO . async
+
 -- | Runs a thread in the background.  The thread is terminated when
 -- the 'MonadSafe' computation completes.
-background
+backgroundSafe
   :: MonadSafe m
   => IO a
   -> m (Async a)
-background act = acquire (liftIO $ async act) (liftIO . cancel)
+backgroundSafe act = acquire (liftIO $ async act) (liftIO . cancel)
 
 -- | Runs in the background an effect, typically one that is moving
 -- data from one process to another.  For examples of its usage, see
--- "Pipes.Cliff.Examples".  The associated thread is killed when the
--- 'MonadSafe' computation completes.
-conveyor :: MonadSafe m => Effect (SafeT IO) a -> m (Async a)
+-- "Pipes.Cliff.Examples".
+conveyor :: MonadIO m => Effect (SafeT IO) a -> m (Async a)
 conveyor = background . liftIO . runSafeT . runEffect
+
+
+-- | Runs in the background an effect, typically one that is moving
+-- data from one process to another.  The associated thread is killed
+-- when the 'MonadSafe' computation completes.
+conveyorSafe :: MonadSafe m => Effect (SafeT IO) a -> m (Async a)
+conveyorSafe = backgroundSafe . liftIO . runSafeT . runEffect
 
 
 -- | A version of 'Control.Concurrent.Async.wait' with an overloaded
@@ -644,6 +642,10 @@ conveyor = background . liftIO . runSafeT . runEffect
 -- exception, 'waitForThread' will throw that same exception.
 waitForThread :: MonadIO m => Async a -> m a
 waitForThread = liftIO . wait
+
+-- | Kills a thread.
+killThread :: MonadIO m => Async a -> m ()
+killThread = liftIO . cancel
 
 
 -- * Effects
@@ -704,7 +706,7 @@ bufSize = 1024
 -- | Initialize a handle.  Returns a computation in the MonadSafe
 -- monad.  That computation has a registered finalizer that will close
 -- a particular handle that is found in the 'Panel'.  As a side
--- effect, the 'Shrine' containing the 'Panel' is viewed, meaning that
+-- effect, the IO action creating the 'Panel' is viewed, meaning that
 -- the process will launch if it hasn't already done so.
 --
 -- Also registers a 'Weak' reference to the 'MVar' that is located in
@@ -723,7 +725,7 @@ initHandle
   -- ^ The remainder of the computation.
   -> m (mi a)
 initHandle desc get pnl mkProxy = mask_ $ do
-  cnsl <- liftIO . viewShrine . pnlConsole $ pnl
+  cnsl <- liftIO . pnlConsole $ pnl
   let han = get cnsl
       fnlzr = closeHandleNoThrow han desc pnl
       fnlzr' = closeHandleNoThrow han desc pnl
@@ -835,7 +837,7 @@ createAndRegisterPanel
   -> m Panel
 createAndRegisterPanel mkr = mask_ $ do
   let destroyer pnl = do
-        cnsl <- viewShrine . pnlConsole $ pnl
+        cnsl <- pnlConsole pnl
         Process.terminateProcess (csHandle cnsl)
   pan <- mkr
   _ <- register (liftIO (destroyer pan))
@@ -964,7 +966,8 @@ pipeErrorSafe inp out cp = do
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard output.
 pipeInputOutput
-  :: ( MonadSafe mi, MonadCatch (Base mi),
+  :: ( MonadIO m, MonadMask m,
+       MonadSafe mi, MonadCatch (Base mi),
        MonadSafe mo, MonadCatch (Base mo))
 
   => NonPipe
@@ -972,7 +975,7 @@ pipeInputOutput
 
   -> CreateProcess
 
-  -> IO (Consumer ByteString mi ExitCode, Producer ByteString mo ExitCode)
+  -> m (Consumer ByteString mi ExitCode, Producer ByteString mo ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
 
@@ -1007,7 +1010,8 @@ pipeInputOutputSafe err cp = do
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard error.
 pipeInputError
-  :: ( MonadSafe mi, MonadCatch (Base mi),
+  :: ( MonadIO m, MonadMask m,
+       MonadSafe mi, MonadCatch (Base mi),
        MonadSafe me, MonadCatch (Base me))
 
   => NonPipe
@@ -1015,7 +1019,7 @@ pipeInputError
   -- ^ Standard output
   -> CreateProcess
 
-  -> IO (Consumer ByteString mi ExitCode, Producer ByteString me ExitCode)
+  -> m (Consumer ByteString mi ExitCode, Producer ByteString me ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
 pipeInputError out cp = do
@@ -1056,7 +1060,8 @@ pipeInputErrorSafe out cp = do
 -- | Create a 'Producer' for standard output and a 'Producer' for
 -- standard error.
 pipeOutputError
-  :: ( MonadSafe mo, MonadCatch (Base mo),
+  :: ( MonadIO m, MonadMask m,
+       MonadSafe mo, MonadCatch (Base mo),
        MonadSafe me, MonadCatch (Base me))
 
   => NonPipe
@@ -1064,7 +1069,7 @@ pipeOutputError
 
   -> CreateProcess
 
-  -> IO (Producer ByteString mo ExitCode, Producer ByteString me ExitCode)
+  -> m (Producer ByteString mo ExitCode, Producer ByteString me ExitCode)
   -- ^ A 'Producer' for standard output and a 'Producer' for standard
   -- error
 
@@ -1106,15 +1111,16 @@ pipeOutputErrorSafe inp cp = do
 -- | Create a 'Consumer' for standard input, a 'Producer' for standard
 -- output, and a 'Producer' for standard error.
 pipeInputOutputError
-  :: ( MonadSafe mi, MonadCatch (Base mi),
+  :: ( MonadIO m, MonadMask m,
+       MonadSafe mi, MonadCatch (Base mi),
        MonadSafe mo, MonadCatch (Base mo),
        MonadSafe me, MonadCatch (Base me))
 
   => CreateProcess
 
-  -> IO ( Consumer ByteString mi ExitCode,
-          Producer ByteString mo ExitCode,
-          Producer ByteString me ExitCode )
+  -> m ( Consumer ByteString mi ExitCode,
+         Producer ByteString mo ExitCode,
+         Producer ByteString me ExitCode )
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output, and a 'Producer' for standard error
 

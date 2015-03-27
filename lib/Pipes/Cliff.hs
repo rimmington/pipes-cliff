@@ -93,7 +93,10 @@ module Pipes.Cliff
 
   , conveyor
   , background
+  , backgroundSafe
+  , conveyorSafe
   , waitForThread
+  , killThread
 
   -- * Running an 'Effect' in 'SafeT'
 

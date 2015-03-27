@@ -24,7 +24,6 @@ import qualified Pipes.Prelude as P
 import qualified Data.ByteString.Char8 as BS8
 
 
-
 -- | Produces a stream of 'BS8.ByteString', where each
 -- 'BS8.ByteString' is a shown integer.  This is an infinite stream.
 -- In the examples below we'll send this infinite stream off into a
@@ -57,26 +56,13 @@ numsToLess = tidyEffect $ produceNumbers >-> toLess
 -- Perfectly useless, but shows how to build pipelines.  Also
 -- squlches warning messages using the 'handler' option.
 alphaNumbers :: IO ExitCode
-alphaNumbers = runSafeT $ do
-  (toTr, fromTr) <- liftIO $ pipeInputOutput Inherit
+alphaNumbers = do
+  (toTr, fromTr) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"]) { handler = squelch }
   let toLess = pipeInput Inherit Inherit
         (procSpec "less" []) { handler = squelch }
   _ <- conveyor $ produceNumbers >-> toTr
-  lastPipeline <- conveyor $ fromTr >-> toLess
-  waitForThread lastPipeline
-
-{-
-
-alphaNumbers :: IO ExitCode
-alphaNumbers = runSafeT $ do
-  ((toTr, fromTr), _) <- pipeInputOutput Inherit
-    (procSpec "tr" ["[0-9]", "[a-z]"]) { handler = squelch }
-  (toLess, lessHan) <- pipeInput Inherit Inherit
-    (procSpec "less" []) { handler = squelch }
-  conveyor $ produceNumbers >-> toTr
-  conveyor $ fromTr >-> toLess
-  waitForProcess lessHan
+  tidyEffect $ fromTr >-> toLess
 
 
 -- | Produces an infinite stream of numbers, sends it to @tr@ for some
@@ -94,23 +80,20 @@ alphaNumbers = runSafeT $ do
 -- the @sh@ process's standard error will be much longer than the
 -- output the user actually viewed in @less@.
 standardOutputAndError :: IO BS8.ByteString
-standardOutputAndError = runSafeT $ do
-  ((toTr, fromTr), _) <- pipeInputOutput Inherit
+standardOutputAndError = do
+  (toTr, fromTr) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  ((toSh, fromShOut, fromShErr), _) <- pipeInputOutputError
+  (toSh, fromShOut, fromShErr) <- pipeInputOutputError
     (procSpec "sh" ["-c", script])
-  (toLess, lessHan) <- pipeInput Inherit Inherit (procSpec "less" [])
-  conveyor $ produceNumbers >-> toTr
-  conveyor $ fromTr >-> toSh
-  conveyor $ fromShOut >-> toLess
-  foldHan <-
-    background
-    . runSafeT
-    $ P.fold BS8.append BS8.empty id fromShErr
-  _ <- waitForProcess lessHan
-  waitForThread foldHan
+  let toLess = pipeInput Inherit Inherit (procSpec "less" [])
+  _ <- conveyor $ produceNumbers >-> toTr
+  _ <- conveyor $ fromTr >-> toSh
+  _ <- conveyor $ fromShOut >-> toLess
+  runSafeT
+    $ P.fold BS8.append BS8.empty id (fmap (const ()) fromShErr)
   where
     script = "while read line; do echo $line; echo $line 1>&2; done"
+
 
 -- | Like 'alphaNumbers' but just sends a limited number
 -- of numbers to @cat@.  A useful test to make sure that pipelines
@@ -118,13 +101,12 @@ standardOutputAndError = runSafeT $ do
 -- uses 'waitForProcess' to wait until @cat@ is done.
 limitedAlphaNumbers :: IO ExitCode
 limitedAlphaNumbers = runSafeT $ do
-  ((toTr, fromTr), _) <- pipeInputOutput Inherit
+  (toTr, fromTr) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  (toCat, catHan) <- pipeInput Inherit Inherit
-    (procSpec "cat" [])
-  conveyor $ produceNumbers >-> P.take 300 >-> toTr
-  conveyor $ fromTr >-> toCat
-  waitForProcess catHan
+  let toCat = pipeInput Inherit Inherit
+        (procSpec "cat" [])
+  _ <- conveyor $ produceNumbers >-> P.take 300 >-> (fmap (const ()) toTr)
+  tidyEffect $ fromTr >-> toCat
 
 -- | Produces a finite list of numbers, sends it to @tr@ for some
 -- mangling, and then puts the results into a 'BS8.ByteString' for
@@ -133,14 +115,8 @@ limitedAlphaNumbers = runSafeT $ do
 -- data type.
 alphaNumbersByteString :: IO BS8.ByteString
 alphaNumbersByteString = runSafeT $ do
-  ((toTr, fromTr), _) <- pipeInputOutput Inherit
+  (toTr, fromTr) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  conveyor $ produceNumbers >-> P.take 300 >-> toTr
-  threadHan <-
-    background
-    . runSafeT
-    $ P.fold BS8.append BS8.empty id fromTr
-  waitForThread threadHan
-
-
--}
+  _ <- conveyor $ produceNumbers >-> P.take 300 >-> (fmap (const ()) toTr)
+  runSafeT
+    $ P.fold BS8.append BS8.empty id (fmap (const ()) fromTr)
