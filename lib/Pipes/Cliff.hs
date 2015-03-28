@@ -58,64 +58,33 @@ module Pipes.Cliff
   , procSpec
   , squelch
 
-  -- * Creating processes
-  -- $process
-  
-  -- ** Type synonyms
+  -- * Type synonyms
   , Stdin
   , Outstream
   , Stdout
   , Stderr
 
-  -- ** Single 'Proxy'
-  -- $singles
+  -- * Creating processes
+  -- $process
+  
   , pipeInput
   , pipeOutput
   , pipeError
-
-  -- ** Automatic resource management
-  -- $automatic
   , pipeInputOutput
   , pipeInputError
   , pipeOutputError
   , pipeInputOutputError
 
-  -- ** Deterministic resource management
-  -- $deterministic
-  , pipeInputSafe
-  , pipeOutputSafe
-  , pipeErrorSafe
-  , pipeInputOutputSafe
-  , pipeInputErrorSafe
-  , pipeOutputErrorSafe
-  , pipeInputOutputErrorSafe
-  
   -- * 'Proxy' combinators
   , forwardRight
   , wrapRight
-
-  -- * Background operations
-
-  -- | Often it is necessary to run threads in the background; in
-  -- addition, all subprocesses run in the background.  These
-  -- functions allow you to launch threads in the background and to
-  -- wait on background threads and subprocesses.
-
   , conveyor
-  , background
-  , backgroundSafe
-  , conveyorSafe
-  , waitForThread
-  , killThread
-
-  -- * Running an 'Effect' in 'SafeT'
-
   , tidyEffect
 
-  -- * Retrieving subprocess properties
+  -- * Querying and terminating the process
   , ProcessHandle
-  , ProcInfo(..)
   , isStillRunning
+  , waitForProcess
   , terminateProcess
 
   -- * Errors and warnings

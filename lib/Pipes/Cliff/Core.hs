@@ -372,9 +372,11 @@ data Console = Console
 --
 -- Side effects: examines the process handle to see if it has yet
 -- returned a value.  Does not block; should return immediately.
-isStillRunning :: Process.ProcessHandle -> IO Bool
-isStillRunning h = fmap (maybe True (const False))
-  (Process.getProcessExitCode h)
+isStillRunning :: ProcessHandle -> IO Bool
+isStillRunning ph = do
+  cnsl <- phConsole ph
+  cd <- Process.getProcessExitCode (csHandle cnsl)
+  return . maybe True (const False) $ cd
 
 -- | All the shared properties of a set of Proxy.
 data ProcessHandle = ProcessHandle
@@ -392,8 +394,8 @@ addReleaser pnl rel = do
     modifyVar_ (csReleasers cnsl) (\ls -> return (rel : ls))
 
 -- | Terminates a process.
-destroyProcess :: ProcessHandle -> IO ()
-destroyProcess pnl = mask_ $ do
+terminateProcess :: ProcessHandle -> IO ()
+terminateProcess pnl = mask_ $ do
   cnsl <- phConsole pnl
   withLock (csLock cnsl) $ do
     let runFnlzr fnl = fnl `MC.catch` catcher
