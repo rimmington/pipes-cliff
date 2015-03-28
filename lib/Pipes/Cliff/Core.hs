@@ -1,4 +1,4 @@
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleContexts, RankNTypes #-}
 
 -- | This contains the innards of Cliff.  You probably won't need
 -- anything that's in here; "Pipes.Cliff" re-exports the most useful
@@ -31,7 +31,6 @@ import Control.Concurrent.Async
 import Control.Concurrent.MVar
 import System.Exit
 import qualified Control.Exception
-import qualified Control.Monad.Catch as MC
 import Control.Monad
 
 -- * Data types
@@ -398,7 +397,7 @@ terminateProcess :: ProcessHandle -> IO ()
 terminateProcess pnl = mask_ $ do
   cnsl <- phConsole pnl
   withLock (csLock cnsl) $ do
-    let runFnlzr fnl = fnl `MC.catch` catcher
+    let runFnlzr fnl = fnl `catch` catcher
         catcher e = return ()
           where _types = e :: Control.Exception.SomeException
     fnlzrs <- readVar (csReleasers cnsl)
@@ -492,11 +491,9 @@ conveyor = async . runSafeT . runEffect
 
 -- * Effects
 
--- | Runs in the foreground an effect in the 'SafeT' monad.  Called \"tidy\" because
--- the use of the 'SafeT' monad ensures that the effect will not leave
--- any stray processes or threads laying around.
-tidyEffect :: Effect (SafeT IO) a -> IO a
-tidyEffect = runSafeT . runEffect
+-- | Runs in the foreground an effect in the 'SafeT' monad.
+safeEffect :: Effect (SafeT IO) a -> IO a
+safeEffect = runSafeT . runEffect
 
 
 -- * Mailboxes
@@ -581,7 +578,23 @@ wrapRight = do
   x <- await
   yield (Right x)
   wrapRight
-
+  
+-- | Converts a 'Producer' that returns a particular type
+-- to one that never returns a value at all but that, instead, takes
+-- that return type and 'yield's it forever as a 'Left'.  Use it with
+-- '>>=', like so:
+--
+-- @
+-- alwaysUnit :: Monad m => Producer (Either () a) m r
+-- alwaysUnit = return () >>= immortal
+-- @
+--
+-- This is useful to convert a producer of values that might terminate
+-- into one that does not terminate, so that it can be fed into a
+-- 'Stdin'.  For an example of its use, see
+-- 'Penny.Cliff.Examples.limitedAlphaNumbers'.
+immortal :: Monad m => r -> Producer' (Either r a) m r'
+immortal a = forever (yield (Left a))
 
 -- * Production from and consumption to 'Handle's
 

@@ -79,7 +79,8 @@ module Pipes.Cliff
   , forwardRight
   , wrapRight
   , conveyor
-  , tidyEffect
+  , safeEffect
+  , immortal
 
   -- * Querying and terminating the process
   , ProcessHandle

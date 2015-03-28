@@ -137,6 +137,7 @@ stm = closedOpen "stm" [2,4,4] [2,5]
 mtl :: Package
 mtl = closedOpen "mtl" [2,2] [2,3]
 
+-- | Currently unused
 exceptions :: Package
 exceptions = closedOpen "exceptions" [0,8] [0,9]
 
@@ -149,7 +150,6 @@ libDeps = buildDepends
   , process
   , async
   , pipesConcurrency
-  , exceptions
   ]
 
 main :: IO ()

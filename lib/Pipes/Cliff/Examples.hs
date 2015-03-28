@@ -47,9 +47,9 @@ produceNumbers = go (0 :: Int)
 -- option.
 
 numsToLess :: IO (Maybe ExitCode, ExitCode)
-numsToLess = tidyEffect $ produceNumbers >-> wrapRight >-> toLess
-  where
-    toLess = pipeInput Inherit Inherit (procSpec "less" [])
+numsToLess = do
+  (toLess, _) <- pipeInput Inherit Inherit (procSpec "less" [])
+  safeEffect $ produceNumbers >-> wrapRight >-> toLess
 
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
@@ -57,14 +57,14 @@ numsToLess = tidyEffect $ produceNumbers >-> wrapRight >-> toLess
 -- squlches warning messages using the 'handler' option.
 alphaNumbers :: IO (ExitCode, ExitCode)
 alphaNumbers = do
-  (toTr, fromTr) <- pipeInputOutput Inherit
+  ((toTr, fromTr), _) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"]) { handler = squelch }
-  let toLess = pipeInput Inherit Inherit
+  (toLess, _) <- pipeInput Inherit Inherit
         (procSpec "less" []) { handler = squelch }
   toTrAsync <- conveyor $ produceNumbers >-> wrapRight >-> toTr
   toLessAsync <- conveyor $ fromTr >-> toLess
-  (_, trCode) <- waitForThread toTrAsync
-  (_, lessCode) <- waitForThread toLessAsync
+  (_, trCode) <- wait toTrAsync
+  (_, lessCode) <- wait toLessAsync
   return (trCode, lessCode)
 
 
@@ -84,11 +84,11 @@ alphaNumbers = do
 -- output the user actually viewed in @less@.
 standardOutputAndError :: IO BS8.ByteString
 standardOutputAndError = do
-  (toTr, fromTr) <- pipeInputOutput Inherit
+  ((toTr, fromTr), _) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  (toSh, fromShOut, fromShErr) <- pipeInputOutputError
+  ((toSh, fromShOut, fromShErr), _) <- pipeInputOutputError
     (procSpec "sh" ["-c", script])
-  let toLess = pipeInput Inherit Inherit (procSpec "less" [])
+  (toLess, _) <- pipeInput Inherit Inherit (procSpec "less" [])
   _ <- conveyor $ produceNumbers >-> wrapRight >-> toTr
   _ <- conveyor $ fromTr >-> toSh
   _ <- conveyor $ fromShOut >-> toLess
@@ -99,21 +99,22 @@ standardOutputAndError = do
     script = "while read line; do echo $line; echo $line 1>&2; done"
 
 
-{-
 -- | Like 'alphaNumbers' but just sends a limited number
 -- of numbers to @cat@.  A useful test to make sure that pipelines
 -- shut down automatically.
-limitedAlphaNumbers :: IO ExitCode
-limitedAlphaNumbers = runSafeT $ do
-  (toTr, fromTr) <- pipeInputOutput Inherit
+limitedAlphaNumbers :: IO (Maybe ExitCode, ExitCode)
+limitedAlphaNumbers = do
+  ((toTr, fromTr), _) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  let toCat = pipeInput Inherit Inherit (procSpec "cat" [])
-  _ <- conveyor
+  (toCat, _) <- pipeInput Inherit Inherit (procSpec "cat" [])
+  _ <- async 
+    . safeEffect
     $ produceNumbers
-    >-> P.take 300
     >-> wrapRight
-    >-> (fmap (const ()) toTr)
-  tidyEffect $ fromTr >-> toCat
+    >-> (P.take 300 >>= immortal)
+    >-> toTr
+  safeEffect $ fromTr >-> toCat
+
 
 -- | Produces a finite list of numbers, sends it to @tr@ for some
 -- mangling, and then puts the results into a 'BS8.ByteString' for
@@ -121,10 +122,14 @@ limitedAlphaNumbers = runSafeT $ do
 -- library to place the results of a pipeline into a simple strict
 -- data type.
 alphaNumbersByteString :: IO BS8.ByteString
-alphaNumbersByteString = runSafeT $ do
-  (toTr, fromTr) <- pipeInputOutput Inherit
+alphaNumbersByteString = do
+  ((toTr, fromTr), _) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  _ <- conveyor $ produceNumbers >-> P.take 300 >-> (fmap (const ()) toTr)
+  _ <- conveyor
+    $ produceNumbers
+    >-> wrapRight
+    >-> (P.take 300 >>= immortal)
+    >-> toTr
+  let trByteStrings = fromTr >-> forwardRight >> return ()
   runSafeT
-    $ P.fold BS8.append BS8.empty id (fmap (const ()) fromTr)
--}
+    $ P.fold BS8.append BS8.empty id trByteStrings
