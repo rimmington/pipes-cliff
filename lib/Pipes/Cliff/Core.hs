@@ -21,7 +21,6 @@ import System.Environment
 import Data.List (intersperse)
 import Control.Exception (IOException)
 import System.IO
-import System.Process (ProcessHandle)
 import qualified System.Process as Process
 import Pipes
 import Pipes.Safe
@@ -29,8 +28,7 @@ import qualified Data.ByteString as BS
 import qualified Pipes.Concurrent as PC
 import Data.ByteString (ByteString)
 import Control.Concurrent.Async
-import qualified Control.Concurrent.MVar as MV
-import Control.Concurrent.MVar (MVar)
+import Control.Concurrent.MVar
 import System.Exit
 import qualified Control.Exception
 import qualified Control.Monad.Catch as MC
@@ -286,52 +284,6 @@ convertCreateProcess inp out err a = Process.CreateProcess
 
 -- * MVar types
 
--- ** Overloaded MVar operations
-
-newMVar :: MonadIO m => a -> m (MVar a)
-newMVar a = liftIO (MV.newMVar a)
-
-takeMVar :: MonadIO m => MVar a -> m a
-takeMVar mv = liftIO (MV.takeMVar mv)
-
-putMVar :: MonadIO m => MVar a -> a -> m ()
-putMVar mv a = liftIO (MV.putMVar mv a)
-
-readMVar :: MonadIO m => MVar a -> m a
-readMVar mv = liftIO (MV.readMVar mv)
-
-evaluate :: MonadIO m => a -> m a
-evaluate v = liftIO (Control.Exception.evaluate v)
-
-modifyMVar
-  :: (MonadIO m, MonadCatch m, MonadMask m)
-  => MVar a -> (a -> m (a, b)) -> m b
-modifyMVar m io = mask $ \restore -> do
-  a <- takeMVar m
-  (a', b) <- restore (io a >>= evaluate) `MC.onException` putMVar m a
-  putMVar m a'
-  return b
-
-modifyMVar_
-  :: (MonadIO m, MonadCatch m, MonadMask m)
-  => MVar a -> (a -> m a) -> m ()
-modifyMVar_ m io = mask $ \restore -> do
-  a <- takeMVar m
-  a' <- restore (io a) `MC.onException` putMVar m a
-  putMVar m a'
-
-withMVar
-  :: (MonadCatch m, MonadMask m, MonadIO m)
-  => MVar a -> (a -> m b) -> m b
-withMVar m io = mask $ \restore -> do
-  a <- liftIO $ MV.takeMVar m
-  b <- restore (io a) `MC.onException` liftIO (MV.putMVar m a)
-  liftIO $ MV.putMVar m a
-  return b
-
-newEmptyMVar :: MonadIO m => m (MVar a)
-newEmptyMVar = liftIO MV.newEmptyMVar
-
 -- ** Lock
 
 -- | Guarantees single-thread access
@@ -340,10 +292,10 @@ newEmptyMVar = liftIO MV.newEmptyMVar
 -- <http://neilmitchell.blogspot.com/2012/06/flavours-of-mvar_04.html>
 type Lock = MVar ()
 
-newLock :: MonadIO m => m Lock
+newLock :: IO Lock
 newLock = newMVar ()
 
-withLock :: (MonadCatch m, MonadIO m, MonadMask m) => Lock -> m a -> m a
+withLock ::  Lock -> IO a -> IO a
 withLock x = withMVar x . const
 
 -- ** Var
@@ -352,20 +304,16 @@ withLock x = withMVar x . const
 
 type Var a = MVar a
 
-newVar :: MonadIO m => a -> m (Var a)
+newVar :: a -> IO (Var a)
 newVar = newMVar
 
-modifyVar
-  :: (MonadMask m, MonadCatch m, MonadIO m)
-  => Var a -> (a -> m (a, b)) -> m b
+modifyVar :: Var a -> (a -> IO (a, b)) -> IO b
 modifyVar = modifyMVar
 
-modifyVar_
-  :: (MonadMask m, MonadIO m, MonadCatch m)
-  => Var a -> (a -> m a) -> m ()
+modifyVar_ :: Var a -> (a -> IO a) -> IO ()
 modifyVar_ = modifyMVar_
 
-readVar :: MonadIO m => Var a -> m a
+readVar :: Var a -> IO a
 readVar = readMVar
 
 -- ** Barrier
@@ -374,13 +322,13 @@ readVar = readMVar
 -- more times.
 type Barrier a = MVar a
 
-newBarrier :: MonadIO m => m (Barrier a)
+newBarrier :: IO (Barrier a)
 newBarrier = newEmptyMVar
 
-signalBarrier :: MonadIO m => Barrier a -> a -> m ()
+signalBarrier :: Barrier a -> a -> IO ()
 signalBarrier = putMVar
 
-waitBarrier :: MonadIO m => Barrier a -> m a
+waitBarrier :: Barrier a -> IO a
 waitBarrier = readMVar
 
 -- ** MVar abstractions
@@ -392,7 +340,7 @@ waitBarrier = readMVar
 --
 -- Side effects: creates a 'Var'.  Returns an IO action that modifies
 -- the contents of that 'Var'.
-once :: (MonadMask m, MonadIO m, MonadCatch m) => m a -> m (m a)
+once :: IO a -> IO (IO a)
 once act = do
   var <- newVar Nothing
   return $ join $ modifyVar var $ \v -> case v of
@@ -424,31 +372,29 @@ data Console = Console
 --
 -- Side effects: examines the process handle to see if it has yet
 -- returned a value.  Does not block; should return immediately.
-isStillRunning :: ProcessHandle -> IO Bool
+isStillRunning :: Process.ProcessHandle -> IO Bool
 isStillRunning h = fmap (maybe True (const False))
   (Process.getProcessExitCode h)
 
 -- | All the shared properties of a set of Proxy.
-data Panel = Panel
-  { pnlCreateProcess :: CreateProcess
-  , pnlConsole :: IO Console
+data ProcessHandle = ProcessHandle
+  { phCreateProcess :: CreateProcess
+  , phConsole :: IO Console
   }
   
--- | Add a finalizer to the Panel.  When the finalizers are run, all
+-- | Add a finalizer to the ProcessHandle.  When the finalizers are run, all
 -- exceptions are ignored, except asynchronous exceptions, which are
 -- masked.
-addReleaser :: Panel -> IO () -> IO ()
+addReleaser :: ProcessHandle -> IO () -> IO ()
 addReleaser pnl rel = do
-  cnsl <- liftIO $ pnlConsole pnl
+  cnsl <- liftIO $ phConsole pnl
   withLock (csLock cnsl) $
     modifyVar_ (csReleasers cnsl) (\ls -> return (rel : ls))
 
 -- | Terminates a process.
-destroyProcess
-  :: Panel
-  -> IO ()
+destroyProcess :: ProcessHandle -> IO ()
 destroyProcess pnl = mask_ $ do
-  cnsl <- pnlConsole pnl
+  cnsl <- phConsole pnl
   withLock (csLock cnsl) $ do
     let runFnlzr fnl = fnl `MC.catch` catcher
         catcher e = return ()
@@ -456,12 +402,14 @@ destroyProcess pnl = mask_ $ do
     fnlzrs <- readVar (csReleasers cnsl)
     mapM_ runFnlzr fnlzrs
 
--- | Gets the exit code of the process that belongs to the 'Panel'.
--- Side effects: may block if process has not yet exited.
-getExitCode :: Panel -> IO ExitCode
-getExitCode pnl = pnlConsole pnl >>= csExitCode
+-- | Gets the exit code of the process that belongs to the 'ProcessHandle'.
+-- Side effects: may block if process has not yet exited.  Usually you
+-- can get the exit code through more idiomatic @pipes@ functions, as
+-- the various 'Proxy' return the 'ExitCode'.
+waitForProcess :: ProcessHandle -> IO ExitCode
+waitForProcess pnl = phConsole pnl >>= csExitCode
 
--- | Creates a new Panel.
+-- | Creates a new ProcessHandle.
 --
 -- Side effects: creates an MVar; this MVar acts as a unique
 -- identifier which allows weak references to work more effectively
@@ -477,17 +425,16 @@ getExitCode pnl = pnlConsole pnl >>= csExitCode
 -- Because this IO action was created with 'once', that means only
 -- one thread ever does the @wait@, which avoids a bug in
 -- "System.Process".
-newPanel
+newProcessHandle
   :: Maybe NonPipe
   -> Maybe NonPipe
   -> Maybe NonPipe
   -> CreateProcess
-  -> IO Panel
-newPanel inp out err cp = liftM2 Panel (return cp)
-  (liftIO . once . liftIO $ act)
+  -> IO ProcessHandle
+newProcessHandle inp out err cp = liftM2 ProcessHandle (return cp) (once act)
   where
     act = mask_ $ do
-      (inp', out', err', han) <- liftIO $ Process.createProcess
+      (inp', out', err', han) <- Process.createProcess
         (convertCreateProcess inp out err cp)
       let killHan mayH desc = case mayH of
             Nothing -> return ()
@@ -495,9 +442,9 @@ newPanel inp out err cp = liftM2 Panel (return cp)
           destroyers =
             [ killHan inp' Input, killHan out' (Outbound Output),
               killHan err' (Outbound Error),
-              liftIO $ Process.terminateProcess han ]
-      getCode <- once $ liftIO (Process.waitForProcess han)
-      _ <- liftIO $ PC.forkIO (getCode >> return ())
+              Process.terminateProcess han ]
+      getCode <- once $ Process.waitForProcess han
+      _ <- PC.forkIO (getCode >> return ())
       lock <- newLock
       rlsrs <- newVar destroyers
       return $ Console inp' out' err' han getCode lock rlsrs
@@ -510,14 +457,13 @@ newPanel inp out err cp = liftM2 Panel (return cp)
 -- place; the recipient of the 'Oopsie' might have additional side
 -- effects.
 handleException
-  :: MonadIO m
-  => Activity
+  :: Activity
   -> HandleDesc
   -> CmdSpec
   -> (Oopsie -> IO ())
   -> IOException
-  -> m ()
-handleException act desc spec sender exc = liftIO $ sender oops
+  -> IO ()
+handleException act desc spec sender exc = sender oops
   where
     oops = Oopsie act desc spec exc
 
@@ -530,43 +476,24 @@ closeHandleNoThrow
   -> (Oopsie -> IO ())
   -> m ()
 closeHandleNoThrow hand desc spec hndlr
-  = (liftIO $ hClose hand) `catch` (handleException Closing desc spec hndlr)
+  = (liftIO $ hClose hand) `catch`
+    (liftIO . handleException Closing desc spec hndlr)
 
 
 -- * Threads
 
--- | Runs a thread in the background.
-background
-  :: MonadIO m
-  => IO a
-  -> m (Async a)
-background = liftIO . async
-
 -- | Runs in the background an effect, typically one that is moving
 -- data from one process to another.  For examples of its usage, see
 -- "Pipes.Cliff.Examples".
-conveyor :: MonadIO m => Effect (SafeT IO) a -> m (Async a)
-conveyor = background . liftIO . runSafeT . runEffect
-
-
--- | A version of 'Control.Concurrent.Async.wait' with an overloaded
--- 'MonadIO' return type.  Allows you to wait for the return value of
--- threads launched with 'background'.  If the thread throws an
--- exception, 'waitForThread' will throw that same exception.
-waitForThread :: MonadIO m => Async a -> m a
-waitForThread = liftIO . wait
-
--- | Kills a thread.
-killThread :: MonadIO m => Async a -> m ()
-killThread = liftIO . cancel
-
+conveyor :: Effect (SafeT IO) a -> IO (Async a)
+conveyor = async . runSafeT . runEffect
 
 -- * Effects
 
 -- | Runs in the foreground an effect in the 'SafeT' monad.  Called \"tidy\" because
 -- the use of the 'SafeT' monad ensures that the effect will not leave
 -- any stray processes or threads laying around.
-tidyEffect :: (MonadIO m, MonadMask m) => Effect (SafeT m) a -> m a
+tidyEffect :: Effect (SafeT IO) a -> IO a
 tidyEffect = runSafeT . runEffect
 
 
@@ -592,10 +519,10 @@ messageBuffer = PC.bounded 1
 -- to an exhausted mailbox.  This will signal to the other side of
 -- the mailbox that the mailbox is sealed.
 newMailbox
-  :: (MonadIO m, MonadSafe mi, MonadSafe mo)
-  => m (Consumer a mi (), Producer a mo ())
+  :: (MonadSafe mi, MonadSafe mo)
+  => IO (Consumer a mi (), Producer a mo ())
 newMailbox = do
-  (toBox, fromBox, seal) <- liftIO $ PC.spawn' messageBuffer
+  (toBox, fromBox, seal) <- PC.spawn' messageBuffer
   let csmr = register (liftIO $ PC.atomically seal)
              >> PC.toOutput toBox
       pdcr = register (liftIO $ PC.atomically seal)
@@ -634,104 +561,6 @@ type Stderr r m a = Outstream r m a
 
 -- * 'Proxy' combinators
 
-
--- * Production from and consumption to 'Handle's
-
--- | I have no idea what this should be.  I'll start with a simple
--- small value and see how it works.
-bufSize :: Int
-bufSize = 1024
-
-
--- | Initialize a handle.  Returns a computation in the MonadSafe
--- monad.  That computation has a registered finalizer that will close
--- a particular handle that is found in the 'Panel'.  As a side
--- effect, the IO action creating the 'Panel' is viewed, meaning that
--- the process will launch if it hasn't already done so.
-initHandle
-  :: (MonadIO m, MonadMask m, MonadSafe mi, MonadCatch (Base mi))
-  => HandleDesc
-  -- ^ Used for error messages
-  -> (Console -> Handle)
-  -- ^ Fetch the handle to close from the 'Panel'.
-  -> Panel
-  -- ^ Has the 'Handle' that will be closed.
-  -> (Handle -> mi a)
-  -- ^ The remainder of the computation.
-  -> m (mi a)
-initHandle desc get pnl mkProxy = mask_ $ do
-  cnsl <- liftIO . pnlConsole $ pnl
-  return $ mask $ \restore ->
-    let han = get cnsl
-        fnlzr = closeHandleNoThrow han desc (cmdspec . pnlCreateProcess $ pnl)
-          (handler . pnlCreateProcess $ pnl)
-    in register fnlzr >> (restore $ mkProxy han)
-
--- Returns a Consumer for process standard input.
---
--- Side effects: Process is started if it isn't already.  The returned
--- computation will await values and passes them on to the process
--- standard input mailbox.  Any IO exceptions are caught, and
--- consumption terminates.
-consumeToHandle
-  :: ( MonadIO m, MonadIO mi, MonadCatch mi, MonadSafe mi,
-       MonadCatch (Base mi), MonadMask m)
-  => Panel
-  -> m (Consumer ByteString mi ())
-consumeToHandle pnl = initHandle Input get pnl fn
-  where
-    get cnsl = case csIn cnsl of
-      Just h -> h
-      Nothing -> error "consumeToHandle: handle not initialized"
-    fn han = do
-      let hndlr = handleException Writing Input
-            (cmdspec . pnlCreateProcess $ pnl)
-            (handler . pnlCreateProcess $ pnl)
-          go = do
-            bs <- await
-            liftIO $ BS.hPut han bs
-            go
-      go `catch` hndlr
-
--- | Produce values from a process standard output.  Process is
--- started if it isn't already.
-produceFromHandle
-  :: ( MonadIO m, MonadIO mi, MonadCatch mi, MonadSafe mi,
-       MonadCatch (Base mi), MonadMask m)
-  => Outbound
-  -> Panel
-  -> m (Producer ByteString mi ())
-produceFromHandle outb pnl = initHandle (Outbound outb) get pnl fn
-  where
-    get cnsl = case outb of
-      Output -> case csOut cnsl of
-        Nothing -> error "produceFromHandle: stdout not initialized"
-        Just h -> h
-      Error -> case csErr cnsl of
-        Nothing -> error "produceFromHandle: stderr not initialized"
-        Just h -> h
-    fn han =
-      let hndlr = handleException Reading (Outbound outb)
-            (cmdspec . pnlCreateProcess $ pnl)
-            (handler . pnlCreateProcess $ pnl)
-          go bs
-            | BS.null bs = return ()
-            | otherwise = yield bs >> produce
-          produce = liftIO (BS.hGetSome han bufSize) >>= go
-      in produce `catch` hndlr
-
-
--- | Given an 'Async', waits for that thread to finish processing
--- values.  When it completes, wait for the process exit code.
-finishProxy
-  :: MonadIO m
-  => Async ()
-  -> Panel
-  -> m ExitCode
-finishProxy thread pnl = do
-  _ <- liftIO $ wait thread
-  liftIO $ getExitCode pnl
-  
 -- | Forwards only Right values; terminates on the first Left value
 -- and returns its value.  Useful to forward the output of an
 -- 'Outstream' to a pipeline that expects only 'ByteString's.
@@ -752,12 +581,106 @@ wrapRight = do
   wrapRight
 
 
+-- * Production from and consumption to 'Handle's
+
+-- | I have no idea what this should be.  I'll start with a simple
+-- small value and see how it works.
+bufSize :: Int
+bufSize = 1024
+
+
+-- | Initialize a handle.  Returns a computation in the MonadSafe
+-- monad.  That computation has a registered finalizer that will close
+-- a particular handle that is found in the 'ProcessHandle'.  As a side
+-- effect, the IO action creating the 'ProcessHandle' is viewed, meaning that
+-- the process will launch if it hasn't already done so.
+initHandle
+  :: (MonadSafe mi, MonadCatch (Base mi))
+  => HandleDesc
+  -- ^ Used for error messages
+  -> (Console -> Handle)
+  -- ^ Fetch the handle to close from the 'ProcessHandle'.
+  -> ProcessHandle
+  -- ^ Has the 'Handle' that will be closed.
+  -> (Handle -> mi a)
+  -- ^ The remainder of the computation.
+  -> IO (mi a)
+initHandle desc get pnl mkProxy = mask_ $ do
+  cnsl <- liftIO . phConsole $ pnl
+  return $ mask $ \restore ->
+    let han = get cnsl
+        fnlzr = closeHandleNoThrow han desc (cmdspec . phCreateProcess $ pnl)
+          (handler . phCreateProcess $ pnl)
+    in register fnlzr >> (restore $ mkProxy han)
+
+-- Returns a Consumer for process standard input.
+--
+-- Side effects: Process is started if it isn't already.  The returned
+-- computation will await values and passes them on to the process
+-- standard input mailbox.  Any IO exceptions are caught, and
+-- consumption terminates.
+consumeToHandle
+  :: (MonadSafe mi, MonadCatch (Base mi))
+  => ProcessHandle
+  -> IO (Consumer ByteString mi ())
+consumeToHandle pnl = initHandle Input get pnl fn
+  where
+    get cnsl = case csIn cnsl of
+      Just h -> h
+      Nothing -> error "consumeToHandle: handle not initialized"
+    fn han = do
+      let hndlr = liftIO . handleException Writing Input
+            (cmdspec . phCreateProcess $ pnl)
+            (handler . phCreateProcess $ pnl)
+          go = do
+            bs <- await
+            liftIO $ BS.hPut han bs
+            go
+      go `catch` hndlr
+
+-- | Produce values from a process standard output.  Process is
+-- started if it isn't already.
+produceFromHandle
+  :: (MonadSafe mi, MonadCatch (Base mi))
+  => Outbound
+  -> ProcessHandle
+  -> IO (Producer ByteString mi ())
+produceFromHandle outb pnl = initHandle (Outbound outb) get pnl fn
+  where
+    get cnsl = case outb of
+      Output -> case csOut cnsl of
+        Nothing -> error "produceFromHandle: stdout not initialized"
+        Just h -> h
+      Error -> case csErr cnsl of
+        Nothing -> error "produceFromHandle: stderr not initialized"
+        Just h -> h
+    fn han =
+      let hndlr = liftIO . handleException Reading (Outbound outb)
+            (cmdspec . phCreateProcess $ pnl)
+            (handler . phCreateProcess $ pnl)
+          go bs
+            | BS.null bs = return ()
+            | otherwise = yield bs >> produce
+          produce = liftIO (BS.hGetSome han bufSize) >>= go
+      in produce `catch` hndlr
+
+
+-- | Given an 'Async', waits for that thread to finish processing
+-- values.  When it completes, wait for the process exit code.
+finishProxy
+  :: Async ()
+  -> ProcessHandle
+  -> IO ExitCode
+finishProxy thread pnl = do
+  _ <- wait thread
+  liftIO $ waitForProcess pnl
+  
 -- | Takes all steps necessary to get a 'Consumer' for standard
 -- input.  Sets up a mailbox, runs a conveyor in the background.  Then
 -- receives streaming data, and then gets the process exit code.
 runInputHandle
   :: (MonadSafe mi, MonadCatch (Base mi))
-  => Panel
+  => ProcessHandle
   -- ^
   -> IO (Stdin mi r)
   -- ^
@@ -767,7 +690,7 @@ runInputHandle pnl = mask_ $ do
   asyncId <- conveyor $ fromBox >-> csmr
   addReleaser pnl (cancel asyncId)
   let f upstream = do
-        thisCode <- finishProxy asyncId pnl
+        thisCode <- liftIO $ finishProxy asyncId pnl
         return $ case upstream of
           Left firstCode -> (Just firstCode, thisCode)
           Right _downstreamStopped -> (Nothing, thisCode)
@@ -781,7 +704,7 @@ runOutputHandle
   :: (MonadSafe mi, MonadCatch (Base mi))
   => Outbound
   -- ^
-  -> Panel
+  -> ProcessHandle
   -- ^
   -> IO (Outstream r mi ExitCode)
   -- ^
@@ -791,7 +714,7 @@ runOutputHandle outb pnl = mask_ $ do
   asyncId <- conveyor $ pdcFromHan >-> toBox
   addReleaser pnl (cancel asyncId)
   let f _ = do
-        code <- finishProxy asyncId pnl
+        code <- liftIO $ finishProxy asyncId pnl
         forever (return (Left code))
   return $ (fromBox >-> wrapRight) >>= f
 
@@ -810,10 +733,10 @@ pipeInput
 
   -> CreateProcess
 
-  -> IO (Stdin m a, Panel)
+  -> IO (Stdin m a, ProcessHandle)
   -- ^ A 'Consumer' for standard input
 pipeInput out err cp = mask_ $ do
-  pnl <- newPanel Nothing (Just out) (Just err) cp
+  pnl <- newProcessHandle Nothing (Just out) (Just err) cp
   inp <- runInputHandle pnl
   return (inp, pnl)
     
@@ -830,10 +753,10 @@ pipeOutput
 
   -> CreateProcess
 
-  -> IO (Stdout r mo ExitCode, Panel)
+  -> IO (Stdout r mo ExitCode, ProcessHandle)
   -- ^ A 'Producer' for standard output
 pipeOutput inp err cp = mask_ $ do
-  pnl <- newPanel (Just inp) Nothing (Just err) cp
+  pnl <- newProcessHandle (Just inp) Nothing (Just err) cp
   pdcr <- runOutputHandle Output pnl
   return (pdcr, pnl)
 
@@ -850,11 +773,11 @@ pipeError
 
   -> CreateProcess
 
-  -> IO (Stderr r me ExitCode, Panel)
+  -> IO (Stderr r me ExitCode, ProcessHandle)
   -- ^ A 'Producer' for standard error
 
 pipeError inp out cp = mask_ $ do
-  pnl <- newPanel (Just inp) (Just out) Nothing cp
+  pnl <- newProcessHandle (Just inp) (Just out) Nothing cp
   pdcr <- runOutputHandle Error pnl
   return (pdcr, pnl)
 
@@ -869,12 +792,12 @@ pipeInputOutput
 
   -> CreateProcess
 
-  -> IO ((Stdin mi a, Stdout r mo ExitCode), Panel)
+  -> IO ((Stdin mi a, Stdout r mo ExitCode), ProcessHandle)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
 
 pipeInputOutput err cp = mask_ $ do
-  pnl <- newPanel Nothing Nothing (Just err) cp
+  pnl <- newProcessHandle Nothing Nothing (Just err) cp
   csmr <- runInputHandle pnl
   pdcr <- runOutputHandle Output pnl
   return ((csmr, pdcr), pnl)
@@ -890,11 +813,11 @@ pipeInputError
   -- ^ Standard output
   -> CreateProcess
 
-  -> IO ((Stdin mi a, Stderr r me ExitCode), Panel)
+  -> IO ((Stdin mi a, Stderr r me ExitCode), ProcessHandle)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
 pipeInputError out cp = do
-  pnl <- newPanel Nothing (Just out) Nothing cp
+  pnl <- newProcessHandle Nothing (Just out) Nothing cp
   csmr <- runInputHandle pnl
   pdcr <- runOutputHandle Error pnl
   return ((csmr, pdcr), pnl)
@@ -911,12 +834,12 @@ pipeOutputError
 
   -> CreateProcess
 
-  -> IO ((Stdout ro mo ExitCode, Stderr re me ExitCode), Panel)
+  -> IO ((Stdout ro mo ExitCode, Stderr re me ExitCode), ProcessHandle)
   -- ^ A 'Producer' for standard output and a 'Producer' for standard
   -- error
 
 pipeOutputError inp cp = do
-  pnl <- newPanel (Just inp) Nothing Nothing cp
+  pnl <- newProcessHandle (Just inp) Nothing Nothing cp
   pdcrOut <- runOutputHandle Output pnl
   pdcrErr <- runOutputHandle Error pnl
   return ((pdcrOut, pdcrErr), pnl)
@@ -931,12 +854,14 @@ pipeInputOutputError
 
   => CreateProcess
 
-  -> IO ((Stdin mi a, Stdout ro mo ExitCode, Stderr re me ExitCode), Panel)
+  -> IO ( (Stdin mi a, Stdout ro mo ExitCode, Stderr re me ExitCode)
+        , ProcessHandle
+        )
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output, and a 'Producer' for standard error
 
 pipeInputOutputError cp = do
-  pnl <- newPanel Nothing Nothing Nothing cp
+  pnl <- newProcessHandle Nothing Nothing Nothing cp
   csmr <- runInputHandle pnl
   pdcrOut <- runOutputHandle Output pnl
   pdcrErr <- runOutputHandle Error pnl
