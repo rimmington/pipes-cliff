@@ -60,6 +60,12 @@ module Pipes.Cliff
 
   -- * Creating processes
   -- $process
+  
+  -- ** Type synonyms
+  , Stdin
+  , Outstream
+  , Stdout
+  , Stderr
 
   -- ** Single 'Proxy'
   -- $singles
@@ -83,6 +89,10 @@ module Pipes.Cliff
   , pipeInputErrorSafe
   , pipeOutputErrorSafe
   , pipeInputOutputErrorSafe
+  
+  -- * 'Proxy' combinators
+  , forwardRight
+  , wrapRight
 
   -- * Background operations
 
@@ -119,6 +129,7 @@ module Pipes.Cliff
 
   -- * Re-exports
   -- $reexports
+  , module Control.Concurrent.Async
   , module Pipes
   , module Pipes.Safe
   , module System.Exit
@@ -127,6 +138,7 @@ module Pipes.Cliff
   -- $designNotes
   ) where
 
+import Control.Concurrent.Async
 import Pipes.Cliff.Core
 import Pipes
 import Pipes.Safe
@@ -173,6 +185,8 @@ at all.  For that, just use 'System.Process.createProcess' in
 -}
 
 {- $reexports
+
+   * "Control.Concurrent.Async" reexports all bindings
 
    * "Pipes" reexports all bindings
 

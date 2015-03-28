@@ -46,23 +46,26 @@ produceNumbers = go (0 :: Int)
 -- error.  This is normal.  To suppress them, see the 'handler'
 -- option.
 
-numsToLess :: IO ExitCode
-numsToLess = tidyEffect $ produceNumbers >-> toLess
+numsToLess :: IO (Maybe ExitCode, ExitCode)
+numsToLess = tidyEffect $ produceNumbers >-> wrapRight >-> toLess
   where
     toLess = pipeInput Inherit Inherit (procSpec "less" [])
-    
+
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
 -- Perfectly useless, but shows how to build pipelines.  Also
 -- squlches warning messages using the 'handler' option.
-alphaNumbers :: IO ExitCode
+alphaNumbers :: IO (ExitCode, ExitCode)
 alphaNumbers = do
   (toTr, fromTr) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"]) { handler = squelch }
   let toLess = pipeInput Inherit Inherit
         (procSpec "less" []) { handler = squelch }
-  _ <- conveyor $ produceNumbers >-> toTr
-  tidyEffect $ fromTr >-> toLess
+  toTrAsync <- conveyor $ produceNumbers >-> wrapRight >-> toTr
+  toLessAsync <- conveyor $ fromTr >-> toLess
+  (_, trCode) <- waitForThread toTrAsync
+  (_, lessCode) <- waitForThread toLessAsync
+  return (trCode, lessCode)
 
 
 -- | Produces an infinite stream of numbers, sends it to @tr@ for some
@@ -86,26 +89,30 @@ standardOutputAndError = do
   (toSh, fromShOut, fromShErr) <- pipeInputOutputError
     (procSpec "sh" ["-c", script])
   let toLess = pipeInput Inherit Inherit (procSpec "less" [])
-  _ <- conveyor $ produceNumbers >-> toTr
+  _ <- conveyor $ produceNumbers >-> wrapRight >-> toTr
   _ <- conveyor $ fromTr >-> toSh
   _ <- conveyor $ fromShOut >-> toLess
   runSafeT
-    $ P.fold BS8.append BS8.empty id (fmap (const ()) fromShErr)
+    $ P.fold BS8.append BS8.empty id
+      (fmap (const ()) (fromShErr >-> forwardRight))
   where
     script = "while read line; do echo $line; echo $line 1>&2; done"
 
 
+{-
 -- | Like 'alphaNumbers' but just sends a limited number
 -- of numbers to @cat@.  A useful test to make sure that pipelines
--- shut down automatically.  Runs both pipelines in the background and
--- uses 'waitForProcess' to wait until @cat@ is done.
+-- shut down automatically.
 limitedAlphaNumbers :: IO ExitCode
 limitedAlphaNumbers = runSafeT $ do
   (toTr, fromTr) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
-  let toCat = pipeInput Inherit Inherit
-        (procSpec "cat" [])
-  _ <- conveyor $ produceNumbers >-> P.take 300 >-> (fmap (const ()) toTr)
+  let toCat = pipeInput Inherit Inherit (procSpec "cat" [])
+  _ <- conveyor
+    $ produceNumbers
+    >-> P.take 300
+    >-> wrapRight
+    >-> (fmap (const ()) toTr)
   tidyEffect $ fromTr >-> toCat
 
 -- | Produces a finite list of numbers, sends it to @tr@ for some
@@ -120,3 +127,4 @@ alphaNumbersByteString = runSafeT $ do
   _ <- conveyor $ produceNumbers >-> P.take 300 >-> (fmap (const ()) toTr)
   runSafeT
     $ P.fold BS8.append BS8.empty id (fmap (const ()) fromTr)
+-}

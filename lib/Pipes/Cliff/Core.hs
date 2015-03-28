@@ -689,6 +689,38 @@ newMailbox = do
              >> PC.fromInput fromBox
   return (csmr, pdcr)
 
+-- * Type synonyms
+
+-- | Consumer that reads values for a process standard input.  Its
+-- input value is described in 'Outstream'.  The result type is a
+-- tuple @(a, b)@, where @a@ is the return code from the upstream
+-- process, and @b@ is the return code from this process.  @a@ will be
+-- Nothing if the downstream process terminated before the upstream
+-- one, or @Just@ if the upstream process terminated first.  The
+-- 'Consumer' process's process exit code is always available and is
+-- returned in @b@.
+type Stdin m a
+  = Consumer (Either a ByteString) m (Maybe a, ExitCode)
+
+-- | Producer of values from a process standard output or error.  'yield' a
+-- @'Left' 'ExitCode'@ if the stream is done producing values, or a
+-- @'Right' 'ByteString'@ if the stream is still producing values.
+-- 'Outstream' is polymorphic in its return type, @r@, becasuse the
+-- 'Outstream' never stops yielding values; instead, it just 'yield's
+-- its exit code over and over again after the process terminates.
+
+type Outstream r m a
+  = Producer (Either a ByteString) m r
+
+-- | Producer of values from a process standard output.
+type Stdout r m a = Outstream r m a
+
+-- | Producer of values from a process standard error.
+type Stderr r m a = Outstream r m a
+
+
+-- * 'Proxy' combinators
+
 
 -- * Production from and consumption to 'Handle's
 
@@ -794,6 +826,26 @@ finishProxy
 finishProxy thread pnl = do
   _ <- liftIO $ wait thread
   liftIO $ getExitCode pnl
+  
+-- | Forwards only Right values; terminates on the first Left value
+-- and returns its value.  Useful to forward the output of an
+-- 'Outstream' to a pipeline that expects only 'ByteString's.
+forwardRight :: Monad m => Pipe (Either a b) b m a
+forwardRight = do
+  ei <- await
+  case ei of
+    Left l -> return l
+    Right r -> yield r >> forwardRight
+
+-- | Forwards all values, after rewrapping them in a Right.  Useful to
+-- convert a producer of 'ByteString' into a 'Producer' of 'Either'
+-- which can be fed to a 'Stdin'.
+wrapRight :: Monad m => Pipe a (Either l a) m r
+wrapRight = do
+  x <- await
+  yield (Right x)
+  wrapRight
+
 
 -- | Takes all steps necessary to get a 'Consumer' for standard
 -- input.  Sets up a mailbox, runs a conveyor in the background.  Then
@@ -801,14 +853,21 @@ finishProxy thread pnl = do
 runInputHandle
   :: (MonadSafe m, MonadSafe mi, MonadCatch (Base mi))
   => Panel
+  -- ^
   -> Consumer ByteString (SafeT IO) ()
-  -> m (Consumer ByteString mi ExitCode)
+  -- ^
+  -> m (Consumer (Either a ByteString) mi (Maybe a, ExitCode))
+  -- ^
 runInputHandle pnl csmToHan = do
   (toBox, fromBox) <- newMailbox
   asyncId <- conveyor $ fromBox >-> csmToHan
-  return $ do
-    toBox
-    finishProxy asyncId pnl
+  let f upstream = do
+        thisCode <- finishProxy asyncId pnl
+        return $ case upstream of
+          Left firstCode -> (Just firstCode, thisCode)
+          Right _downstreamStopped -> (Nothing, thisCode)
+
+  return $ ((fmap Left forwardRight) >-> fmap Right toBox) >>= f
 
 -- | Takes all steps necessary to get a 'Producer' for standard
 -- input.  Sets up a mailbox, runs a conveyor in the background.  Then
@@ -816,15 +875,19 @@ runInputHandle pnl csmToHan = do
 runOutputHandle
   :: (MonadSafe m, MonadSafe mi, MonadCatch (Base mi))
   => Panel
+  -- ^
   -> Producer ByteString (SafeT IO) ()
-  -> m (Producer ByteString mi ExitCode)
+  -- ^
+  -> m (Outstream r mi ExitCode)
+  -- ^
 runOutputHandle pnl pdcFromHan = do
   (toBox, fromBox) <- newMailbox
   asyncId <- conveyor $ pdcFromHan >-> toBox
-  return $ do
-    fromBox
-    finishProxy asyncId pnl
-    
+  let f _ = do
+        code <- finishProxy asyncId pnl
+        forever (return (Left code))
+  return $ (fromBox >-> wrapRight) >>= f
+
 -- | Creates a Panel.  Also registers a finalizer that will destroy
 -- the process when the MonadSafe computation exits.  The destruction
 -- of the process should trigger all other finalizers: the destruction
@@ -857,7 +920,7 @@ pipeInput
 
   -> CreateProcess
 
-  -> Consumer ByteString m ExitCode
+  -> Stdin m a
   -- ^ A 'Consumer' for standard input
 pipeInput out err cp = mask $ \restore -> do
   pnl <- newPanel Nothing (Just out) (Just err) cp
@@ -877,7 +940,7 @@ pipeInputSafe
 
   -> CreateProcess
 
-  -> Consumer ByteString mi ExitCode
+  -> Stdin mi a
   -- ^ A 'Consumer' for standard input
 pipeInputSafe out err cp = do
   pnl <- createAndRegisterPanel (newPanel Nothing (Just out) (Just err) cp)
@@ -886,7 +949,7 @@ pipeInputSafe out err cp = do
 
 -- | Create a 'Producer' for standard output.
 pipeOutput
-  :: (MonadSafe m, MonadCatch (Base m))
+  :: (MonadSafe mo, MonadCatch (Base mo))
 
   => NonPipe
   -- ^ Standard input
@@ -896,7 +959,7 @@ pipeOutput
 
   -> CreateProcess
 
-  -> Producer ByteString m ExitCode
+  -> Stdout r mo ExitCode
   -- ^ A 'Producer' for standard output
 pipeOutput inp err cp = mask $ \restore -> do
   pnl <- newPanel (Just inp) Nothing (Just err) cp
@@ -915,7 +978,7 @@ pipeOutputSafe
 
   -> CreateProcess
 
-  -> Producer ByteString mo ExitCode
+  -> Stdout r mo ExitCode
   -- ^ A 'Producer' for standard output
 pipeOutputSafe inp err cp = do
   pnl <- createAndRegisterPanel (newPanel (Just inp) Nothing (Just err) cp)
@@ -924,7 +987,7 @@ pipeOutputSafe inp err cp = do
 
 -- | Create a 'Producer' for standard error.
 pipeError
-  :: (MonadSafe m, MonadCatch (Base m))
+  :: (MonadSafe me, MonadCatch (Base me))
 
   => NonPipe
   -- ^ Standard input
@@ -934,7 +997,7 @@ pipeError
 
   -> CreateProcess
 
-  -> Producer ByteString m ExitCode
+  -> Stderr r me ExitCode
   -- ^ A 'Producer' for standard error
 
 pipeError inp out cp = mask $ \restore -> do
@@ -955,7 +1018,7 @@ pipeErrorSafe
 
   -> CreateProcess
 
-  -> Producer ByteString me ExitCode
+  -> Stderr r me ExitCode
   -- ^ A 'Producer' for standard error
 pipeErrorSafe inp out cp = do
   pnl <- createAndRegisterPanel (newPanel (Just inp) (Just out) Nothing cp)
@@ -975,7 +1038,7 @@ pipeInputOutput
 
   -> CreateProcess
 
-  -> m (Consumer ByteString mi ExitCode, Producer ByteString mo ExitCode)
+  -> m (Stdin mi a, Stdout r mo ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
 
@@ -997,7 +1060,7 @@ pipeInputOutputSafe
 
   -> CreateProcess
 
-  -> m (Consumer ByteString mi ExitCode, Producer ByteString mo ExitCode)
+  -> m (Stdin mi a, Stdout r mo ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
 pipeInputOutputSafe err cp = do
@@ -1019,7 +1082,7 @@ pipeInputError
   -- ^ Standard output
   -> CreateProcess
 
-  -> m (Consumer ByteString mi ExitCode, Producer ByteString me ExitCode)
+  -> m (Stdin mi a, Stderr r me ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
 pipeInputError out cp = do
@@ -1044,7 +1107,7 @@ pipeInputErrorSafe
   -- ^ Standard output
   -> CreateProcess
 
-  -> m (Consumer ByteString mi ExitCode, Producer ByteString me ExitCode)
+  -> m (Stdin mi a, Stderr r me ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
 pipeInputErrorSafe out cp = do
@@ -1069,7 +1132,7 @@ pipeOutputError
 
   -> CreateProcess
 
-  -> m (Producer ByteString mo ExitCode, Producer ByteString me ExitCode)
+  -> m (Stdout ro mo ExitCode, Stderr re me ExitCode)
   -- ^ A 'Producer' for standard output and a 'Producer' for standard
   -- error
 
@@ -1094,7 +1157,7 @@ pipeOutputErrorSafe
 
   -> CreateProcess
 
-  -> m (Producer ByteString mo ExitCode, Producer ByteString me ExitCode)
+  -> m (Stdout ro mo ExitCode, Stderr re me ExitCode)
   -- ^ A 'Producer' for standard output and a 'Producer' for standard
   -- error
 
@@ -1118,9 +1181,9 @@ pipeInputOutputError
 
   => CreateProcess
 
-  -> m ( Consumer ByteString mi ExitCode,
-         Producer ByteString mo ExitCode,
-         Producer ByteString me ExitCode )
+  -> m ( Stdin mi a,
+         Stdout ro mo ExitCode,
+         Stderr re me ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output, and a 'Producer' for standard error
 
@@ -1145,9 +1208,9 @@ pipeInputOutputErrorSafe
 
   => CreateProcess
 
-  -> m ( Consumer ByteString mi ExitCode,
-         Producer ByteString mo ExitCode,
-         Producer ByteString me ExitCode )
+  -> m ( Stdin mi a,
+         Stdout ro mo ExitCode,
+         Stderr re me ExitCode)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output, and a 'Producer' for standard error
 
