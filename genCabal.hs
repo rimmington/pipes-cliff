@@ -5,7 +5,7 @@ import Cartel
 props :: Properties
 props = blank
   { name = "pipes-cliff"
-  , version = [0,8,0,2]
+  , version = [0,10,0,0]
   , cabalVersion = Just (1, 18)
   , buildType = Just simple
   , license = Just bsd3
