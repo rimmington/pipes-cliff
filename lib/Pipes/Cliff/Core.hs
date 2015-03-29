@@ -472,9 +472,12 @@ terminateProcess pnl = mask_ $ do
     mapM_ runFnlzr fnlzrs
 
 -- | Gets the exit code of the process that belongs to the 'ProcessHandle'.
--- Side effects: may block if process has not yet exited.  Usually you
--- can get the exit code through more idiomatic @pipes@ functions, as
--- the various 'Proxy' return the 'ExitCode'.
+-- Often you can get the exit code through more idiomatic @pipes@
+-- functions, as the various 'Proxy' return the 'ExitCode'.  Sometimes
+-- though it can be difficult to use the @pipes@ idioms to get the
+-- exit code, so this function is here.
+--
+-- Side effects: may block if process has not yet exited.
 waitForProcess :: ProcessHandle -> IO ExitCode
 waitForProcess pnl = phConsole pnl >>= csExitCode
 
@@ -568,16 +571,18 @@ safeEffect = runSafeT . runEffect
 -- or consumption has completed, even if such completion is not due
 -- to an exhausted mailbox.  This will signal to the other side of
 -- the mailbox that the mailbox is sealed.
+--
+-- Also returns an STM action to seal the box manually.
 newMailbox
   :: (MonadSafe mi, MonadSafe mo)
-  => IO (Consumer a mi (), Producer a mo ())
+  => IO (Consumer a mi (), Producer a mo (), STM ())
 newMailbox = do
   (toBox, fromBox, seal) <- messageBox
   let csmr = register (liftIO $ atomically seal)
              >> sendToBox toBox
       pdcr = register (liftIO $ atomically seal)
              >> produceFromBox fromBox
-  return (csmr, pdcr)
+  return (csmr, pdcr, seal)
 
 -- * Exception safety
 
@@ -633,10 +638,10 @@ initHandle
   -- ^ Has the 'Handle' that will be closed.
   -> (Handle -> mi a)
   -- ^ The remainder of the computation.
-  -> IO (mi a)
+  -> mi a
 initHandle desc get pnl mkProxy = mask_ $ do
-  cnsl <- phConsole $ pnl
-  return $ mask $ \restore ->
+  cnsl <- liftIO $ phConsole $ pnl
+  mask $ \restore ->
     let han = get cnsl
         fnlzr = closeHandleNoThrow han desc (cmdspec . phCreateProcess $ pnl)
           (handler . phCreateProcess $ pnl)
@@ -654,7 +659,7 @@ initHandle desc get pnl mkProxy = mask_ $ do
 consumeToHandle
   :: (MonadSafe mi, MonadCatch (Base mi))
   => ProcessHandle
-  -> IO (Consumer ByteString mi ())
+  -> Consumer ByteString mi ()
 consumeToHandle pnl = initHandle Input get pnl fn
   where
     get cnsl = case csIn cnsl of
@@ -676,7 +681,7 @@ produceFromHandle
   :: (MonadSafe mi, MonadCatch (Base mi))
   => Outbound
   -> ProcessHandle
-  -> IO (Producer ByteString mi ())
+  -> Producer ByteString mi ()
 produceFromHandle outb pnl = initHandle (Outbound outb) get pnl fn
   where
     get cnsl = case outb of
@@ -743,13 +748,14 @@ runInputHandle
   -- ^
   -> Consumer ByteString mi ExitCode
   -- ^
-runInputHandle pnl = mask_ $ do
-  csmr <- liftIO $ consumeToHandle pnl
-  (toBox, fromBox) <- liftIO newMailbox
-  asyncId <- liftIO . conveyor $ fromBox >-> csmr
+runInputHandle pnl = mask $ \restore -> do
+  (toBox, fromBox, seal) <- liftIO newMailbox
+  asyncId <- liftIO . conveyor $ fromBox >-> (consumeToHandle pnl)
   liftIO $ addReleaser pnl (cancel asyncId)
-  toBox
-  liftIO $ finishProxy asyncId pnl
+  restore $ do
+    toBox
+    liftIO $ atomically seal
+    liftIO $ finishProxy asyncId pnl
 
 
 -- | Takes all steps necessary to get a 'Producer' for standard
@@ -763,13 +769,14 @@ runOutputHandle
   -- ^
   -> Producer ByteString mi ExitCode
   -- ^
-runOutputHandle outb pnl = mask_ $ do
-  pdcFromHan <- liftIO $ produceFromHandle outb pnl
-  (toBox, fromBox) <- liftIO newMailbox
-  asyncId <- liftIO . conveyor $ pdcFromHan >-> toBox
+runOutputHandle outb pnl = mask $ \restore -> do
+  (toBox, fromBox, seal) <- liftIO newMailbox
+  asyncId <- liftIO . conveyor $ (produceFromHandle outb pnl) >-> toBox
   liftIO $ addReleaser pnl (cancel asyncId)
-  fromBox
-  liftIO $ finishProxy asyncId pnl
+  restore $ do
+    fromBox
+    liftIO $ atomically seal
+    liftIO $ finishProxy asyncId pnl
 
 
 -- * Creating Proxy
@@ -845,7 +852,9 @@ pipeInputOutput
 
   -> CreateProcess
 
-  -> IO ((Consumer ByteString mi ExitCode, Producer ByteString mo ExitCode), ProcessHandle)
+  -> IO ( (Consumer ByteString mi ExitCode , Producer ByteString mo ExitCode)
+        , ProcessHandle
+        )
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
 
@@ -866,7 +875,9 @@ pipeInputError
   -- ^ Standard output
   -> CreateProcess
 
-  -> IO ((Consumer ByteString mi ExitCode, Producer ByteString me ExitCode), ProcessHandle)
+  -> IO ( (Consumer ByteString mi ExitCode, Producer ByteString me ExitCode)
+        , ProcessHandle
+        )
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
 pipeInputError out cp = do
@@ -887,7 +898,9 @@ pipeOutputError
 
   -> CreateProcess
 
-  -> IO ((Producer ByteString mo ExitCode, Producer ByteString me ExitCode), ProcessHandle)
+  -> IO ( (Producer ByteString mo ExitCode, Producer ByteString me ExitCode)
+        , ProcessHandle
+        )
   -- ^ A 'Producer' for standard output and a 'Producer' for standard
   -- error
 
@@ -907,7 +920,10 @@ pipeInputOutputError
 
   => CreateProcess
 
-  -> IO ( (Consumer ByteString mi ExitCode, Producer ByteString mo ExitCode, Producer ByteString me ExitCode)
+  -> IO ( ( Consumer ByteString mi ExitCode
+          , Producer ByteString mo ExitCode
+          , Producer ByteString me ExitCode
+          )
         , ProcessHandle
         )
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard

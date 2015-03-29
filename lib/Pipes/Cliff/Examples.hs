@@ -44,26 +44,35 @@ produceNumbers = go (0 :: Int)
 -- standard error.  This is normal.  To suppress them, see the
 -- 'handler' option.
 
-numsToLess :: IO (Maybe ExitCode, ExitCode)
+numsToLess :: IO ExitCode
 numsToLess = do
   (toLess, _) <- pipeInput Inherit Inherit (procSpec "less" [])
-  safeEffect $ produceNumbers >-> wrapRight >-> toLess
+  safeEffect $ produceNumbers >-> toLess
 
 
 -- | Streams an infinite list of numbers to @tr@ and then to @less@.
 -- Perfectly useless, but shows how to build pipelines.  Also
 -- squlches warning messages using the 'handler' option.
+--
+-- Note that, consistent with usual @pipes@ usage, the value of
+-- @code1@ and @code2@ is not necessarily the last exit code in the
+-- pipeline.  Rather, it is the exit code of the process that
+-- terminated first.  Use 'waitForProcess' if you need to determine
+-- the exit value of a particular process.  It's also possible to use
+-- a bit of 'fmap' to see which process in a pipeline did terminate
+-- first; for an example of that, search the "Pipes.Tutorial" module
+-- for @echo3.hs@.
 alphaNumbers :: IO (ExitCode, ExitCode)
 alphaNumbers = do
   ((toTr, fromTr), _) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"]) { handler = squelch }
   (toLess, _) <- pipeInput Inherit Inherit
         (procSpec "less" []) { handler = squelch }
-  toTrAsync <- conveyor $ produceNumbers >-> wrapRight >-> toTr
+  toTrAsync <- conveyor $ produceNumbers >-> toTr
   toLessAsync <- conveyor $ fromTr >-> toLess
-  (_, trCode) <- wait toTrAsync
-  (_, lessCode) <- wait toLessAsync
-  return (trCode, lessCode)
+  code1 <- wait toTrAsync
+  code2 <- wait toLessAsync
+  return (code1, code2)
 
 
 -- | Produces an infinite stream of numbers, sends it to @tr@ for some
@@ -87,12 +96,11 @@ standardOutputAndError = do
   ((toSh, fromShOut, fromShErr), _) <- pipeInputOutputError
     (procSpec "sh" ["-c", script])
   (toLess, _) <- pipeInput Inherit Inherit (procSpec "less" [])
-  _ <- conveyor $ produceNumbers >-> wrapRight >-> toTr
+  _ <- conveyor $ produceNumbers >-> toTr
   _ <- conveyor $ fromTr >-> toSh
   _ <- conveyor $ fromShOut >-> toLess
   runSafeT
-    $ P.fold BS8.append BS8.empty id
-      (fromShErr >-> (forwardRight >> return ()))
+    $ P.fold BS8.append BS8.empty id (fromShErr >> return ())
   where
     script = "while read line; do echo $line; echo $line 1>&2; done"
 
@@ -100,7 +108,7 @@ standardOutputAndError = do
 -- | Like 'alphaNumbers' but just sends a limited number
 -- of numbers to @cat@.  A useful test to make sure that pipelines
 -- shut down automatically.
-limitedAlphaNumbers :: IO (Maybe ExitCode, ExitCode)
+limitedAlphaNumbers :: IO ExitCode
 limitedAlphaNumbers = do
   ((toTr, fromTr), _) <- pipeInputOutput Inherit
     (procSpec "tr" ["[0-9]", "[a-z]"])
@@ -108,9 +116,8 @@ limitedAlphaNumbers = do
   _ <- async 
     . safeEffect
     $ produceNumbers
-    >-> wrapRight
-    >-> (P.take 300 >>= immortal)
-    >-> toTr
+    >-> P.take 300
+    >-> (toTr >> return ())
   safeEffect $ fromTr >-> toCat
 
 
@@ -125,12 +132,10 @@ alphaNumbersByteString = do
     (procSpec "tr" ["[0-9]", "[a-z]"])
   _ <- conveyor
     $ produceNumbers
-    >-> wrapRight
-    >-> (P.take 300 >>= immortal)
-    >-> toTr
-  let trByteStrings = (fromTr >-> forwardRight) >> return ()
+    >-> P.take 300
+    >-> (toTr >> return ())
   runSafeT
-    $ P.fold BS8.append BS8.empty id trByteStrings
+    $ P.fold BS8.append BS8.empty id (fromTr >> return ())
 
 -- | So far, all examples have ignored the issue of exception safety.
 -- Here's an example that properly uses 'bracket' to make sure that
@@ -150,11 +155,10 @@ standardOutputAndErrorBracketed =
     $ \(toSh, fromShOut, fromShErr) ->
 
   withProcess (pipeInput Inherit Inherit (procSpec "less" [])) $ \toLess ->
-  withConveyor (produceNumbers >-> wrapRight >-> toTr) $
+  withConveyor (produceNumbers >-> toTr) $
   withConveyor (fromTr >-> toSh) $
   withConveyor (fromShOut >-> toLess) $
   runSafeT
-    $ P.fold BS8.append BS8.empty id
-      (fromShErr >-> (forwardRight >> return ()))
+    $ P.fold BS8.append BS8.empty id (fromShErr >> return ())
   where
     script = "while read line; do echo $line; echo $line 1>&2; done"

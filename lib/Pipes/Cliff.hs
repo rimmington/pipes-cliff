@@ -54,12 +54,6 @@ module Pipes.Cliff
   , procSpec
   , squelch
 
-  -- * Type synonyms
-  , Stdin
-  , Outstream
-  , Stdout
-  , Stderr
-
   -- * Creating processes
   -- $process
   
@@ -72,11 +66,8 @@ module Pipes.Cliff
   , pipeInputOutputError
 
   -- * 'Proxy' combinators
-  , forwardRight
-  , wrapRight
   , conveyor
   , safeEffect
-  , immortal
 
   -- * Querying and terminating the process
   , ProcessHandle
@@ -203,6 +194,11 @@ available in "Control.Exception", "Pipes.Safe", and
 handle this issue; she can just perform a 'Control.Exception.bracket'
 and may combine this with the @ContT@ monad in @transformers@ or @mtl@
 if she wishes, or perhaps with the @managed@ library.
+
+An earlier version of this library (see version 0.8.0.0) tried to use
+the return value of a 'Proxy' to indicate the return value of both
+processes in the pipeline, not just one.  I removed this because it
+interfered heavily with composability.
 
 You might wonder why, if you are using an external process as
 a pipeline, why can't you create, well, a 'Pipe'?  Wouldn't
