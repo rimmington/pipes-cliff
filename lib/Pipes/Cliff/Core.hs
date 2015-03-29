@@ -797,11 +797,11 @@ runInputHandle pnl = mask_ $ do
         liftIO . atomically $ seal
         thisCode <- liftIO $ finishProxy asyncId pnl
         return $ case proxyRes of
-          Left firstCode -> (Just firstCode, thisCode)
-          Right _downstreamStopped -> (Nothing, thisCode)
+          Just firstCode -> (Just firstCode, thisCode)
+          Nothing -> (Nothing, thisCode)
 
-  return (((fmap Left forwardRight) >-> fmap Right toBox) >>= f)
-
+  return (((fmap Just forwardRight) >-> fmap (const Nothing) toBox) >>= f)
+  
 
 -- | Takes all steps necessary to get a 'Producer' for standard
 -- input.  Sets up a mailbox, runs a conveyor in the background.  Then
@@ -819,7 +819,7 @@ runOutputHandle outb pnl = mask_ $ do
   (toBox, fromBox, _) <- newMailbox
   asyncId <- conveyor $ pdcFromHan >-> toBox
   addReleaser pnl (cancel asyncId)
-  let f _ = do
+  let f () = do
         code <- liftIO $ finishProxy asyncId pnl
         forever (yield (Left code))
   return $ (fromBox >-> wrapRight) >>= f
