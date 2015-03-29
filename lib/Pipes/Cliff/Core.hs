@@ -455,9 +455,12 @@ addReleaser pnl rel = do
   withLock (csLock cnsl) $
     modifyVar_ (csReleasers cnsl) (\ls -> return (rel : ls))
 
--- | Terminates a process.  Cleans up all associated resources.  Use
--- this with 'Control.Exception.bracket' to ensure proper cleanup of
--- resources.
+-- | Terminates a process.  Sends the process a @SIGTERM@, which does
+-- not absolutely guarantee that it will exit.  Closes any 'Handle's
+-- that were created for the process through Cliff, and terminates any
+-- associated background threads that were moving data to and from the
+-- process.  Use this function this with 'Control.Exception.bracket'
+-- to ensure proper cleanup of resources.
 terminateProcess :: ProcessHandle -> IO ()
 terminateProcess pnl = mask_ $ do
   cnsl <- phConsole pnl
