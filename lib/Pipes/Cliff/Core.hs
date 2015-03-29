@@ -568,87 +568,16 @@ safeEffect = runSafeT . runEffect
 -- or consumption has completed, even if such completion is not due
 -- to an exhausted mailbox.  This will signal to the other side of
 -- the mailbox that the mailbox is sealed.
---
--- In addition to returning the two 'Proxy', also returns an STM
--- action that will manually seal the mailbox.
 newMailbox
   :: (MonadSafe mi, MonadSafe mo)
-  => IO (Consumer a mi (), Producer a mo (), STM ())
+  => IO (Consumer a mi (), Producer a mo ())
 newMailbox = do
   (toBox, fromBox, seal) <- messageBox
   let csmr = register (liftIO $ atomically seal)
              >> sendToBox toBox
       pdcr = register (liftIO $ atomically seal)
              >> produceFromBox fromBox
-  return (csmr, pdcr, seal)
-
--- * Type synonyms
-
--- | Consumer that reads values for a process standard input.  Its
--- input value is described in 'Outstream'.  The result type is a
--- tuple @(a, b)@, where @a@ is the return code from the upstream
--- process, and @b@ is the return code from this process.  @a@ will be
--- Nothing if the downstream process terminated before the upstream
--- one, or @Just@ if the upstream process terminated first.  The
--- 'Consumer' process's process exit code is always available and is
--- returned in @b@.
-type Stdin m a
-  = Consumer (Either a ByteString) m (Maybe a, ExitCode)
-
--- | Producer of values from a process standard output or error.  'yield' a
--- @'Left'@ if the stream is done producing values, or a
--- @'Right' 'ByteString'@ if the stream is still producing values.
--- 'Outstream' is polymorphic in its return type, @r@, becasuse the
--- 'Outstream' never stops yielding values; instead, it just 'yield's
--- its exit code over and over again after the process terminates.
-
-type Outstream r m a
-  = Producer (Either a ByteString) m r
-
--- | Producer of values from a process standard output.
-type Stdout r m a = Outstream r m a
-
--- | Producer of values from a process standard error.
-type Stderr r m a = Outstream r m a
-
-
--- * 'Proxy' combinators
-
--- | Forwards only Right values; terminates on the first Left value
--- and returns its value.  Useful to forward the output of an
--- 'Outstream' to a pipeline that expects only 'ByteString's.
-forwardRight :: Monad m => Pipe (Either a b) b m a
-forwardRight = do
-  ei <- await
-  case ei of
-    Left l -> return l
-    Right r -> yield r >> forwardRight
-
--- | Forwards all values, after rewrapping them in a Right.  Useful to
--- convert a producer of 'ByteString' into a 'Producer' of 'Either'
--- which can be fed to a 'Stdin'.
-wrapRight :: Monad m => Pipe a (Either l a) m r
-wrapRight = do
-  x <- await
-  yield (Right x)
-  wrapRight
-  
--- | Converts a 'Producer' that returns a particular type
--- to one that never returns a value at all but that, instead, takes
--- that return type and 'yield's it forever as a 'Left'.  Use it with
--- '>>=', like so:
---
--- @
--- alwaysUnit :: Monad m => Producer (Either () a) m r
--- alwaysUnit = return () >>= immortal
--- @
---
--- This is useful to convert a producer of values that might terminate
--- into one that does not terminate, so that it can be fed into a
--- 'Stdin'.  For an example of its use, see
--- 'Penny.Cliff.Examples.limitedAlphaNumbers'.
-immortal :: Monad m => r -> Producer' (Either r a) m r'
-immortal a = forever (yield (Left a))
+  return (csmr, pdcr)
 
 -- * Exception safety
 
@@ -800,44 +729,28 @@ finishProxy thread pnl = do
 -- terminates the process.
 --
 -- * Returns a 'Consumer'.  The 'Consumer' consumes to the mailbox.
--- The 'Consumer' forwards all 'Right' values obtained from the
--- 'yield' to the mailbox.  The 'Consumer' ceases consumption on the
--- first 'Left' value.
+-- This 'Consumer' returns the exit code of this process (but remember
+-- that the ultimate result of the 'Proxy' depends on which component
+-- terminates first).
 --
--- The returned 'Consumer' will, on the first 'Left' value, manually
--- seal the mailbox that transmits to the spawned thread.  This causes
--- the background 'Effect' to shut down which will, in turn, cause the
--- 'MonadSafe' computation to invoke its finalizers which will close
--- the process's stdin.  That should cause the process to shut down.
--- Then we wait for the background thead to finish, and then wait for
--- the process's exit code.
---
--- The returned 'Proxy' always returns the exit code of this process.
--- In addition, if the upstream 'Producer' terminated first, that
--- return value is returned as well.  If this process terminated first
--- (perhaps because the user shut it down manually, or it otherwise
--- shut down without needing all of its stdin) then there will be no
--- return value from the upstream 'Producer' to return.
+-- Does not register in the 'MonadSafe' an action to cancel the
+-- background thread.  Data might still be moving to the process even
+-- if the 'Proxy' has shut down.  Let the thread terminate through
+-- mailbox closure or a broken pipe.
 runInputHandle
   :: (MonadSafe mi, MonadCatch (Base mi))
   => ProcessHandle
   -- ^
-  -> IO (Stdin mi r)
+  -> Consumer ByteString mi ExitCode
   -- ^
 runInputHandle pnl = mask_ $ do
-  csmr <- consumeToHandle pnl
-  (toBox, fromBox, seal) <- newMailbox
-  asyncId <- conveyor $ fromBox >-> csmr
-  addReleaser pnl (cancel asyncId)
-  let f proxyRes = do
-        liftIO . atomically $ seal
-        thisCode <- liftIO $ finishProxy asyncId pnl
-        return $ case proxyRes of
-          Just firstCode -> (Just firstCode, thisCode)
-          Nothing -> (Nothing, thisCode)
+  csmr <- liftIO $ consumeToHandle pnl
+  (toBox, fromBox) <- liftIO newMailbox
+  asyncId <- liftIO . conveyor $ fromBox >-> csmr
+  liftIO $ addReleaser pnl (cancel asyncId)
+  toBox
+  liftIO $ finishProxy asyncId pnl
 
-  return (((fmap Just forwardRight) >-> fmap (const Nothing) toBox) >>= f)
-  
 
 -- | Takes all steps necessary to get a 'Producer' for standard
 -- input.  Sets up a mailbox, runs a conveyor in the background.  Then
@@ -848,24 +761,22 @@ runOutputHandle
   -- ^
   -> ProcessHandle
   -- ^
-  -> IO (Outstream r mi ExitCode)
+  -> Producer ByteString mi ExitCode
   -- ^
 runOutputHandle outb pnl = mask_ $ do
-  pdcFromHan <- produceFromHandle outb pnl
-  (toBox, fromBox, _) <- newMailbox
-  asyncId <- conveyor $ pdcFromHan >-> toBox
-  addReleaser pnl (cancel asyncId)
-  let f () = do
-        code <- liftIO $ finishProxy asyncId pnl
-        forever (yield (Left code))
-  return $ (fromBox >-> wrapRight) >>= f
+  pdcFromHan <- liftIO $ produceFromHandle outb pnl
+  (toBox, fromBox) <- liftIO newMailbox
+  asyncId <- liftIO . conveyor $ pdcFromHan >-> toBox
+  liftIO $ addReleaser pnl (cancel asyncId)
+  fromBox
+  liftIO $ finishProxy asyncId pnl
 
 
 -- * Creating Proxy
 
 -- | Create a 'Consumer' for standard input.
 pipeInput
-  :: (MonadSafe m, MonadCatch (Base m))
+  :: (MonadSafe mi, MonadCatch (Base mi))
 
   => NonPipe
   -- ^ Standard output
@@ -875,11 +786,11 @@ pipeInput
 
   -> CreateProcess
 
-  -> IO (Stdin m a, ProcessHandle)
+  -> IO (Consumer ByteString mi ExitCode, ProcessHandle)
   -- ^ A 'Consumer' for standard input
 pipeInput out err cp = mask_ $ do
   pnl <- newProcessHandle Nothing (Just out) (Just err) cp
-  inp <- runInputHandle pnl
+  let inp = runInputHandle pnl
   return (inp, pnl)
     
 
@@ -895,11 +806,11 @@ pipeOutput
 
   -> CreateProcess
 
-  -> IO (Stdout r mo ExitCode, ProcessHandle)
+  -> IO (Producer ByteString mo ExitCode, ProcessHandle)
   -- ^ A 'Producer' for standard output
 pipeOutput inp err cp = mask_ $ do
   pnl <- newProcessHandle (Just inp) Nothing (Just err) cp
-  pdcr <- runOutputHandle Output pnl
+  let pdcr = runOutputHandle Output pnl
   return (pdcr, pnl)
 
 
@@ -915,12 +826,12 @@ pipeError
 
   -> CreateProcess
 
-  -> IO (Stderr r me ExitCode, ProcessHandle)
+  -> IO (Producer ByteString me ExitCode, ProcessHandle)
   -- ^ A 'Producer' for standard error
 
 pipeError inp out cp = mask_ $ do
   pnl <- newProcessHandle (Just inp) (Just out) Nothing cp
-  pdcr <- runOutputHandle Error pnl
+  let pdcr = runOutputHandle Error pnl
   return (pdcr, pnl)
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
@@ -934,14 +845,14 @@ pipeInputOutput
 
   -> CreateProcess
 
-  -> IO ((Stdin mi a, Stdout r mo ExitCode), ProcessHandle)
+  -> IO ((Consumer ByteString mi ExitCode, Producer ByteString mo ExitCode), ProcessHandle)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
 
 pipeInputOutput err cp = mask_ $ do
   pnl <- newProcessHandle Nothing Nothing (Just err) cp
-  csmr <- runInputHandle pnl
-  pdcr <- runOutputHandle Output pnl
+  let csmr = runInputHandle pnl
+      pdcr = runOutputHandle Output pnl
   return ((csmr, pdcr), pnl)
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
@@ -955,13 +866,13 @@ pipeInputError
   -- ^ Standard output
   -> CreateProcess
 
-  -> IO ((Stdin mi a, Stderr r me ExitCode), ProcessHandle)
+  -> IO ((Consumer ByteString mi ExitCode, Producer ByteString me ExitCode), ProcessHandle)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
 pipeInputError out cp = do
   pnl <- newProcessHandle Nothing (Just out) Nothing cp
-  csmr <- runInputHandle pnl
-  pdcr <- runOutputHandle Error pnl
+  let csmr = runInputHandle pnl
+      pdcr = runOutputHandle Error pnl
   return ((csmr, pdcr), pnl)
 
 
@@ -976,14 +887,14 @@ pipeOutputError
 
   -> CreateProcess
 
-  -> IO ((Stdout ro mo ExitCode, Stderr re me ExitCode), ProcessHandle)
+  -> IO ((Producer ByteString mo ExitCode, Producer ByteString me ExitCode), ProcessHandle)
   -- ^ A 'Producer' for standard output and a 'Producer' for standard
   -- error
 
 pipeOutputError inp cp = do
   pnl <- newProcessHandle (Just inp) Nothing Nothing cp
-  pdcrOut <- runOutputHandle Output pnl
-  pdcrErr <- runOutputHandle Error pnl
+  let pdcrOut =  runOutputHandle Output pnl
+      pdcrErr =  runOutputHandle Error pnl
   return ((pdcrOut, pdcrErr), pnl)
 
 
@@ -996,7 +907,7 @@ pipeInputOutputError
 
   => CreateProcess
 
-  -> IO ( (Stdin mi a, Stdout ro mo ExitCode, Stderr re me ExitCode)
+  -> IO ( (Consumer ByteString mi ExitCode, Producer ByteString mo ExitCode, Producer ByteString me ExitCode)
         , ProcessHandle
         )
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
@@ -1004,7 +915,7 @@ pipeInputOutputError
 
 pipeInputOutputError cp = do
   pnl <- newProcessHandle Nothing Nothing Nothing cp
-  csmr <- runInputHandle pnl
-  pdcrOut <- runOutputHandle Output pnl
-  pdcrErr <- runOutputHandle Error pnl
+  let csmr = runInputHandle pnl
+      pdcrOut =  runOutputHandle Output pnl
+      pdcrErr =  runOutputHandle Error pnl
   return ((csmr, pdcrOut, pdcrErr), pnl)
