@@ -1,9 +1,17 @@
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleContexts, RankNTypes #-}
 
--- | This contains the innards of Cliff.  You probably won't need
--- anything that's in here; "Pipes.Cliff" re-exports the most useful
--- bindings.  But nothing will break if you use what's in here, so
--- it's here if you need it.
+-- | This contains the innards of Cliff.
+-- You shouldn't need anything that's in this module; instead, use
+-- "Pipes.Cliff".
+--
+-- Exit code and waiting for processes: as of base 4.7, there was a
+-- bug in 'System.Process.waitForProcess' which may arise if you have
+-- multiple threads waiting for a single process to finish.  Thus this
+-- module is set up so that only one thread does the wait, and it
+-- places the result in an MVar.  See
+--
+-- http://ghc.haskell.org/trac/ghc/ticket/9292
+
 module Pipes.Cliff.Core where
 
 import System.Environment
@@ -11,14 +19,17 @@ import Data.List (intersperse)
 import Control.Exception (IOException)
 import System.IO
 import qualified System.Process as Process
-import System.Process (ProcessHandle)
 import Pipes
 import Pipes.Safe
 import qualified Data.ByteString as BS
-import qualified Pipes.Concurrent as PC
 import Data.ByteString (ByteString)
+import Control.Concurrent (forkIO)
 import Control.Concurrent.Async
+import Control.Concurrent.MVar
 import System.Exit
+import qualified Control.Exception
+import Control.Monad
+import Control.Concurrent.STM
 
 -- * Data types
 
@@ -43,44 +54,48 @@ data Activity
   | Closing
   deriving (Eq, Ord, Show)
 
--- | Describes a handle.  From the perspective of the subprocess; for
--- example, 'Input' means that this handle is connected to the
--- process's standard input.
-data HandleDesc
-  = Input
-  | Output
+-- | The two kinds of outbound handles.
+data Outbound
+  = Output
   | Error
   deriving (Eq, Ord, Show)
 
--- | Describes IO errors tha occur when dealing with a 'Handle'.
-data HandleOopsie = HandleOopsie Activity HandleDesc
-  deriving (Eq,Show)
+-- | Describes a handle.  From the perspective of the subprocess; for
+-- example, 'Input' means that this handle is connected to the
+-- process's standard input.
+
+data HandleDesc
+  = Input
+  | Outbound Outbound
+  deriving (Eq, Ord, Show)
 
 -- | Describes all IO exceptions.  The 'Oopsie' contains the
 -- 'IOException' itself, along with the 'CmdSpec' that was running
--- when the exception occurred.  If the exception occurred while
--- dealing with a 'Handle', there is also a 'HandleOopsie'.  If there
--- is no 'HandleOopsie', this means that the exception arose when
--- running 'terminateProcess'.
+-- when the exception occurred.
 --
 -- The exceptions that are caught and placed into an 'Oopsie' may
 -- arise from reading data from or writing data to a 'Handle'.  In
 -- these errors, the associated 'Producer' or 'Consumer' will
 -- terminate (which may trigger various cleanup actions in the
--- 'MonadSafe' computation) but the exception itself is not re-thrown;
--- rather, it is passed to the 'handler'.  Similarly, an exception may
--- occur while closing a handle; these exceptions are caught, not
--- rethrown, and are passed to the 'handler'.  If an exception arises
--- when terminating a process (I'm not sure this is possible) then it
--- is also caught, not rethrown, and passed to the 'handler'.
+-- 'MonadSafe' computation) but the exception itself is not
+-- re-thrown; rather, it is passed to the 'handler'.  Similarly, an
+-- exception may occur while closing a handle; these exceptions are
+-- caught, not rethrown, and are passed to the 'handler'.  If an
+-- exception arises when terminating a process (I'm not sure this is
+-- possible) then it is also caught, not rethrown, and passed to the
+-- 'handler'.
 --
 -- If an exception arises when creating a process--such as a command
--- not being found--the exception is /not/ caught, handled, or passed
--- to the 'handler'.  Also, an 'Oopsie' is created only for an
--- 'IOException'; no other exceptions of any kind are caught or
--- handled.  However, exceptions of any kind will still trigger
--- appropriate cleanup actions in the 'MonadSafe' computation.
-data Oopsie = Oopsie (Maybe HandleOopsie) CmdSpec IOException
+-- not being found--the exception is /not/ caught, handled, or
+-- passed to the 'handler'.  In addition, no exceptions are caught
+-- if they originated during a 'Process.waitForProcess'.  (I can't
+-- conceive of how any synchronous exceptions could arise from
+-- 'Process.waitForProcess', but if they do, Cliff does not handle
+-- them.)  Also, an 'Oopsie' is created only for an 'IOException';
+-- no other exceptions of any kind are caught or handled.  However,
+-- exceptions of any kind will still trigger appropriate cleanup
+-- actions in the 'MonadSafe' computation.
+data Oopsie = Oopsie Activity HandleDesc CmdSpec IOException
   deriving (Eq, Show)
 
 -- | Formats an 'Oopsie' for display.
@@ -89,9 +104,9 @@ renderOopsie
   -- ^ The name of the currently runnning program
   -> Oopsie
   -> String
-renderOopsie pn (Oopsie mayHan cmd ioe) =
+renderOopsie pn (Oopsie act desc cmd ioe) =
   pn ++ ": warning: when running command "
-  ++ renderCommand cmd ++ ": " ++ renderMayHan mayHan
+  ++ renderCommand cmd ++ ": " ++ renderHan
   ++ ": " ++ show ioe
   where
     renderCommand (ShellCommand str) = show str
@@ -99,8 +114,7 @@ renderOopsie pn (Oopsie mayHan cmd ioe) =
       = concat . intersperse " " . map show
       $ fp : ss
 
-    renderMayHan Nothing = "when terminating process"
-    renderMayHan (Just (HandleOopsie act desc)) =
+    renderHan =
       "when " ++ actStr ++ " " ++ descStr
       where
         actStr = case act of
@@ -109,11 +123,14 @@ renderOopsie pn (Oopsie mayHan cmd ioe) =
           Closing -> "closing the handle associated with"
         descStr = "standard " ++ case desc of
           Input -> "input"
-          Output -> "output"
-          Error -> "error"
+          Outbound Output -> "output"
+          Outbound Error -> "error"
 
 -- | The default handler when receiving an 'Oopsie'; simply uses
 -- 'renderOopsie' to format it nicely and put it on standard error.
+--
+-- Side effects: gets the program name from the environment, and
+-- prints the Oopsie to standard error.
 defaultHandler :: Oopsie -> IO ()
 defaultHandler oops = do
   pn <- getProgName
@@ -196,13 +213,15 @@ data CreateProcess = CreateProcess
   -- total gibberish can result as the text gets mixed in.  You
   -- could solve this by putting the errors into a
   -- "Pipes.Concurrent" mailbox and having a single thread print the
-  -- errors; building this sort of functionality directly in to the
-  -- library would clutter up the API somewhat so I have been
-  -- reluctant to do it.
+  -- errors; this sort of thing could be built into the library but
+  -- so far I haven't been motivated to do it.
+
   }
 
 -- | Do not show or do anything with exceptions; useful to use as a
 -- 'handler'.
+--
+-- Side effects: None.
 squelch :: Monad m => a -> m ()
 squelch = const (return ())
 
@@ -221,8 +240,6 @@ squelch = const (return ())
 -- * no new process group is created
 --
 -- * 'delegate_ctlc' is 'False'
---
--- * 'storeProcessHandle' is 'Nothing'
 --
 -- * 'handler' is 'defaultHandler'
 
@@ -262,140 +279,285 @@ convertCreateProcess inp out err a = Process.CreateProcess
   where
     conv = convertNonPipe
 
--- * ErrSpec
+-- * MVar types
 
--- | Contains data necessary to deal with exceptions.
-data ErrSpec = ErrSpec
-  { esErrorHandler :: Oopsie -> IO ()
-  , esCmdSpec :: CmdSpec
+-- ** Lock
+
+-- | Guarantees single-thread access
+--
+-- All MVar idioms thanks to Neil Mitchell:
+-- <http://neilmitchell.blogspot.com/2012/06/flavours-of-mvar_04.html>
+type Lock = MVar ()
+
+newLock :: IO Lock
+newLock = newMVar ()
+
+withLock ::  Lock -> IO a -> IO a
+withLock x = withMVar x . const
+
+-- ** Var
+
+-- | Operates on mutable variables in thread-safe way.
+
+type Var a = MVar a
+
+newVar :: a -> IO (Var a)
+newVar = newMVar
+
+modifyVar :: Var a -> (a -> IO (a, b)) -> IO b
+modifyVar = modifyMVar
+
+modifyVar_ :: Var a -> (a -> IO a) -> IO ()
+modifyVar_ = modifyMVar_
+
+readVar :: Var a -> IO a
+readVar = readMVar
+
+-- ** Barrier
+
+-- | Starts with no value, is written to once, and is read one or
+-- more times.
+type Barrier a = MVar a
+
+newBarrier :: IO (Barrier a)
+newBarrier = newEmptyMVar
+
+signalBarrier :: Barrier a -> a -> IO ()
+signalBarrier = putMVar
+
+waitBarrier :: Barrier a -> IO a
+waitBarrier = readMVar
+
+-- ** MVar abstractions
+
+
+-- | Takes an action and returns a new action.  If the action is
+-- never called the argument action will never be executed, but if
+-- it is called more than once, it will only be executed once.
+--
+-- Side effects: creates a 'Var'.  Returns an IO action that modifies
+-- the contents of that 'Var'.
+once :: IO a -> IO (IO a)
+once act = do
+  var <- newVar Nothing
+  return $ join $ modifyVar var $ \v -> case v of
+    Nothing -> do
+      b <- newBarrier
+      let r = do
+            x <- act
+            signalBarrier b x
+            return x
+      return (Just b, r)
+    Just b -> return (Just b, waitBarrier b)
+    
+-- * Mailboxes
+
+-- | Creates a new mailbox.  Returns an action to send to the mailbox;
+-- this action will return False if the mailbox is sealed, or True if
+-- the message was successfully placed in the mailbox.  Also returns
+-- an action to retrieve from the mailbox, which returns Nothing if
+-- the mailbox is sealed, or Just if there is a value to be retrieved.
+-- Also returns an action to seal the mailbox.
+messageBox :: IO (a -> STM Bool, STM (Maybe a), STM ())
+messageBox = atomically $ do
+  locked <- newTVar False
+  mailbox <- newEmptyTMVar
+  return (sendBox locked mailbox, recvBox locked mailbox, sealer locked)
+  
+sendBox :: TVar Bool -> TMVar a -> a -> STM Bool
+sendBox locked mailbox a = do
+  isLocked <- readTVar locked
+  if isLocked
+    then return False
+    else do
+      putTMVar mailbox a
+      return True
+
+recvBox :: TVar Bool -> TMVar a -> STM (Maybe a)
+recvBox locked mailbox = do
+  mayA <- tryTakeTMVar mailbox
+  case mayA of
+    Just a -> return $ Just a
+    Nothing -> do
+      isLocked <- readTVar locked
+      if isLocked
+        then return Nothing
+        else retry
+    
+sealer :: TVar Bool -> STM ()
+sealer locked = writeTVar locked True
+
+produceFromBox :: MonadIO m => STM (Maybe a) -> Producer a m ()
+produceFromBox stm = do
+  mayV <- liftIO $ atomically stm
+  case mayV of
+    Nothing -> return ()
+    Just v -> yield v >> produceFromBox stm
+    
+sendToBox :: MonadIO m => (a -> STM Bool) -> Consumer a m ()
+sendToBox stm = do
+  v <- await
+  r <- liftIO $ atomically (stm v)
+  if r then sendToBox stm else return ()
+
+-- * Console
+
+-- | Data that is computed once, after the process has been created.
+-- After computation, this data does not change.
+data Console = Console
+  { csIn :: Maybe Handle
+  -- ^ Standard input
+  , csOut :: Maybe Handle
+  -- ^ Standard output
+  , csErr :: Maybe Handle
+  -- ^ Standard error
+  , csHandle :: Process.ProcessHandle
+  , csExitCode :: IO ExitCode
+  -- ^ IO action that will return the exit code.  Use this rather than
+  -- using 'Process.waitForProcess' on the 'csHandle'.
+  , csLock :: Lock
+  -- ^ If locked, new resources cannot be created.  Obtain this lock
+  -- while registering new releasers in 'csReleasers'.
+  , csReleasers :: Var [IO ()]
+  -- ^ Each time a resource is created, register a finalizer here.
+  -- These finalizers are run when 'terminateProcess' is run.
   }
+  
 
-makeErrSpec
-  :: CreateProcess
-  -> ErrSpec
-makeErrSpec cp = ErrSpec
-  { esErrorHandler = handler cp
-  , esCmdSpec = cmdspec cp
+-- | Is this process still running?
+--
+-- Side effects: examines the process handle to see if it has yet
+-- returned a value.  Does not block; should return immediately.
+isStillRunning :: ProcessHandle -> IO Bool
+isStillRunning ph = do
+  cnsl <- phConsole ph
+  cd <- Process.getProcessExitCode (csHandle cnsl)
+  return . maybe True (const False) $ cd
+
+-- | Allows you to terminate the process, as well as to obtain some
+-- information about the process.
+data ProcessHandle = ProcessHandle
+  { phCreateProcess :: CreateProcess
+  , phConsole :: IO Console
   }
+  
+-- | Tells you the 'CreateProcess' that was originally used to create
+-- the process associated with this 'ProcessHandle'.
+originalCreateProcess :: ProcessHandle -> CreateProcess
+originalCreateProcess = phCreateProcess
+  
+-- | Add a finalizer to the ProcessHandle.  When the finalizers are run, all
+-- exceptions are ignored, except asynchronous exceptions, which are
+-- masked.
+addReleaser :: ProcessHandle -> IO () -> IO ()
+addReleaser pnl rel = do
+  cnsl <- phConsole pnl
+  withLock (csLock cnsl) $
+    modifyVar_ (csReleasers cnsl) (\ls -> return (rel : ls))
 
+-- | Terminates a process.  Cleans up all associated resources.  Use
+-- this with 'Control.Exception.bracket' to ensure proper cleanup of
+-- resources.
+terminateProcess :: ProcessHandle -> IO ()
+terminateProcess pnl = mask_ $ do
+  cnsl <- phConsole pnl
+  withLock (csLock cnsl) $ do
+    let runFnlzr fnl = fnl `catch` catcher
+        catcher e = return ()
+          where _types = e :: Control.Exception.SomeException
+    fnlzrs <- readVar (csReleasers cnsl)
+    mapM_ runFnlzr fnlzrs
+
+-- | Gets the exit code of the process that belongs to the 'ProcessHandle'.
+-- Side effects: may block if process has not yet exited.  Usually you
+-- can get the exit code through more idiomatic @pipes@ functions, as
+-- the various 'Proxy' return the 'ExitCode'.
+waitForProcess :: ProcessHandle -> IO ExitCode
+waitForProcess pnl = phConsole pnl >>= csExitCode
+
+-- | Creates a new ProcessHandle.
+--
+-- Side effects: Does not create the process right away;
+-- instead, creates an IO action that, when run, will create the
+-- process.  This IO action contains another IO action that, when run,
+-- will return the process exit code.
+--
+-- In addition, the IO action will fork a simple thread that will
+-- immediately wait for the process.  In effect, this means there is
+-- immediately a thread that will wait for the process to exit.
+-- Because this IO action was created with 'once', that means only
+-- one thread ever does the @wait@, which avoids a bug in
+-- "System.Process".
+newProcessHandle
+  :: Maybe NonPipe
+  -> Maybe NonPipe
+  -> Maybe NonPipe
+  -> CreateProcess
+  -> IO ProcessHandle
+newProcessHandle inp out err cp = liftM2 ProcessHandle (return cp) (once act)
+  where
+    act = mask_ $ do
+      (inp', out', err', han) <- Process.createProcess
+        (convertCreateProcess inp out err cp)
+      let killHan mayH desc = case mayH of
+            Nothing -> return ()
+            Just h -> closeHandleNoThrow h desc (cmdspec cp) (handler cp)
+          destroyers =
+            [ killHan inp' Input, killHan out' (Outbound Output),
+              killHan err' (Outbound Error),
+              Process.terminateProcess han ]
+      getCode <- once $ Process.waitForProcess han
+      _ <- forkIO (getCode >> return ())
+      lock <- newLock
+      rlsrs <- newVar destroyers
+      return $ Console inp' out' err' han getCode lock rlsrs
+      
 
 -- * Exception handling
 
 -- | Sends an exception using the exception handler specified in the
--- 'ErrSpec'.
+-- 'ErrSpec'.  Side effects: transmits the 'Oopsie' to the right
+-- place; the recipient of the 'Oopsie' might have additional side
+-- effects.
 handleException
-  :: MonadIO m
-  => Maybe HandleOopsie
+  :: Activity
+  -> HandleDesc
+  -> CmdSpec
+  -> (Oopsie -> IO ())
   -> IOException
-  -> ErrSpec
-  -> m ()
-handleException mayOops exc ev = liftIO $ sender oops
+  -> IO ()
+handleException act desc spec sender exc = sender oops
   where
-    spec = esCmdSpec ev
-    sender = esErrorHandler ev
-    oops = Oopsie mayOops spec exc
-
-
--- | Run an action, taking all IO errors and sending them to the handler.
-handleErrors
-  :: (MonadCatch m, MonadIO m)
-  => Maybe HandleOopsie
-  -> ErrSpec
-  -> m ()
-  -> m ()
-handleErrors mayHandleOops ev act = catch act catcher
-  where
-    catcher e = liftIO $ hndlr oops
-      where
-        spec = esCmdSpec ev
-        hndlr = esErrorHandler ev
-        oops = Oopsie mayHandleOops spec e
-
+    oops = Oopsie act desc spec exc
 
 -- | Close a handle.  Catches any exceptions and passes them to the handler.
 closeHandleNoThrow
-  :: (MonadCatch m, MonadIO m)
-  => Handle
+  :: Handle
   -> HandleDesc
-  -> ErrSpec
-  -> m ()
-closeHandleNoThrow hand desc ev = handleErrors (Just (HandleOopsie Closing desc))
-  ev (liftIO $ hClose hand)
-
--- | Terminates a process; sends any IO errors to the handler.
-terminateProcess
-  :: (MonadCatch m, MonadIO m)
-  => Process.ProcessHandle
-  -> ErrSpec
-  -> m ()
-terminateProcess han ev = do
-  _ <- handleErrors Nothing ev (liftIO (Process.terminateProcess han))
-  handleErrors Nothing ev . liftIO $ do
-    _ <- Process.waitForProcess han
-    return ()
-
-
--- | Acquires a resource and ensures it will be destroyed when the
--- 'MonadSafe' computation completes.
-acquire
-  :: MonadSafe m
-  => Base m a
-  -- ^ Acquirer.
-  -> (a -> Base m ())
-  -- ^ Destroyer.
-  -> m a
-acquire acq rel = mask $ \restore -> do
-  a <- liftBase acq
-  _ <- register (rel a)
-  restore $ return a
+  -> CmdSpec
+  -> (Oopsie -> IO ())
+  -> IO ()
+closeHandleNoThrow hand desc spec hndlr
+  = (hClose hand) `catch`
+    (handleException Closing desc spec hndlr)
 
 
 -- * Threads
 
--- | Runs a thread in the background.  The thread is terminated when
--- the 'MonadSafe' computation completes.
-background
-  :: MonadSafe m
-  => IO a
-  -> m (Async a)
-background act = acquire (liftIO $ async act) (liftIO . cancel)
-
 -- | Runs in the background an effect, typically one that is moving
 -- data from one process to another.  For examples of its usage, see
--- "Pipes.Cliff.Examples".  The associated thread is killed when the
--- 'MonadSafe' computation completes.
-conveyor :: MonadSafe m => Effect (SafeT IO) () -> m ()
-conveyor efct
-  = (background . liftIO . runSafeT . runEffect $ efct) >> return ()
+-- "Pipes.Cliff.Examples".
+conveyor :: Effect (SafeT IO) a -> IO (Async a)
+conveyor = async . runSafeT . runEffect
 
+-- * Effects
 
--- | A version of 'Control.Concurrent.Async.wait' with an overloaded
--- 'MonadIO' return type.  Allows you to wait for the return value of
--- threads launched with 'background'.  If the thread throws an
--- exception, 'waitForThread' will throw that same exception.
-waitForThread :: MonadIO m => Async a -> m a
-waitForThread = liftIO . wait
-
--- | An overloaded version of the 'Process.waitForProcess' from
--- "System.Process".
-waitForProcess :: MonadIO m => ProcessHandle -> m ExitCode
-waitForProcess h = liftIO $ Process.waitForProcess h
+-- | Runs in the foreground an effect in the 'SafeT' monad.
+safeEffect :: Effect (SafeT IO) a -> IO a
+safeEffect = runSafeT . runEffect
 
 
 -- * Mailboxes
-
--- | A buffer that holds 1 message.  I have no idea if this is the
--- ideal size.  Don't use an unbounded buffer, though, because with
--- unbounded producers an unbounded buffer will fill up your RAM.
---
--- Since the buffer just holds one size, you might think \"why not
--- just use an MVar\"?  At least, I have been silly enough to think
--- that.  Using @Pipes.Concurrent@ also give the mailbox the ability
--- to be sealed; sealing the mailbox signals to the other side that it
--- won't be getting any more input or be allowed to send any more
--- output, which tells the whole pipeline to start shutting down.
-messageBuffer :: PC.Buffer a
-messageBuffer = PC.bounded 1
 
 -- | Creates a new mailbox and returns 'Proxy' that stream values
 -- into and out of the mailbox.  Each 'Proxy' is equipped with a
@@ -403,17 +565,118 @@ messageBuffer = PC.bounded 1
 -- or consumption has completed, even if such completion is not due
 -- to an exhausted mailbox.  This will signal to the other side of
 -- the mailbox that the mailbox is sealed.
+--
+-- In addition to returning the two 'Proxy', also returns an STM
+-- action that will manually seal the mailbox.
 newMailbox
-  :: (MonadIO m, MonadSafe mi, MonadSafe mo)
-  => m (Consumer a mi (), Producer a mo ())
+  :: (MonadSafe mi, MonadSafe mo)
+  => IO (Consumer a mi (), Producer a mo (), STM ())
 newMailbox = do
-  (toBox, fromBox, seal) <- liftIO $ PC.spawn' messageBuffer
-  let csmr = register (liftIO $ PC.atomically seal)
-             >> PC.toOutput toBox
-      pdcr = register (liftIO $ PC.atomically seal)
-             >> PC.fromInput fromBox
-  return (csmr, pdcr)
+  (toBox, fromBox, seal) <- messageBox
+  let csmr = register (liftIO $ atomically seal)
+             >> sendToBox toBox
+      pdcr = register (liftIO $ atomically seal)
+             >> produceFromBox fromBox
+  return (csmr, pdcr, seal)
 
+-- * Type synonyms
+
+-- | Consumer that reads values for a process standard input.  Its
+-- input value is described in 'Outstream'.  The result type is a
+-- tuple @(a, b)@, where @a@ is the return code from the upstream
+-- process, and @b@ is the return code from this process.  @a@ will be
+-- Nothing if the downstream process terminated before the upstream
+-- one, or @Just@ if the upstream process terminated first.  The
+-- 'Consumer' process's process exit code is always available and is
+-- returned in @b@.
+type Stdin m a
+  = Consumer (Either a ByteString) m (Maybe a, ExitCode)
+
+-- | Producer of values from a process standard output or error.  'yield' a
+-- @'Left'@ if the stream is done producing values, or a
+-- @'Right' 'ByteString'@ if the stream is still producing values.
+-- 'Outstream' is polymorphic in its return type, @r@, becasuse the
+-- 'Outstream' never stops yielding values; instead, it just 'yield's
+-- its exit code over and over again after the process terminates.
+
+type Outstream r m a
+  = Producer (Either a ByteString) m r
+
+-- | Producer of values from a process standard output.
+type Stdout r m a = Outstream r m a
+
+-- | Producer of values from a process standard error.
+type Stderr r m a = Outstream r m a
+
+
+-- * 'Proxy' combinators
+
+-- | Forwards only Right values; terminates on the first Left value
+-- and returns its value.  Useful to forward the output of an
+-- 'Outstream' to a pipeline that expects only 'ByteString's.
+forwardRight :: Monad m => Pipe (Either a b) b m a
+forwardRight = do
+  ei <- await
+  case ei of
+    Left l -> return l
+    Right r -> yield r >> forwardRight
+
+-- | Forwards all values, after rewrapping them in a Right.  Useful to
+-- convert a producer of 'ByteString' into a 'Producer' of 'Either'
+-- which can be fed to a 'Stdin'.
+wrapRight :: Monad m => Pipe a (Either l a) m r
+wrapRight = do
+  x <- await
+  yield (Right x)
+  wrapRight
+  
+-- | Converts a 'Producer' that returns a particular type
+-- to one that never returns a value at all but that, instead, takes
+-- that return type and 'yield's it forever as a 'Left'.  Use it with
+-- '>>=', like so:
+--
+-- @
+-- alwaysUnit :: Monad m => Producer (Either () a) m r
+-- alwaysUnit = return () >>= immortal
+-- @
+--
+-- This is useful to convert a producer of values that might terminate
+-- into one that does not terminate, so that it can be fed into a
+-- 'Stdin'.  For an example of its use, see
+-- 'Penny.Cliff.Examples.limitedAlphaNumbers'.
+immortal :: Monad m => r -> Producer' (Either r a) m r'
+immortal a = forever (yield (Left a))
+
+-- * Exception safety
+
+-- | Creates a process, uses it, and terminates it when the last
+-- computation ends.  Don't try to use any of the process resources
+-- after the last computation ends, because the process will already
+-- have been terminated.  For an example of its use, see
+-- 'Pipes.Cliff.Examples.standardOutputAndErrorBracketed'.
+withProcess
+  :: IO (a, ProcessHandle)
+  -- ^ Creates the process
+  -> (a -> IO b)
+  -- ^ Uses the process
+  -> IO b
+withProcess acq use = Control.Exception.bracket acq (terminateProcess . snd)
+  (use . fst)
+
+-- | Runs an 'Effect' in the backgroud (typically one that is moving
+-- data from one process to another).  If the background thread is
+-- still running when the second computation ends, the background
+-- thread is terminated.  For an example of its use, see
+-- 'Pipes.Cliff.Examples.standardOutputAndErrorBracketed'.
+
+withConveyor
+  :: Effect (SafeT IO) a
+  -- ^ The 'Effect' to run in another thread
+  -> IO b
+  -- ^ The rest of the computation to run
+  -> IO b
+withConveyor cvy end = Control.Exception.bracket (conveyor cvy) cancel
+  (\_ -> end)
 
 -- * Production from and consumption to 'Handle's
 
@@ -423,287 +686,322 @@ bufSize :: Int
 bufSize = 1024
 
 
--- | Create a 'Producer' that produces from a 'Handle'.  Takes
--- ownership of the 'Handle'; closes it when the 'Producer'
--- terminates.  If any IO errors arise either during production or
--- when the 'Handle' is closed, they are caught and passed to the
--- handler.
-produceFromHandle
-  :: (MonadSafe m, MonadCatch (Base m))
+-- | Initialize a handle.  Returns a computation in the MonadSafe
+-- monad.  That computation has a registered finalizer that will close
+-- a particular handle that is found in the 'ProcessHandle'.  As a side
+-- effect, the IO action creating the 'ProcessHandle' is viewed, meaning that
+-- the process will launch if it hasn't already done so.
+initHandle
+  :: (MonadSafe mi, MonadCatch (Base mi))
   => HandleDesc
-  -> Handle
-  -> ErrSpec
-  -> Producer ByteString m ()
-produceFromHandle hDesc h ev = do
-  _ <- register (closeHandleNoThrow h hDesc ev)
-  let hndlr e = lift $ handleException (Just oops) e ev
-      oops = HandleOopsie Reading hDesc
-      produce = liftIO (BS.hGetSome h bufSize) >>= go
-      go bs
-        | BS.null bs = return ()
-        | otherwise = yield bs >> produce
-  produce `catch` hndlr
+  -- ^ Used for error messages
+  -> (Console -> Handle)
+  -- ^ Fetch the handle to close from the 'ProcessHandle'.
+  -> ProcessHandle
+  -- ^ Has the 'Handle' that will be closed.
+  -> (Handle -> mi a)
+  -- ^ The remainder of the computation.
+  -> IO (mi a)
+initHandle desc get pnl mkProxy = mask_ $ do
+  cnsl <- phConsole $ pnl
+  return $ mask $ \restore ->
+    let han = get cnsl
+        fnlzr = closeHandleNoThrow han desc (cmdspec . phCreateProcess $ pnl)
+          (handler . phCreateProcess $ pnl)
+    in register (liftIO fnlzr) >> (restore $ mkProxy han)
+
+-- Returns a Consumer for process standard input.
+--
+-- Side effects: Process is started if it isn't already.  The returned
+-- computation will await values and pass them on to the process
+-- standard input mailbox.  Any IO exceptions are caught, and
+-- consumption terminates.
+--
+-- I would rather just catch broken pipe exceptions, but I'm not sure
+-- there is a good way to do that.
+consumeToHandle
+  :: (MonadSafe mi, MonadCatch (Base mi))
+  => ProcessHandle
+  -> IO (Consumer ByteString mi ())
+consumeToHandle pnl = initHandle Input get pnl fn
+  where
+    get cnsl = case csIn cnsl of
+      Just h -> h
+      Nothing -> error "consumeToHandle: handle not initialized"
+    fn han = do
+      let hndlr = liftIO . handleException Writing Input
+            (cmdspec . phCreateProcess $ pnl)
+            (handler . phCreateProcess $ pnl)
+          go = do
+            bs <- await
+            liftIO $ BS.hPut han bs
+            go
+      go `catch` hndlr
+
+-- | Produce values from a process standard output.  Process is
+-- started if it isn't already.
+produceFromHandle
+  :: (MonadSafe mi, MonadCatch (Base mi))
+  => Outbound
+  -> ProcessHandle
+  -> IO (Producer ByteString mi ())
+produceFromHandle outb pnl = initHandle (Outbound outb) get pnl fn
+  where
+    get cnsl = case outb of
+      Output -> case csOut cnsl of
+        Nothing -> error "produceFromHandle: stdout not initialized"
+        Just h -> h
+      Error -> case csErr cnsl of
+        Nothing -> error "produceFromHandle: stderr not initialized"
+        Just h -> h
+    fn han =
+      let hndlr = liftIO . handleException Reading (Outbound outb)
+            (cmdspec . phCreateProcess $ pnl)
+            (handler . phCreateProcess $ pnl)
+          go bs
+            | BS.null bs = return ()
+            | otherwise = yield bs >> produce
+          produce = liftIO (BS.hGetSome han bufSize) >>= go
+      in produce `catch` hndlr
+
+
+-- | Given an 'Async', waits for that thread to finish processing
+-- values.  When it completes, wait for the process exit code.
+finishProxy
+  :: Async ()
+  -> ProcessHandle
+  -> IO ExitCode
+finishProxy thread pnl = do
+  _ <- wait thread
+  waitForProcess pnl
+  
+-- | Takes all steps necessary to get a 'Consumer' for standard
+-- input:
+--
+-- * Creates a 'Consumer' that will consume to the process standard
+-- input.  This 'Consumer' registers a MonadSafe releaser that will
+-- close the handle.
+--
+-- * Creates a mailbox, with a 'Producer' from the mailbox and a
+-- 'Consumer' to the mailbox.  Each of these 'Proxy' has a MonadSafe
+-- releaser that will close the mailbox.
+--
+-- * Spwans a thread to run an 'Effect' that connects the 'Consumer'
+-- that is connected to the handle to the 'Producer' from the mailbox.
+-- In a typical UNIX pipeline situation (where the process keeps its
+-- stdin open as long as it is getting input) this 'Effect' will stop
+-- running only when the mailbox is sealed.
+--
+-- * Registers a releaser in the Panel (not in the MonadSafe
+-- computation) to destroy the thread; this is in case the user
+-- terminates the process.
+--
+-- * Returns a 'Consumer'.  The 'Consumer' consumes to the mailbox.
+-- The 'Consumer' forwards all 'Right' values obtained from the
+-- 'yield' to the mailbox.  The 'Consumer' ceases consumption on the
+-- first 'Left' value.
+--
+-- The returned 'Consumer' will, on the first 'Left' value, manually
+-- seal the mailbox that transmits to the spawned thread.  This causes
+-- the background 'Effect' to shut down which will, in turn, cause the
+-- 'MonadSafe' computation to invoke its finalizers which will close
+-- the process's stdin.  That should cause the process to shut down.
+-- Then we wait for the background thead to finish, and then wait for
+-- the process's exit code.
+--
+-- The returned 'Proxy' always returns the exit code of this process.
+-- In addition, if the upstream 'Producer' terminated first, that
+-- return value is returned as well.  If this process terminated first
+-- (perhaps because the user shut it down manually, or it otherwise
+-- shut down without needing all of its stdin) then there will be no
+-- return value from the upstream 'Producer' to return.
+runInputHandle
+  :: (MonadSafe mi, MonadCatch (Base mi))
+  => ProcessHandle
+  -- ^
+  -> IO (Stdin mi r)
+  -- ^
+runInputHandle pnl = mask_ $ do
+  csmr <- consumeToHandle pnl
+  (toBox, fromBox, seal) <- newMailbox
+  asyncId <- conveyor $ fromBox >-> csmr
+  addReleaser pnl (cancel asyncId)
+  let f proxyRes = do
+        liftIO . atomically $ seal
+        thisCode <- liftIO $ finishProxy asyncId pnl
+        return $ case proxyRes of
+          Just firstCode -> (Just firstCode, thisCode)
+          Nothing -> (Nothing, thisCode)
+
+  return (((fmap Just forwardRight) >-> fmap (const Nothing) toBox) >>= f)
   
 
--- | Runs a 'Consumer'; registers the handle so that it is closed
--- when consumption finishes.  If any IO errors arise either during
--- consumption or when the 'Handle' is closed, they are caught and
--- passed to the handler.
-consumeToHandle
-  :: (MonadSafe m, MonadCatch (Base m))
-  => Handle
-  -> ErrSpec
-  -> Consumer ByteString m ()
-consumeToHandle h ev = do
-  _ <- register $ closeHandleNoThrow h Input ev
-  let hndlr e = lift $ handleException (Just oops) e ev
-      oops = HandleOopsie Writing Input
-      go = do
-        bs <- await
-        liftIO $ BS.hPut h bs
-        go
-  go `catch` hndlr
-
-
--- | Creates a background thread that will consume to the given Handle
--- from the given Producer.  Takes ownership of the 'Handle' and
--- closes it when done.
-backgroundSendToProcess
-  :: MonadSafe m
-  => Handle
-  -> Producer ByteString (SafeT IO) ()
-  -> ErrSpec
-  -> m ()
-backgroundSendToProcess han prod ev = background act >> return ()
-  where
-    csmr = consumeToHandle han ev
-    act = runSafeT . runEffect $ prod >-> csmr
-
--- | Creates a background thread that will produce from the given
--- Handle into the given Consumer.  Takes possession of the Handle and
--- closes it when done.
-backgroundReceiveFromProcess
-  :: MonadSafe m
-  => HandleDesc
-  -> Handle
-  -> Consumer ByteString (SafeT IO) ()
-  -> ErrSpec
-  -> m ()
-backgroundReceiveFromProcess desc han csmr ev = background act >> return ()
-  where
-    prod = produceFromHandle desc han ev
-    act = runSafeT . runEffect $ prod >-> csmr
-
--- | Does everything necessary to run a 'Handle' that is created to a
--- process standard input.  Creates mailbox, runs background thread
--- that pumps data out of the mailbox and into the process standard
--- input, and returns a Consumer that consumes and places what it
--- consumes into the mailbox for delivery to the background process.
-runInputHandle
-  :: (MonadSafe m, MonadSafe mi)
-  => Handle
-  -> ErrSpec
-  -> m (Consumer ByteString mi ())
-runInputHandle inp ev = do
-  (toMbox, fromMbox) <- liftIO newMailbox
-  backgroundSendToProcess inp fromMbox ev
-  return toMbox
-
-
--- | Does everything necessary to run a 'Handle' that is created to a
--- process standard output or standard error.  Creates mailbox, runs
--- background thread that pumps data from the process output 'Handle'
--- into the mailbox, and returns a Producer that produces what comes
--- into the mailbox.
+-- | Takes all steps necessary to get a 'Producer' for standard
+-- input.  Sets up a mailbox, runs a conveyor in the background.  Then
+-- receives streaming data, and then gets the process exit code.
 runOutputHandle
-  :: (MonadSafe m, MonadSafe mo)
-  => HandleDesc
-  -> Handle
-  -> ErrSpec
-  -> m (Producer ByteString mo ())
-runOutputHandle desc out ev = do
-  (toMbox, fromMbox) <- liftIO $ newMailbox
-  backgroundReceiveFromProcess desc out toMbox ev
-  return fromMbox
+  :: (MonadSafe mi, MonadCatch (Base mi))
+  => Outbound
+  -- ^
+  -> ProcessHandle
+  -- ^
+  -> IO (Outstream r mi ExitCode)
+  -- ^
+runOutputHandle outb pnl = mask_ $ do
+  pdcFromHan <- produceFromHandle outb pnl
+  (toBox, fromBox, _) <- newMailbox
+  asyncId <- conveyor $ pdcFromHan >-> toBox
+  addReleaser pnl (cancel asyncId)
+  let f () = do
+        code <- liftIO $ finishProxy asyncId pnl
+        forever (yield (Left code))
+  return $ (fromBox >-> wrapRight) >>= f
 
-
--- * Creating subprocesses
-
-
--- | Creates a subprocess.  Registers destroyers for each handle
--- created, as well as for the ProcessHandle.
-createProcess
-  :: (MonadSafe m, MonadCatch (Base m))
-  => Process.CreateProcess
-  -> ErrSpec
-  -> m (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
-createProcess cp ev = mask $ \restore -> do
-  (mayIn, mayOut, mayErr, han) <- liftIO $ Process.createProcess cp
-  let close mayHan desc = maybe (return ())
-        (\h -> closeHandleNoThrow h desc ev) mayHan
-  _ <- register (close mayIn Input)
-  _ <- register (close mayOut Output)
-  _ <- register (close mayErr Error)
-  _ <- register (terminateProcess han ev)
-  restore $ return (mayIn, mayOut, mayErr, han)
-
-
--- | Convenience wrapper for 'createProcess'.  The subprocess is
--- terminated and all its handles destroyed when the 'MonadSafe'
--- computation completes.
-runCreateProcess
-  :: (MonadSafe m, MonadCatch (Base m))
-  => Maybe NonPipe
-  -- ^ Standard input
-  -> Maybe NonPipe
-  -- ^ Standard output
-  -> Maybe NonPipe
-  -- ^ Standard error
-  -> CreateProcess
-  -> m (Maybe Handle, Maybe Handle, Maybe Handle, ErrSpec, ProcessHandle)
-runCreateProcess inp out err cp = do
-  let ev = makeErrSpec cp
-  (inp', out', err', phan) <-
-      createProcess (convertCreateProcess inp out err cp) ev
-  return (inp', out', err', ev, phan)
 
 -- * Creating Proxy
 
-
--- | Do not create any 'Proxy' to or from the process.
-pipeNone
-  :: (MonadSafe m, MonadCatch (Base m))
-  => NonPipe
-  -- ^ Standard input
-  -> NonPipe
-  -- ^ Standard output
-  -> NonPipe
-  -- ^ Standard error
-  -> CreateProcess
-  -> m ProcessHandle
-pipeNone inp out err cp = do
-  (_, _, _, _, phan) <-
-    runCreateProcess (Just inp) (Just out) (Just err) cp
-  return phan
-
-
 -- | Create a 'Consumer' for standard input.
 pipeInput
-  :: (MonadSafe mi, MonadSafe m, MonadCatch (Base m))
+  :: (MonadSafe m, MonadCatch (Base m))
+
   => NonPipe
   -- ^ Standard output
+
   -> NonPipe
   -- ^ Standard error
+
   -> CreateProcess
-  -> m (Consumer ByteString mi (), ProcessHandle)
+
+  -> IO (Stdin m a, ProcessHandle)
   -- ^ A 'Consumer' for standard input
-pipeInput out err cp = do
-  (Just inp, _, _, ev, phan) <-
-    runCreateProcess Nothing (Just out) (Just err) cp
-  ih <- runInputHandle inp ev
-  return (ih, phan)
-
-
+pipeInput out err cp = mask_ $ do
+  pnl <- newProcessHandle Nothing (Just out) (Just err) cp
+  inp <- runInputHandle pnl
+  return (inp, pnl)
+    
 
 -- | Create a 'Producer' for standard output.
 pipeOutput
-  :: (MonadSafe mo, MonadSafe m, MonadCatch (Base m))
+  :: (MonadSafe mo, MonadCatch (Base mo))
+
   => NonPipe
   -- ^ Standard input
+
   -> NonPipe
   -- ^ Standard error
+
   -> CreateProcess
-  -> m (Producer ByteString mo (), ProcessHandle)
+
+  -> IO (Stdout r mo ExitCode, ProcessHandle)
   -- ^ A 'Producer' for standard output
-pipeOutput inp err cp = do
-  (_, Just out, _, ev, phan) <- runCreateProcess (Just inp)
-    Nothing (Just err) cp
-  oh <- runOutputHandle Output out ev
-  return (oh, phan)
+pipeOutput inp err cp = mask_ $ do
+  pnl <- newProcessHandle (Just inp) Nothing (Just err) cp
+  pdcr <- runOutputHandle Output pnl
+  return (pdcr, pnl)
+
 
 -- | Create a 'Producer' for standard error.
 pipeError
-  :: (MonadSafe m, MonadCatch (Base m))
+  :: (MonadSafe me, MonadCatch (Base me))
+
   => NonPipe
   -- ^ Standard input
+
   -> NonPipe
   -- ^ Standard output
+
   -> CreateProcess
-  -> m (Producer ByteString m (), ProcessHandle)
+
+  -> IO (Stderr r me ExitCode, ProcessHandle)
   -- ^ A 'Producer' for standard error
-pipeError inp out cp = do
-  (_, _, Just err, ev, phan) <- runCreateProcess (Just inp) (Just out) Nothing cp
-  eh <- runOutputHandle Error err ev
-  return (eh, phan)
+
+pipeError inp out cp = mask_ $ do
+  pnl <- newProcessHandle (Just inp) (Just out) Nothing cp
+  pdcr <- runOutputHandle Error pnl
+  return (pdcr, pnl)
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard output.
 pipeInputOutput
-  :: (MonadSafe mi, MonadSafe mo, MonadSafe m, MonadCatch (Base m))
+  :: ( MonadSafe mi, MonadCatch (Base mi),
+       MonadSafe mo, MonadCatch (Base mo))
+
   => NonPipe
   -- ^ Standard error
+
   -> CreateProcess
-  -> m ((Consumer ByteString mi (), Producer ByteString mo ()), ProcessHandle)
+
+  -> IO ((Stdin mi a, Stdout r mo ExitCode), ProcessHandle)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- output
-pipeInputOutput err cp = do
-  (Just inp, Just out, _, ev, phan) <-
-    runCreateProcess Nothing Nothing (Just err) cp
-  ih <- runInputHandle inp ev
-  oh <- runOutputHandle Output out ev
-  return ((ih, oh), phan)
+
+pipeInputOutput err cp = mask_ $ do
+  pnl <- newProcessHandle Nothing Nothing (Just err) cp
+  csmr <- runInputHandle pnl
+  pdcr <- runOutputHandle Output pnl
+  return ((csmr, pdcr), pnl)
 
 -- | Create a 'Consumer' for standard input and a 'Producer' for
 -- standard error.
 pipeInputError
-  :: (MonadSafe mi, MonadSafe me, MonadSafe m, MonadCatch (Base m))
+  :: ( MonadSafe mi, MonadCatch (Base mi),
+       MonadSafe me, MonadCatch (Base me))
+
   => NonPipe
+
   -- ^ Standard output
   -> CreateProcess
-  -> m ( (Consumer ByteString mi (), Producer ByteString me ())
-       , ProcessHandle)
+
+  -> IO ((Stdin mi a, Stderr r me ExitCode), ProcessHandle)
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
   -- error
 pipeInputError out cp = do
-  (Just inp, _, Just err, ev, phan) <-
-    runCreateProcess Nothing (Just out) Nothing cp
-  ih <- runInputHandle inp ev
-  eh <- runOutputHandle Error err ev
-  return $ ((ih, eh), phan)
+  pnl <- newProcessHandle Nothing (Just out) Nothing cp
+  csmr <- runInputHandle pnl
+  pdcr <- runOutputHandle Error pnl
+  return ((csmr, pdcr), pnl)
+
 
 -- | Create a 'Producer' for standard output and a 'Producer' for
 -- standard error.
 pipeOutputError
-  :: (MonadSafe mo, MonadSafe me, MonadSafe m, MonadCatch (Base m))
+  :: ( MonadSafe mo, MonadCatch (Base mo),
+       MonadSafe me, MonadCatch (Base me))
+
   => NonPipe
   -- ^ Standard input
+
   -> CreateProcess
-  -> m ((Producer ByteString mo (), Producer ByteString me ()), ProcessHandle)
-  -- ^ A 'Producer' for standard output, a 'Producer' for standard
+
+  -> IO ((Stdout ro mo ExitCode, Stderr re me ExitCode), ProcessHandle)
+  -- ^ A 'Producer' for standard output and a 'Producer' for standard
   -- error
+
 pipeOutputError inp cp = do
-  (_, Just out, Just err, ev, phan) <-
-    runCreateProcess (Just inp) Nothing Nothing cp
-  oh <- runOutputHandle Output out ev
-  eh <- runOutputHandle Error err ev
-  return ((oh, eh), phan)
+  pnl <- newProcessHandle (Just inp) Nothing Nothing cp
+  pdcrOut <- runOutputHandle Output pnl
+  pdcrErr <- runOutputHandle Error pnl
+  return ((pdcrOut, pdcrErr), pnl)
 
 
 -- | Create a 'Consumer' for standard input, a 'Producer' for standard
 -- output, and a 'Producer' for standard error.
 pipeInputOutputError
-  :: ( MonadSafe mi, MonadSafe mo, MonadSafe me,
-       MonadSafe m, MonadCatch (Base m))
+  :: ( MonadSafe mi, MonadCatch (Base mi),
+       MonadSafe mo, MonadCatch (Base mo),
+       MonadSafe me, MonadCatch (Base me))
+
   => CreateProcess
-  -> m (( Consumer ByteString mi ()
-        , Producer ByteString mo ()
-        , Producer ByteString me ()), ProcessHandle)
+
+  -> IO ( (Stdin mi a, Stdout ro mo ExitCode, Stderr re me ExitCode)
+        , ProcessHandle
+        )
   -- ^ A 'Consumer' for standard input, a 'Producer' for standard
-  -- output, a 'Producer' for standard error
+  -- output, and a 'Producer' for standard error
+
 pipeInputOutputError cp = do
-  (Just inp, Just out, Just err, ev, phan) <-
-    runCreateProcess Nothing Nothing Nothing cp
-  ih <- runInputHandle inp ev
-  oh <- runOutputHandle Output out ev
-  eh <- runOutputHandle Error err ev
-  return $ ((ih, oh, eh), phan) 
+  pnl <- newProcessHandle Nothing Nothing Nothing cp
+  csmr <- runInputHandle pnl
+  pdcrOut <- runOutputHandle Output pnl
+  pdcrErr <- runOutputHandle Error pnl
+  return ((csmr, pdcrOut, pdcrErr), pnl)

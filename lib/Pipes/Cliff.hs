@@ -15,20 +15,16 @@
 --
 -- __Use the @-threaded@ GHC option__ when compiling your programs or
 -- when using GHCi.  Internally, this module uses
--- 'System.Process.waitForProcess' from the "System.Process" module;
--- it's also quite likely that you will use this function when you
--- write code using this library.  As the documentation for
--- 'waitForProcess' states, you must use the @-threaded@ option to
--- prevent every thread in the system from suspending when you use
--- 'waitForProcess'.  So, if your program experiences deadlocks, be
--- sure you used the @-threaded@ option.
+-- 'System.Process.waitForProcess' from the "System.Process" module.
+-- As the documentation for 'waitForProcess' states, you must use the
+-- @-threaded@ option to prevent every thread in the system from
+-- suspending when 'waitForProcess' is used.  So, if your program
+-- experiences deadlocks, be sure you used the @-threaded@ option.
 --
--- This module relies on the "Pipes", "Pipes.Safe", and
--- "System.Process" modules.  You will want to have basic
--- familiarity with what all of those modules do before using this
--- module.  It uses "Control.Concurrent.Async" and
--- "Pipes.Concurrent" behind the scenes; you don't need to know how
--- these work unless you're curious.
+-- This module relies on the "Pipes", "Pipes.Safe",
+-- "Control.Concurrent.Async", and "System.Process" modules.  You will
+-- want to have basic familiarity with what all of those modules do
+-- before using this module.
 --
 -- All communcation with subprocesses is done with strict
 -- 'ByteString's.  If you are dealing with textual data, the @text@
@@ -58,9 +54,15 @@ module Pipes.Cliff
   , procSpec
   , squelch
 
+  -- * Type synonyms
+  , Stdin
+  , Outstream
+  , Stdout
+  , Stderr
+
   -- * Creating processes
   -- $process
-  , pipeNone
+  
   , pipeInput
   , pipeOutput
   , pipeError
@@ -69,45 +71,53 @@ module Pipes.Cliff
   , pipeOutputError
   , pipeInputOutputError
 
-  -- * Background operations
-
-  -- | Often it is necessary to run threads in the background; in
-  -- addition, all subprocesses run in the background.  These
-  -- functions allow you to launch threads in the background and to
-  -- wait on background threads and subprocesses.
-
+  -- * 'Proxy' combinators
+  , forwardRight
+  , wrapRight
   , conveyor
-  , background
+  , safeEffect
+  , immortal
+
+  -- * Querying and terminating the process
+  , ProcessHandle
+  , originalCreateProcess
+  , isStillRunning
   , waitForProcess
-  , waitForThread
+  , terminateProcess
+  
+  -- * Exception safety
+
+  -- | These are some simple combinators built with
+  -- 'Control.Exception.bracket'; feel free to use your own favorite
+  -- idioms for exception safety.
+  , withProcess
+  , withConveyor
 
   -- * Errors and warnings
 
   -- | You will only need what's in this section if you want to
   -- examine errors more closely.
   , Activity(..)
+  , Outbound(..)
   , HandleDesc(..)
-  , HandleOopsie(..)
   , Oopsie(..)
 
   -- * Re-exports
   -- $reexports
-  , module Control.Concurrent.MVar
+  , module Control.Concurrent.Async
   , module Pipes
   , module Pipes.Safe
   , module System.Exit
-  , module System.Process
 
   -- * Some design notes
   -- $designNotes
   ) where
 
+import Control.Concurrent.Async
 import Pipes.Cliff.Core
 import Pipes
-import Pipes.Safe
+import Pipes.Safe (runSafeT)
 import System.Exit
-import System.Process (ProcessHandle)
-import Control.Concurrent.MVar
 
 {- $process
 
@@ -125,45 +135,48 @@ output, use 'pipeInputOutput'.  You must describe what you want done
 with standard error.  A 'Producer' is returned for standard output
 and a 'Consumer' for standard input.
 
-If you are creating a 'Proxy' for only one stream (for instance,
-you're using 'pipeOutput') then a single 'Proxy' is returned to you.
-That 'Proxy' manages all the resources it creates; so, for example,
-when you ultimately run your 'Effect', the process is created and then
-destroyed when the 'MonadSafe' computation completes.
+Each function also returns a 'ProcessHandle'; this is not the same
+'ProcessHandle' that you will find in "System.Process".  You can use
+this 'ProcessHandle' to obtain some information about the process that
+is created and to get the eventual 'ExitCode'.
 
-If you are creating a 'Proxy' for more than one stream (for
-instance, you're using 'pipeInputOutput') then the multiple 'Proxy'
-are returned to you in a tuple in the 'MonadSafe' computation.  The
-'MonadSafe' computation will make sure that the resulting process
-and handles are destroyed when you exit the 'MonadSafe' computation.
-In such a case, you must make sure that you don't try to use the
-streams outside of the 'MonadSafe' computation, because the
-subprocess will already be destroyed.  To make sure you are done
-using the streams before leaving the 'MonadSafe' computation, you
-will want to use 'waitForProcess' for one or more processes that you
-are most interested in.
+Every time you create a process with one of these functions, some
+additional behind-the-scenes resources are created, such as some
+threads to move data to and from the process.  In normal usage, these
+threads will be cleaned up after the process exits.  However, if
+exceptions are thrown, there could be resource leaks.  Applying
+'terminateProcess' to a 'ProcessHandle' makes a best effort to clean
+up all the resources that Cliff may create, including the process
+itself and any additional threads.  To guard against resource leaks,
+use the functions found in "Control.Exception" or in
+"Control.Monad.Catch".  "Control.Monad.Catch" provides operations that
+are the same as those in "Control.Exception", but they are not limited
+to 'IO'.
 
-Every function in this section (except for the 'pipeNone' function)
-returns a value of type @(a, h)@, where @a@ is the set of 'Proxy',
-and @h@ is the 'ProcessHandle'; that means the functions that return
-multiple 'Proxy' have a nested return type.  That allows you to use
-'fst' and 'snd' to pull out the part you are interested in.  It
-would have been more consistent for 'pipeNone' to return
-@((), ProcessHandle)@ but that just seemed silly.
+I say that 'terminateProcess' \"makes a best effort\" to release
+resources because in UNIX it merely sends a @SIGTERM@ to the process.
+That should kill well-behaved processes, but 'terminateProcess' does
+not send a @SIGKILL@.  'terminateProcess' always closes all handles
+associated with the process and it kills all Haskell threads that were
+moving data to and from the process.  ('terminateProcess' does not
+kill threads it does not know about, such as threads you created with
+'conveyor'.)
+
+There is no function that will create a process that has no 'Proxy'
+at all.  For that, just use 'System.Process.createProcess' in
+"System.Process".
 
 -}
 
 {- $reexports
 
-   * "Control.Concurrent.MVar" reexports all bindings
+   * "Control.Concurrent.Async" reexports all bindings
 
    * "Pipes" reexports all bindings
 
-   * "Pipes.Safe" reexports all bindings
+   * "Pipes.Safe" reexports 'runSafeT'
 
    * "System.Exit" reexports all bindings
-
-   * "System.Process" reexports 'ProcessHandle'
 
 -}
 
@@ -178,9 +191,18 @@ the user has to pay explicit attention to encoding issues--as
 she should, because not all UNIX processes deal with encoded
 textual data.
 
-Second, I paid meticulous attention to resource management.
-Resources are deterministically destroyed immediately after
-use.  This eliminates many bugs.
+Second, I paid meticulous attention to resource management.  Resources
+are deterministically destroyed immediately after use.  This
+eliminates many bugs.  Even so, I decided to leave it up to the user
+to use something like 'Control.Exception.bracket' to ensure that all
+resources are cleaned up if there is an exception.  Originally I tried
+to have the library do this, but that turned out not to be very
+composable.  There are already many exception-handling mechanisms
+available in "Control.Exception", "Pipes.Safe", and
+"Control.Monad.Catch", and it seems best to let the user choose how to
+handle this issue; she can just perform a 'Control.Exception.bracket'
+and may combine this with the @ContT@ monad in @transformers@ or @mtl@
+if she wishes, or perhaps with the @managed@ library.
 
 You might wonder why, if you are using an external process as
 a pipeline, why can't you create, well, a 'Pipe'?  Wouldn't
