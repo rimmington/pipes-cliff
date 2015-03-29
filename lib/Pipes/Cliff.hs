@@ -23,12 +23,10 @@
 -- 'waitForProcess'.  So, if your program experiences deadlocks, be
 -- sure you used the @-threaded@ option.
 --
--- This module relies on the "Pipes", "Pipes.Safe", and
--- "System.Process" modules.  You will want to have basic
--- familiarity with what all of those modules do before using this
--- module.  It uses "Control.Concurrent.Async" and
--- "Pipes.Concurrent" behind the scenes; you don't need to know how
--- these work unless you're curious.
+-- This module relies on the "Pipes", "Pipes.Safe",
+-- "Control.Concurrent.Async", and "System.Process" modules.  You will
+-- want to have basic familiarity with what all of those modules do
+-- before using this module.
 --
 -- All communcation with subprocesses is done with strict
 -- 'ByteString's.  If you are dealing with textual data, the @text@
@@ -131,23 +129,33 @@ output, use 'pipeInputOutput'.  You must describe what you want done
 with standard error.  A 'Producer' is returned for standard output
 and a 'Consumer' for standard input.
 
-If you are creating a 'Proxy' for only one stream (for instance,
-you're using 'pipeOutput') then a single 'Proxy' is returned to you.
-That 'Proxy' manages all the resources it creates; so, for example,
-when you ultimately run your 'Effect', the process is created and then
-destroyed when the 'MonadSafe' computation completes.
+Each function also returns a 'ProcessHandle'; this is not the same
+'ProcessHandle' that you will find in "System.Process".  You can use
+this 'ProcessHandle' to obtain some information about the process that
+is created and to get the eventual 'ExitCode'.
 
-If you are creating a 'Proxy' for more than one stream (for
-instance, you're using 'pipeInputOutput') then the multiple 'Proxy'
-are returned to you in a tuple in the 'MonadSafe' computation.  The
-'MonadSafe' computation will make sure that the resulting process
-and handles are destroyed when you exit the 'MonadSafe' computation.
-In such a case, you must make sure that you don't try to use the
-streams outside of the 'MonadSafe' computation, because the
-subprocess will already be destroyed.  To make sure you are done
-using the streams before leaving the 'MonadSafe' computation, you
-will want to use 'waitForProcess' for one or more processes that you
-are most interested in.
+Every time you create a process with one of these functions, some
+additional behind-the-scenes resources are created, such as some
+threads to move data to and from the process.  In normal usage, these
+threads will be cleaned up after the process exits.  However, if
+exceptions are thrown, there could be resource leaks.  Applying
+'terminateProcess' to a 'ProcessHandle' makes a best effort to clean
+up all the resources that Cliff may create, including the process
+itself and any additional threads.  To guard against resource leaks,
+use the functions found in "Control.Exception" or in
+"Control.Monad.Catch".  "Control.Monad.Catch" provides operations that
+are the same as those in "Control.Exception", but they are not limited
+to 'IO'; they are easy to use with Cliff because this module reexports
+"Pipes.Safe" which, in turn, reexports "Control.Monad.Catch".
+
+I say that 'terminateProcess' \"makes a best effort\" to release
+resources because in UNIX it merely sends a @SIGTERM@ to the process.
+That should kill well-behaved processes, but 'terminateProcess' does
+not send a @SIGKILL@.  'terminateProcess' always closes all handles
+associated with the process and it kills all Haskell threads that were
+moving data to and from the process.  ('terminateProcess' does not
+kill threads it does not know about, such as threads you created with
+'conveyor'.)
 
 There is no function that will create a process that has no 'Proxy'
 at all.  For that, just use 'System.Process.createProcess' in
@@ -167,78 +175,6 @@ at all.  For that, just use 'System.Process.createProcess' in
 
 -}
 
-{- $singles
-
-These functions create a single 'Proxy'.  The 'Proxy' itself
-performs all resource management.  After the 'Proxy' terminates, all
-background threads associated with pushing and pulling data to and
-from the process will be terminated.  This occurs whether the 'Proxy' terminates
-normally, \"prematurely\" in the @pipes@ sense, or due to an
-exception.
-
-Upon 'Proxy' termination, the process itself is @not@ terminated.
-Typically it will have died anyway, but Cliff does not kill it.
-Cliff performs a @wait@ in a background thread for all processes,
-and that thread is not terminated when the 'Proxy' terminates.
-
-The 'Proxy' does not actually start the process until it starts
-streaming through a 'runEffect' or similar function; that's
-reflected in the return types of these functions, all of which are
-pure.
--}
-
-{- $automatic
-
-Unlike the functions that create a single 'Proxy', such as
-'pipeInput', 'pipeOutput', and 'pipeError', these functions create
-more than one 'Proxy', with one 'Proxy' for each standard stream.
-These functions must run in the IO monad because shared resources
-must be initialized for the multiple 'Proxy' to share.  However, the
-subprocess will not start running until one of the 'Proxy' starts
-using it.
-
-These functions are a little loosey-goosey when it comes to resource
-management.  Two or three 'Proxy' share the same process, so it's
-difficult to ensure that all the resources related to the process
-(such as the process itself, and threads used to push and pull data
-in and out of it) get cleaned up in the face of exceptions.  None of
-these functions will ever terminate your process on their own; they
-merely wait for it to finish.  That makes them easier to use, but
-less deterministic in their resource management.
-
-In normal use, all resources will be cleaned up--for instance, when
-a process dies, all resources should be cleaned up shortly
-thereafter.  This is done deterministically and does not depend on
-the garbage collector.  But in the face of exceptions, things get
-tricky.
-
--}
-
-{- $deterministic
-
-These functions, like the so-called \"automatic\" ones, also create
-multiple 'Proxy'.  Unlike the \"automatic\" ones, they create the
-resources in a 'MonadSafe' computation.  All process resources will
-be destroyed when you leave the 'MonadSafe' computation, even if an
-exception was the reason the 'MonadSafe' computation is terminating.
-To be more precise, the associated processes are sent a
-'terminateProcess'; on UNIX, this is a SIGTERM, which means the
-process does not /have/ to exit.
-
-The advantage of this is that you don't have to think about when
-resources will be released.  The disadvantage is that you must make
-sure you use everything related to the process inside of the
-'MonadSafe' computation, or the process will be snatched out from
-under you.
-
-Even if an exception is thrown, there might still be a single thread
-left, which is performing a @wait@ on the process.  This is
-necessary to avoid zombie processes.  That thread won't be around if
-your processes are good citizens and they exited after getting the
-@SIGTERM@.
-
--}
-
 {- $designNotes
 
 Two overarching principles guided the design of this
@@ -252,7 +188,18 @@ textual data.
 
 Second, I paid meticulous attention to resource management.
 Resources are deterministically destroyed immediately after
-use.  This eliminates many bugs.
+use.  This eliminates many bugs.  Even so, I decided to
+leave it up to the user to use something like 'bracket' to
+ensure that all resources are cleaned up if there is an
+exception.  Originally I tried to have the library do this,
+but that turned out not to be very composable.  There are
+already many exception-handling mechanisms available in
+"Control.Exception", "Pipes.Safe", and
+"Control.Monad.Catch", and it seems best to let the user
+choose how to handle this issue; she can just perform a
+'bracket' and may combine this with the @ContT@ monad in
+@transformers@ or @mtl@ if she wishes, or perhaps with the
+@managed@ library.
 
 You might wonder why, if you are using an external process as
 a pipeline, why can't you create, well, a 'Pipe'?  Wouldn't
