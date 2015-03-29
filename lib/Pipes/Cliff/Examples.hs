@@ -37,15 +37,12 @@ produceNumbers = go (0 :: Int)
     go i = yield ((BS8.pack . show $ i) `BS8.snoc` '\n')
       >> go (succ i)
 
--- | Streams an infinite list of numbers to @less@.
--- The 'Effect' that streams values to the process is run in the
--- background by using 'conveyor', even though there is only one
--- subprocess.  This is typically what you want.  Shows off how you
--- can use "Pipes.Cliff" even for non-finite 'Producer's.  Don't try
--- to go to the end of the input in @less@, though.  When you quit
--- @less@, you will get broken pipe warnings printed to standard
--- error.  This is normal.  To suppress them, see the 'handler'
--- option.
+-- | Streams an infinite list of numbers to @less@.  Shows off how
+-- you can use "Pipes.Cliff" even for non-finite 'Producer's.  Don't
+-- try to go to the end of the input in @less@, though.  When you
+-- quit @less@, you will get broken pipe warnings printed to
+-- standard error.  This is normal.  To suppress them, see the
+-- 'handler' option.
 
 numsToLess :: IO (Maybe ExitCode, ExitCode)
 numsToLess = do
