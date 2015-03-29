@@ -1,3 +1,4 @@
+{-# LANGUAGE RankNTypes #-}
 -- | Examples using "Pipes.Cliff".  You will want to look at the
 -- source code itself; viewing just the Haddocks will not help you
 -- much.  You can view the source using Haddock if you used
@@ -130,7 +131,7 @@ alphaNumbersByteString = do
     >-> wrapRight
     >-> (P.take 300 >>= immortal)
     >-> toTr
-  let trByteStrings = fromTr >-> forwardRight >> return ()
+  let trByteStrings = (fromTr >-> forwardRight) >> return ()
   runSafeT
     $ P.fold BS8.append BS8.empty id trByteStrings
 

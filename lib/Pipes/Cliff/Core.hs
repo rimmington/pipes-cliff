@@ -25,8 +25,8 @@ import qualified System.Process as Process
 import Pipes
 import Pipes.Safe
 import qualified Data.ByteString as BS
-import qualified Pipes.Concurrent as PC
 import Data.ByteString (ByteString)
+import Control.Concurrent (forkIO)
 import Control.Concurrent.Async
 import Control.Concurrent.MVar
 import System.Exit
@@ -384,6 +384,19 @@ recvBox locked mailbox = do
 sealer :: TVar Bool -> STM ()
 sealer locked = writeTVar locked True
 
+produceFromBox :: MonadIO m => STM (Maybe a) -> Producer a m ()
+produceFromBox stm = do
+  mayV <- liftIO $ atomically stm
+  case mayV of
+    Nothing -> return ()
+    Just v -> yield v >> produceFromBox stm
+    
+sendToBox :: MonadIO m => (a -> STM Bool) -> Consumer a m ()
+sendToBox stm = do
+  v <- await
+  r <- liftIO $ atomically (stm v)
+  if r then sendToBox stm else return ()
+
 -- * Console
 
 -- | Data that is computed once, after the process has been created.
@@ -479,7 +492,7 @@ newProcessHandle inp out err cp = liftM2 ProcessHandle (return cp) (once act)
               killHan err' (Outbound Error),
               Process.terminateProcess han ]
       getCode <- once $ Process.waitForProcess han
-      _ <- PC.forkIO (getCode >> return ())
+      _ <- forkIO (getCode >> return ())
       lock <- newLock
       rlsrs <- newVar destroyers
       return $ Console inp' out' err' han getCode lock rlsrs
@@ -531,35 +544,25 @@ safeEffect = runSafeT . runEffect
 
 -- * Mailboxes
 
--- | A buffer that holds 1 message.  I have no idea if this is the
--- ideal size.  Don't use an unbounded buffer, though, because with
--- unbounded producers an unbounded buffer will fill up your RAM.
---
--- Since the buffer just holds one size, you might think \"why not
--- just use an MVar\"?  At least, I have been silly enough to think
--- that.  Using @Pipes.Concurrent@ also give the mailbox the ability
--- to be sealed; sealing the mailbox signals to the other side that it
--- won't be getting any more input or be allowed to send any more
--- output, which tells the whole pipeline to start shutting down.
-messageBuffer :: PC.Buffer a
-messageBuffer = PC.bounded 1
-
 -- | Creates a new mailbox and returns 'Proxy' that stream values
 -- into and out of the mailbox.  Each 'Proxy' is equipped with a
 -- finalizer that will seal the mailbox immediately after production
 -- or consumption has completed, even if such completion is not due
 -- to an exhausted mailbox.  This will signal to the other side of
 -- the mailbox that the mailbox is sealed.
+--
+-- In addition to returning the two 'Proxy', also returns an STM
+-- action that will manually seal the mailbox.
 newMailbox
   :: (MonadSafe mi, MonadSafe mo)
-  => IO (Consumer a mi (), Producer a mo ())
+  => IO (Consumer a mi (), Producer a mo (), STM ())
 newMailbox = do
-  (toBox, fromBox, seal) <- PC.spawn' messageBuffer
-  let csmr = register (liftIO $ PC.atomically seal)
-             >> PC.toOutput toBox
-      pdcr = register (liftIO $ PC.atomically seal)
-             >> PC.fromInput fromBox
-  return (csmr, pdcr)
+  (toBox, fromBox, seal) <- messageBox
+  let csmr = register (liftIO $ atomically seal)
+             >> sendToBox toBox
+      pdcr = register (liftIO $ atomically seal)
+             >> produceFromBox fromBox
+  return (csmr, pdcr, seal)
 
 -- * Type synonyms
 
@@ -724,8 +727,45 @@ finishProxy thread pnl = do
   waitForProcess pnl
   
 -- | Takes all steps necessary to get a 'Consumer' for standard
--- input.  Sets up a mailbox, runs a conveyor in the background.  Then
--- receives streaming data, and then gets the process exit code.
+-- input:
+--
+-- * Creates a 'Consumer' that will consume to the process standard
+-- input.  This 'Consumer' registers a MonadSafe releaser that will
+-- close the handle.
+--
+-- * Creates a mailbox, with a 'Producer' from the mailbox and a
+-- 'Consumer' to the mailbox.  Each of these 'Proxy' has a MonadSafe
+-- releaser that will close the mailbox.
+--
+-- * Spwans a thread to run an 'Effect' that connects the 'Consumer'
+-- that is connected to the handle to the 'Producer' from the mailbox.
+-- In a typical UNIX pipeline situation (where the process keeps its
+-- stdin open as long as it is getting input) this 'Effect' will stop
+-- running only when the mailbox is sealed.
+--
+-- * Registers a releaser in the Panel (not in the MonadSafe
+-- computation) to destroy the thread; this is in case the user
+-- terminates the process.
+--
+-- * Returns a 'Consumer'.  The 'Consumer' consumes to the mailbox.
+-- The 'Consumer' forwards all 'Right' values obtained from the
+-- 'yield' to the mailbox.  The 'Consumer' ceases consumption on the
+-- first 'Left' value.
+--
+-- The returned 'Consumer' will, on the first 'Left' value, manually
+-- seal the mailbox that transmits to the spawned thread.  This causes
+-- the background 'Effect' to shut down which will, in turn, cause the
+-- 'MonadSafe' computation to invoke its finalizers which will close
+-- the process's stdin.  That should cause the process to shut down.
+-- Then we wait for the background thead to finish, and then wait for
+-- the process's exit code.
+--
+-- The returned 'Proxy' always returns the exit code of this process.
+-- In addition, if the upstream 'Producer' terminated first, that
+-- return value is returned as well.  If this process terminated first
+-- (perhaps because the user shut it down manually, or it otherwise
+-- shut down without needing all of its stdin) then there will be no
+-- return value from the upstream 'Producer' to return.
 runInputHandle
   :: (MonadSafe mi, MonadCatch (Base mi))
   => ProcessHandle
@@ -734,16 +774,18 @@ runInputHandle
   -- ^
 runInputHandle pnl = mask_ $ do
   csmr <- consumeToHandle pnl
-  (toBox, fromBox) <- newMailbox
+  (toBox, fromBox, seal) <- newMailbox
   asyncId <- conveyor $ fromBox >-> csmr
   addReleaser pnl (cancel asyncId)
-  let f upstream = do
+  let f proxyRes = do
+        liftIO . atomically $ seal
         thisCode <- liftIO $ finishProxy asyncId pnl
-        return $ case upstream of
+        return $ case proxyRes of
           Left firstCode -> (Just firstCode, thisCode)
           Right _downstreamStopped -> (Nothing, thisCode)
 
   return $ ((fmap Left forwardRight) >-> fmap Right toBox) >>= f
+
 
 -- | Takes all steps necessary to get a 'Producer' for standard
 -- input.  Sets up a mailbox, runs a conveyor in the background.  Then
@@ -758,7 +800,7 @@ runOutputHandle
   -- ^
 runOutputHandle outb pnl = mask_ $ do
   pdcFromHan <- produceFromHandle outb pnl
-  (toBox, fromBox) <- newMailbox
+  (toBox, fromBox, _) <- newMailbox
   asyncId <- conveyor $ pdcFromHan >-> toBox
   addReleaser pnl (cancel asyncId)
   let f _ = do

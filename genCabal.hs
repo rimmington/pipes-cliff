@@ -113,6 +113,7 @@ pipes = closedOpen "pipes" [4,1] [4,2]
 pipesSafe :: Package
 pipesSafe = closedOpen "pipes-safe" [2,2] [2,3]
 
+-- | Currently unused
 pipesConcurrency :: Package
 pipesConcurrency = closedOpen "pipes-concurrency" [2,0,3] [2,1]
 
@@ -148,7 +149,6 @@ libDeps = buildDepends
   , bytestring
   , process
   , async
-  , pipesConcurrency
   , stm
   ]
 
