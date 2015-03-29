@@ -84,6 +84,7 @@ module Pipes.Cliff
 
   -- * Querying and terminating the process
   , ProcessHandle
+  , originalCreateProcess
   , isStillRunning
   , waitForProcess
   , terminateProcess

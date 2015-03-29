@@ -1,9 +1,8 @@
 {-# LANGUAGE FlexibleContexts, RankNTypes #-}
 
--- | This contains the innards of Cliff.  You probably won't need
--- anything that's in here; "Pipes.Cliff" re-exports the most useful
--- bindings.  But nothing will break if you use what's in here, so
--- it's here if you need it.
+-- | This contains the innards of Cliff.
+-- You shouldn't need anything that's in this module; instead, use
+-- "Pipes.Cliff".
 --
 -- Exit code and waiting for processes: as of base 4.7, there was a
 -- bug in 'System.Process.waitForProcess' which may arise if you have
@@ -12,9 +11,7 @@
 -- places the result in an MVar.  See
 --
 -- http://ghc.haskell.org/trac/ghc/ticket/9292
--- 
---
--- 
+
 module Pipes.Cliff.Core where
 
 import System.Environment
@@ -355,6 +352,12 @@ once act = do
     
 -- * Mailboxes
 
+-- | Creates a new mailbox.  Returns an action to send to the mailbox;
+-- this action will return False if the mailbox is sealed, or True if
+-- the message was successfully placed in the mailbox.  Also returns
+-- an action to retrieve from the mailbox, which returns Nothing if
+-- the mailbox is sealed, or Just if there is a value to be retrieved.
+-- Also returns an action to seal the mailbox.
 messageBox :: IO (a -> STM Bool, STM (Maybe a), STM ())
 messageBox = atomically $ do
   locked <- newTVar False
@@ -403,14 +406,21 @@ sendToBox stm = do
 -- After computation, this data does not change.
 data Console = Console
   { csIn :: Maybe Handle
+  -- ^ Standard input
   , csOut :: Maybe Handle
+  -- ^ Standard output
   , csErr :: Maybe Handle
+  -- ^ Standard error
   , csHandle :: Process.ProcessHandle
   , csExitCode :: IO ExitCode
+  -- ^ IO action that will return the exit code.  Use this rather than
+  -- using 'Process.waitForProcess' on the 'csHandle'.
   , csLock :: Lock
-  -- ^ If locked, new resources cannot be created.
+  -- ^ If locked, new resources cannot be created.  Obtain this lock
+  -- while registering new releasers in 'csReleasers'.
   , csReleasers :: Var [IO ()]
   -- ^ Each time a resource is created, register a finalizer here.
+  -- These finalizers are run when 'terminateProcess' is run.
   }
   
 
@@ -424,11 +434,17 @@ isStillRunning ph = do
   cd <- Process.getProcessExitCode (csHandle cnsl)
   return . maybe True (const False) $ cd
 
--- | All the shared properties of a set of Proxy.
+-- | Allows you to terminate the process, as well as to obtain some
+-- information about the process.
 data ProcessHandle = ProcessHandle
   { phCreateProcess :: CreateProcess
   , phConsole :: IO Console
   }
+  
+-- | Tells you the 'CreateProcess' that was originally used to create
+-- the process associated with this 'ProcessHandle'.
+originalCreateProcess :: ProcessHandle -> CreateProcess
+originalCreateProcess = phCreateProcess
   
 -- | Add a finalizer to the ProcessHandle.  When the finalizers are run, all
 -- exceptions are ignored, except asynchronous exceptions, which are
@@ -459,10 +475,7 @@ waitForProcess pnl = phConsole pnl >>= csExitCode
 
 -- | Creates a new ProcessHandle.
 --
--- Side effects: creates an MVar; this MVar acts as a unique
--- identifier which allows weak references to work more effectively
--- (see the documentation in "System.Mem.Weak" for the 'Weak' type for
--- more details on this.)  Does not create the process right away;
+-- Side effects: Does not create the process right away;
 -- instead, creates an IO action that, when run, will create the
 -- process.  This IO action contains another IO action that, when run,
 -- will return the process exit code.
@@ -667,9 +680,12 @@ initHandle desc get pnl mkProxy = mask_ $ do
 -- Returns a Consumer for process standard input.
 --
 -- Side effects: Process is started if it isn't already.  The returned
--- computation will await values and passes them on to the process
+-- computation will await values and pass them on to the process
 -- standard input mailbox.  Any IO exceptions are caught, and
 -- consumption terminates.
+--
+-- I would rather just catch broken pipe exceptions, but I'm not sure
+-- there is a good way to do that.
 consumeToHandle
   :: (MonadSafe mi, MonadCatch (Base mi))
   => ProcessHandle
@@ -784,7 +800,9 @@ runInputHandle pnl = mask_ $ do
           Left firstCode -> (Just firstCode, thisCode)
           Right _downstreamStopped -> (Nothing, thisCode)
 
-  return $ ((fmap Left forwardRight) >-> fmap Right toBox) >>= f
+  return
+    $ register (liftIO $ cancel asyncId)
+    >> ((fmap Left forwardRight) >-> fmap Right toBox) >>= f
 
 
 -- | Takes all steps necessary to get a 'Producer' for standard
