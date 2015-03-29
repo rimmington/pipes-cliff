@@ -32,6 +32,7 @@ import Control.Concurrent.MVar
 import System.Exit
 import qualified Control.Exception
 import Control.Monad
+import Control.Concurrent.STM
 
 -- * Data types
 
@@ -351,6 +352,39 @@ once act = do
             return x
       return (Just b, r)
     Just b -> return (Just b, waitBarrier b)
+    
+-- * Mailboxes
+
+messageBox :: IO (a -> STM Bool, STM (Maybe a), STM ())
+messageBox = atomically $ do
+  locked <- newTVar False
+  mailbox <- newEmptyTMVar
+  return (sendBox locked mailbox, recvBox locked mailbox, sealer locked)
+  
+sendBox :: TVar Bool -> TMVar a -> a -> STM Bool
+sendBox locked mailbox a = do
+  isLocked <- readTVar locked
+  if isLocked
+    then return False
+    else do
+      putTMVar mailbox a
+      return True
+
+recvBox :: TVar Bool -> TMVar a -> STM (Maybe a)
+recvBox locked mailbox = do
+  mayA <- tryTakeTMVar mailbox
+  case mayA of
+    Just a -> return $ Just a
+    Nothing -> do
+      isLocked <- readTVar locked
+      if isLocked
+        then return Nothing
+        else retry
+    
+sealer :: TVar Bool -> STM ()
+sealer locked = writeTVar locked True
+
+-- * Console
 
 -- | Data that is computed once, after the process has been created.
 -- After computation, this data does not change.
@@ -388,7 +422,7 @@ data ProcessHandle = ProcessHandle
 -- masked.
 addReleaser :: ProcessHandle -> IO () -> IO ()
 addReleaser pnl rel = do
-  cnsl <- liftIO $ phConsole pnl
+  cnsl <- phConsole pnl
   withLock (csLock cnsl) $
     modifyVar_ (csReleasers cnsl) (\ls -> return (rel : ls))
 
@@ -470,15 +504,14 @@ handleException act desc spec sender exc = sender oops
 
 -- | Close a handle.  Catches any exceptions and passes them to the handler.
 closeHandleNoThrow
-  :: (MonadCatch m, MonadIO m)
-  => Handle
+  :: Handle
   -> HandleDesc
   -> CmdSpec
   -> (Oopsie -> IO ())
-  -> m ()
+  -> IO ()
 closeHandleNoThrow hand desc spec hndlr
-  = (liftIO $ hClose hand) `catch`
-    (liftIO . handleException Closing desc spec hndlr)
+  = (hClose hand) `catch`
+    (handleException Closing desc spec hndlr)
 
 
 -- * Threads
@@ -621,12 +654,12 @@ initHandle
   -- ^ The remainder of the computation.
   -> IO (mi a)
 initHandle desc get pnl mkProxy = mask_ $ do
-  cnsl <- liftIO . phConsole $ pnl
+  cnsl <- phConsole $ pnl
   return $ mask $ \restore ->
     let han = get cnsl
         fnlzr = closeHandleNoThrow han desc (cmdspec . phCreateProcess $ pnl)
           (handler . phCreateProcess $ pnl)
-    in register fnlzr >> (restore $ mkProxy han)
+    in register (liftIO fnlzr) >> (restore $ mkProxy han)
 
 -- Returns a Consumer for process standard input.
 --
@@ -688,7 +721,7 @@ finishProxy
   -> IO ExitCode
 finishProxy thread pnl = do
   _ <- wait thread
-  liftIO $ waitForProcess pnl
+  waitForProcess pnl
   
 -- | Takes all steps necessary to get a 'Consumer' for standard
 -- input.  Sets up a mailbox, runs a conveyor in the background.  Then
@@ -730,7 +763,7 @@ runOutputHandle outb pnl = mask_ $ do
   addReleaser pnl (cancel asyncId)
   let f _ = do
         code <- liftIO $ finishProxy asyncId pnl
-        forever (return (Left code))
+        forever (yield (Left code))
   return $ (fromBox >-> wrapRight) >>= f
 
 

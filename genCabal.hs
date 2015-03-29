@@ -129,7 +129,6 @@ async = closedOpen "async" [2,0] [2,1]
 transformers :: Package
 transformers = closedOpen "transformers" [0,3] [0,5]
 
--- | Currently unused
 stm :: Package
 stm = closedOpen "stm" [2,4,4] [2,5]
 
@@ -150,6 +149,7 @@ libDeps = buildDepends
   , process
   , async
   , pipesConcurrency
+  , stm
   ]
 
 main :: IO ()

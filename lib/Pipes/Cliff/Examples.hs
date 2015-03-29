@@ -94,7 +94,7 @@ standardOutputAndError = do
   _ <- conveyor $ fromShOut >-> toLess
   runSafeT
     $ P.fold BS8.append BS8.empty id
-      (fmap (const ()) (fromShErr >-> forwardRight))
+      (fromShErr >-> (forwardRight >> return ()))
   where
     script = "while read line; do echo $line; echo $line 1>&2; done"
 
@@ -133,3 +133,4 @@ alphaNumbersByteString = do
   let trByteStrings = fromTr >-> forwardRight >> return ()
   runSafeT
     $ P.fold BS8.append BS8.empty id trByteStrings
+
