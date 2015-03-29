@@ -455,7 +455,9 @@ addReleaser pnl rel = do
   withLock (csLock cnsl) $
     modifyVar_ (csReleasers cnsl) (\ls -> return (rel : ls))
 
--- | Terminates a process.
+-- | Terminates a process.  Cleans up all associated resources.  Use
+-- this with 'Control.Exception.bracket' to ensure proper cleanup of
+-- resources.
 terminateProcess :: ProcessHandle -> IO ()
 terminateProcess pnl = mask_ $ do
   cnsl <- phConsole pnl
@@ -591,7 +593,7 @@ type Stdin m a
   = Consumer (Either a ByteString) m (Maybe a, ExitCode)
 
 -- | Producer of values from a process standard output or error.  'yield' a
--- @'Left' 'ExitCode'@ if the stream is done producing values, or a
+-- @'Left'@ if the stream is done producing values, or a
 -- @'Right' 'ByteString'@ if the stream is still producing values.
 -- 'Outstream' is polymorphic in its return type, @r@, becasuse the
 -- 'Outstream' never stops yielding values; instead, it just 'yield's
@@ -644,6 +646,37 @@ wrapRight = do
 -- 'Penny.Cliff.Examples.limitedAlphaNumbers'.
 immortal :: Monad m => r -> Producer' (Either r a) m r'
 immortal a = forever (yield (Left a))
+
+-- * Exception safety
+
+-- | Creates a process, uses it, and terminates it when the last
+-- computation ends.  Don't try to use any of the process resources
+-- after the last computation ends, because the process will already
+-- have been terminated.  For an example of its use, see
+-- 'Pipes.Cliff.Examples.standardOutputAndErrorBracketed'.
+withProcess
+  :: IO (a, ProcessHandle)
+  -- ^ Creates the process
+  -> (a -> IO b)
+  -- ^ Uses the process
+  -> IO b
+withProcess acq use = Control.Exception.bracket acq (terminateProcess . snd)
+  (use . fst)
+
+-- | Runs an 'Effect' in the backgroud (typically one that is moving
+-- data from one process to another).  If the background thread is
+-- still running when the second computation ends, the background
+-- thread is terminated.  For an example of its use, see
+-- 'Pipes.Cliff.Examples.standardOutputAndErrorBracketed'.
+
+safeConveyor
+  :: Effect (SafeT IO) a
+  -- ^ The 'Effect' to run in another thread
+  -> IO b
+  -- ^ The rest of the computation to run
+  -> IO b
+safeConveyor cvy end = Control.Exception.bracket (conveyor cvy) cancel
+  (\_ -> end)
 
 -- * Production from and consumption to 'Handle's
 

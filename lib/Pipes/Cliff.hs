@@ -15,13 +15,11 @@
 --
 -- __Use the @-threaded@ GHC option__ when compiling your programs or
 -- when using GHCi.  Internally, this module uses
--- 'System.Process.waitForProcess' from the "System.Process" module;
--- it's also quite likely that you will use this function when you
--- write code using this library.  As the documentation for
--- 'waitForProcess' states, you must use the @-threaded@ option to
--- prevent every thread in the system from suspending when you use
--- 'waitForProcess'.  So, if your program experiences deadlocks, be
--- sure you used the @-threaded@ option.
+-- 'System.Process.waitForProcess' from the "System.Process" module.
+-- As the documentation for 'waitForProcess' states, you must use the
+-- @-threaded@ option to prevent every thread in the system from
+-- suspending when 'waitForProcess' is used.  So, if your program
+-- experiences deadlocks, be sure you used the @-threaded@ option.
 --
 -- This module relies on the "Pipes", "Pipes.Safe",
 -- "Control.Concurrent.Async", and "System.Process" modules.  You will
@@ -86,6 +84,14 @@ module Pipes.Cliff
   , isStillRunning
   , waitForProcess
   , terminateProcess
+  
+  -- * Exception safety
+
+  -- | These are some simple combinators built with
+  -- 'Control.Exception.bracket'; feel free to use your own favorite
+  -- idioms for exception safety.
+  , withProcess
+  , safeConveyor
 
   -- * Errors and warnings
 
@@ -110,7 +116,7 @@ module Pipes.Cliff
 import Control.Concurrent.Async
 import Pipes.Cliff.Core
 import Pipes
-import Pipes.Safe
+import Pipes.Safe (runSafeT)
 import System.Exit
 
 {- $process
@@ -145,8 +151,7 @@ itself and any additional threads.  To guard against resource leaks,
 use the functions found in "Control.Exception" or in
 "Control.Monad.Catch".  "Control.Monad.Catch" provides operations that
 are the same as those in "Control.Exception", but they are not limited
-to 'IO'; they are easy to use with Cliff because this module reexports
-"Pipes.Safe" which, in turn, reexports "Control.Monad.Catch".
+to 'IO'.
 
 I say that 'terminateProcess' \"makes a best effort\" to release
 resources because in UNIX it merely sends a @SIGTERM@ to the process.
@@ -169,7 +174,7 @@ at all.  For that, just use 'System.Process.createProcess' in
 
    * "Pipes" reexports all bindings
 
-   * "Pipes.Safe" reexports all bindings
+   * "Pipes.Safe" reexports 'runSafeT'
 
    * "System.Exit" reexports all bindings
 
@@ -186,20 +191,18 @@ the user has to pay explicit attention to encoding issues--as
 she should, because not all UNIX processes deal with encoded
 textual data.
 
-Second, I paid meticulous attention to resource management.
-Resources are deterministically destroyed immediately after
-use.  This eliminates many bugs.  Even so, I decided to
-leave it up to the user to use something like 'bracket' to
-ensure that all resources are cleaned up if there is an
-exception.  Originally I tried to have the library do this,
-but that turned out not to be very composable.  There are
-already many exception-handling mechanisms available in
-"Control.Exception", "Pipes.Safe", and
-"Control.Monad.Catch", and it seems best to let the user
-choose how to handle this issue; she can just perform a
-'bracket' and may combine this with the @ContT@ monad in
-@transformers@ or @mtl@ if she wishes, or perhaps with the
-@managed@ library.
+Second, I paid meticulous attention to resource management.  Resources
+are deterministically destroyed immediately after use.  This
+eliminates many bugs.  Even so, I decided to leave it up to the user
+to use something like 'Control.Exception.bracket' to ensure that all
+resources are cleaned up if there is an exception.  Originally I tried
+to have the library do this, but that turned out not to be very
+composable.  There are already many exception-handling mechanisms
+available in "Control.Exception", "Pipes.Safe", and
+"Control.Monad.Catch", and it seems best to let the user choose how to
+handle this issue; she can just perform a 'Control.Exception.bracket'
+and may combine this with the @ContT@ monad in @transformers@ or @mtl@
+if she wishes, or perhaps with the @managed@ library.
 
 You might wonder why, if you are using an external process as
 a pipeline, why can't you create, well, a 'Pipe'?  Wouldn't

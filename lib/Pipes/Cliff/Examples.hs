@@ -12,11 +12,11 @@
 -- that uses "Pipes.Cliff", including this code; see the warning in
 -- "Pipes.Cliff" for more details.
 --
--- Notice throughout how pipelines that move data from one process
--- to another typically are run in the background using 'conveyor',
--- and that threads that produce information you need to use are run
--- in the 'background' so you can use 'waitForThread' to retrieve
--- their results.
+-- Notice throughout how pipelines that move data from one process to
+-- another typically are run in the background using 'conveyor', which
+-- spawns a thread.  You have to make sure all these threads are
+-- running concurrently so that data flows through your pipeline (a
+-- shell does this sort of thing for you.)
 
 module Pipes.Cliff.Examples where
 
@@ -135,3 +135,29 @@ alphaNumbersByteString = do
   runSafeT
     $ P.fold BS8.append BS8.empty id trByteStrings
 
+-- | So far, all examples have ignored the issue of exception safety.
+-- Here's an example that properly uses 'bracket' to make sure that
+-- all resource allocations are cleaned up if there is an exception.
+-- Otherwise, it's identical to 'standardOutputAndError'.  You can put
+-- some @do@ notation sugar in here and eliminate all the hanging
+-- lambdas and '$'s by using the 'ContT' monad from @transformers@ (I
+-- did not write the example that way to avoid incurring a direct
+-- dependency on @transformers@).
+
+standardOutputAndErrorBracketed :: IO BS8.ByteString
+standardOutputAndErrorBracketed =
+  withProcess (pipeInputOutput Inherit (procSpec "tr" ["[0-9]", "[a-z]"]))
+    $ \(toTr, fromTr) ->
+
+  withProcess (pipeInputOutputError (procSpec "sh" ["-c", script]))
+    $ \(toSh, fromShOut, fromShErr) ->
+
+  withProcess (pipeInput Inherit Inherit (procSpec "less" [])) $ \toLess ->
+  safeConveyor (produceNumbers >-> wrapRight >-> toTr) $
+  safeConveyor (fromTr >-> toSh) $
+  safeConveyor (fromShOut >-> toLess) $
+  runSafeT
+    $ P.fold BS8.append BS8.empty id
+      (fromShErr >-> (forwardRight >> return ()))
+  where
+    script = "while read line; do echo $line; echo $line 1>&2; done"
