@@ -800,9 +800,7 @@ runInputHandle pnl = mask_ $ do
           Left firstCode -> (Just firstCode, thisCode)
           Right _downstreamStopped -> (Nothing, thisCode)
 
-  return
-    $ register (liftIO $ cancel asyncId)
-    >> ((fmap Left forwardRight) >-> fmap Right toBox) >>= f
+  return (((fmap Left forwardRight) >-> fmap Right toBox) >>= f)
 
 
 -- | Takes all steps necessary to get a 'Producer' for standard
