@@ -32,10 +32,11 @@ import qualified Data.ByteString.Char8 as BS8
 -- without a framework like @pipes@.
 
 produceNumbers :: Monad m => Producer BS8.ByteString m r
-produceNumbers = go (0 :: Int)
+produceNumbers
+  = iterate' succ (0 :: Int)
+  >-> P.show >-> P.map BS8.pack >-> P.map (`BS8.snoc` '\n')
   where
-    go i = yield ((BS8.pack . show $ i) `BS8.snoc` '\n')
-      >> go (succ i)
+    iterate' nxt i = yield i >> iterate' nxt (nxt i)
 
 -- | Streams an infinite list of numbers to @less@.  Shows off how
 -- you can use "Pipes.Cliff" even for non-finite 'Producer's.  Don't
