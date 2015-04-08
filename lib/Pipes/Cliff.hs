@@ -118,9 +118,6 @@ continues concurrently.  A function is provided for each possible
 combination of standard input, standard output, and standard error.
 Use the 'NonPipe' type to describe what you want to do with streams
 you do NOT want to create a stream for.  For example, to create a
-subprocess that does not create a Pipe for any of the standard
-streams, use 'pipeNone'.  You must describe what you want done with
-standard input, standard output, and standard error.  To create a
 subprocess that creates a 'Proxy' for standard input and standard
 output, use 'pipeInputOutput'.  You must describe what you want done
 with standard error.  A 'Producer' is returned for standard output

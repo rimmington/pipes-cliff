@@ -186,7 +186,7 @@ data CreateProcess = CreateProcess
 
   , handler :: Oopsie -> IO ()
   -- ^ Whenever an IO exception arises during the course of various
-  -- IO actios, the exception is caught and placed into an 'Oopsie'
+  -- IO actions, the exception is caught and placed into an 'Oopsie'
   -- that indicates why and where the exception happened.  The
   -- 'handler' determines what happens when an 'Oopsie' comes in.
   -- See 'Oopsie' for details.
