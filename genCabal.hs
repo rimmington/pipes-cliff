@@ -5,7 +5,7 @@ import Cartel
 props :: Properties
 props = blank
   { name = "pipes-cliff"
-  , version = [0,10,0,2]
+  , version = [0,10,0,4]
   , cabalVersion = Just (1, 18)
   , buildType = Just simple
   , license = Just bsd3
@@ -37,7 +37,7 @@ props = blank
     , "<https://github.com/massysett/pipes-cliff>"
     ]
   , category = "Pipes, Concurrency"
-  , testedWith = map (\v -> (ghc, eq v)) [[7,8,2], [7,10,1]]
+  , testedWith = map (\v -> (ghc, eq v)) [[7,10,1]]
   , extraSourceFiles = ["README.md"]
   }
 
@@ -105,41 +105,25 @@ sections fl libMods testMods =
 -- # Packages
 
 base :: Package
-base = closedOpen "base" [4,7,0,0] [4,9]
+base = closedOpen "base" [4,7,0,0] [5]
 
 pipes :: Package
-pipes = closedOpen "pipes" [4,1] [4,2]
+pipes = package "pipes" (gtEq [4,1])
 
 pipesSafe :: Package
-pipesSafe = closedOpen "pipes-safe" [2,2] [2,3]
-
--- | Currently unused
-pipesConcurrency :: Package
-pipesConcurrency = closedOpen "pipes-concurrency" [2,0,3] [2,1]
+pipesSafe = package "pipes-safe" (gtEq [2,2])
 
 bytestring :: Package
-bytestring = closedOpen "bytestring" [0,10,4] [0,11]
+bytestring = package "bytestring" (gtEq [0,10,4])
 
 process :: Package
-process = closedOpen "process" [1,2,0,0] [1,3]
+process = package "process" (gtEq [1,2,0,0])
 
 async :: Package
-async = closedOpen "async" [2,0] [2,1]
-
--- | Currently unused
-transformers :: Package
-transformers = closedOpen "transformers" [0,3] [0,5]
+async = package "async" (gtEq [2,0])
 
 stm :: Package
-stm = closedOpen "stm" [2,4,4] [2,5]
-
--- | Currently unused
-mtl :: Package
-mtl = closedOpen "mtl" [2,2] [2,3]
-
--- | Currently unused
-exceptions :: Package
-exceptions = closedOpen "exceptions" [0,8] [0,9]
+stm = package "stm" (gtEq [2,4,4])
 
 libDeps :: HasBuildInfo a => a
 libDeps = buildDepends
