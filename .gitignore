@@ -1,5 +1,4 @@
 dist/
 TAGS
-pipes-cliff.cabal
 .cabal-sandbox
 cabal.sandbox.config
